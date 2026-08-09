@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
 
 1. 打开图片，或把图片拖进预览区
 2. 用 **标尺对齐** 沿条带上沿/泳道边拖一条线，点“旋正为水平/垂直”（也可看绿色参考线手动转）
-3. 点顶部 **框选 ROI**，拖出青色框；再切到 **调整分隔线** 拖橙色竖线
+3. 点顶部 **框选 ROI**，拖出青色框；分隔线会按剖面峰谷自动划分（也可点“按剖面峰谷划分”或拖橙线微调）
 4. 点 **ROI 定量**（复杂膜优先这条路径；自动分析仅作粗检）
 5. **强度剖面** 检查峰形；归一化页保存 LC/Target
 6. **导出展示图**（按 ROI 裁切）或导出数据 CSV
@@ -100,7 +100,8 @@ pytest
 关键模块：
 
 - `wb_analyzer/analysis.py`：自动检测
-- `wb_analyzer/roi.py`：旋转、ROI 泳道定量、强度剖面
+- `wb_analyzer/roi.py`：旋转、ROI 泳道定量、剖面峰谷分隔
+- `wb_analyzer/dnd.py`：拖拽路径解析（含 TIF / `file://`）
 - `wb_analyzer/normalize.py`：内参历史与归一化
 - `wb_analyzer/gui.py`：桌面界面
 - `desktop/` + `scripts/build_windows.ps1`：Windows 打包
