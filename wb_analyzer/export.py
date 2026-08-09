@@ -16,7 +16,19 @@ def export_result(result: AnalysisResult, image_path: str | Path, output_dir: st
     stem = Path(image_path).stem
     csv_path = output / f"{stem}_bands.csv"
     preview_path = output / f"{stem}_annotated.png"
-    fields = ["lane", "band", "x", "y", "width", "height", "area", "mean_intensity", "background", "integrated_density"]
+    fields = [
+        "lane",
+        "band",
+        "x",
+        "y",
+        "width",
+        "height",
+        "area",
+        "mean_intensity",
+        "background",
+        "integrated_density",
+        "saturated_fraction",
+    ]
     with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()

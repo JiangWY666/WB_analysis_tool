@@ -5,18 +5,47 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .analysis import analyze_image
+from .analysis import AnalysisConfig, analyze_image
 from .export import export_result
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="自动识别并统计 Western Blot 条带灰度")
     parser.add_argument("image", type=Path, help="待分析图片")
     parser.add_argument("--output", "-o", type=Path, default=Path("results"), help="结果目录")
-    args = parser.parse_args()
-    result = analyze_image(args.image)
+    parser.add_argument(
+        "--sensitivity",
+        type=float,
+        default=1.0,
+        help="检测灵敏度，越小越容易检出弱条带（默认 1.0，范围约 0.35–2.5）",
+    )
+    parser.add_argument(
+        "--kernel-size",
+        type=int,
+        default=None,
+        help="背景校正形态学核大小（奇数像素）；省略则自动估计",
+    )
+    parser.add_argument(
+        "--background",
+        choices=("auto", "dark_bands", "light_bands"),
+        default="auto",
+        help="背景模式：auto / dark_bands（深带浅底）/ light_bands（浅带深底）",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    config = AnalysisConfig(
+        sensitivity=args.sensitivity,
+        kernel_size=args.kernel_size,
+        background_mode=args.background,
+    )
+    result = analyze_image(args.image, config=config)
     csv_path, preview_path = export_result(result, args.image, args.output)
     print(f"检测到 {len(result.measurements)} 个条带")
+    if result.saturated_band_count:
+        print(f"警告：{result.saturated_band_count} 个条带可能存在曝光饱和")
     print(f"数据：{csv_path}\n预览：{preview_path}")
 
 
