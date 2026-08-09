@@ -22,5 +22,8 @@ build = ["pyinstaller>=6.3"]
 wb-analyzer = "wb_analyzer.gui:main"
 wb-analyze = "wb_analyzer.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["wb_analyzer*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -102,8 +102,8 @@ pytest
 
 打包相关文件：
 
-- `packaging/run_gui.py`：exe 入口
-- `packaging/wb-analyzer.spec`：PyInstaller 配置
+- `desktop/run_gui.py`：exe 入口
+- `desktop/wb-analyzer.spec`：PyInstaller 配置
 - `scripts/build_windows.ps1`：Windows 一键打包
 - `.github/workflows/build-windows.yml`：CI 自动出 Windows 包
 

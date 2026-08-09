@@ -8,7 +8,7 @@ on:
   pull_request:
     paths:
       - "wb_analyzer/**"
-      - "packaging/**"
+      - "desktop/**"
       - "scripts/build_windows.ps1"
       - "pyproject.toml"
       - ".github/workflows/build-windows.yml"

@@ -7,5 +7,5 @@ dist/
 *.egg-info/
 results/
 *.spec.bak
-packaging/*.toc
-packaging/warn-*.txt
+desktop/*.toc
+desktop/warn-*.txt

@@ -9,7 +9,9 @@ Set-Location $Root
 
 Write-Host "==> Installing package and build dependencies"
 python -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
 python -m pip install -e ".[build]"
+if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
 $Dist = Join-Path $Root "dist"
 $Build = Join-Path $Root "build"
@@ -22,7 +24,8 @@ python -m PyInstaller `
   --clean `
   --workpath $Build `
   --distpath $Dist `
-  (Join-Path $Root "packaging\wb-analyzer.spec")
+  (Join-Path $Root "desktop\wb-analyzer.spec")
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
 $AppDir = Join-Path $Dist "WB-Analyzer"
 $ExePath = Join-Path $AppDir "WB-Analyzer.exe"
