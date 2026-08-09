@@ -34,14 +34,28 @@ class RoiRect:
 
 
 def load_bgr(path) -> np.ndarray:
+    """Load an image as BGR, with TIFF-friendly fallbacks for Windows paths."""
     from pathlib import Path
 
+    from PIL import Image
+
     path = Path(path)
-    data = np.fromfile(path, dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError(f"不支持或已损坏的图片：{path}")
-    return image
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if image is not None:
+            return image
+    except OSError:
+        pass
+
+    # Some TIFF variants fail in cv2.imdecode; Pillow is more tolerant.
+    try:
+        with Image.open(path) as pil_image:
+            pil_image = pil_image.convert("RGB")
+            rgb = np.array(pil_image)
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except OSError as exc:
+        raise ValueError(f"不支持或已损坏的图片：{path}") from exc
 
 
 def to_gray(image: np.ndarray) -> np.ndarray:
@@ -99,11 +113,92 @@ def rotate_image(image: np.ndarray, angle_deg: float) -> np.ndarray:
 
 
 def default_separators(roi: RoiRect, lane_count: int) -> list[float]:
-    """Absolute X positions of internal lane separators."""
+    """Absolute X positions of internal lane separators (equal split fallback)."""
     n = max(1, int(lane_count))
     if n <= 1:
         return []
     return [roi.x + roi.width * i / n for i in range(1, n)]
+
+
+def _smooth_profile(values: np.ndarray, radius: int = 4) -> np.ndarray:
+    radius = max(1, int(radius))
+    kernel = np.ones(radius * 2 + 1, dtype=float)
+    kernel /= kernel.sum()
+    return np.convolve(values.astype(float), kernel, mode="same")
+
+
+def find_profile_peaks(
+    profile: np.ndarray,
+    *,
+    expected_lanes: int | None = None,
+    min_distance: int | None = None,
+) -> list[int]:
+    """Return peak indices on an ROI intensity profile."""
+    if profile.size < 8:
+        return []
+    smooth = _smooth_profile(profile, max(2, profile.size // 80))
+    baseline = float(np.percentile(smooth, 30))
+    span = float(smooth.max() - baseline)
+    if span <= 1e-6:
+        return []
+    # Keep spacing below typical strong/weak pair gaps; flat tops are handled by
+    # plateau centering below rather than an oversized min-distance.
+    if min_distance is not None:
+        distance = max(3, int(min_distance))
+    elif expected_lanes and expected_lanes > 1:
+        distance = max(8, profile.size // max(expected_lanes * 3, 16))
+    else:
+        distance = max(8, profile.size // 20)
+    win = max(2, distance // 4)
+    min_prom = span * 0.08
+    plateau_eps = max(1e-6, span * 0.02)
+    candidates: list[int] = []
+    index = win
+    while index < len(smooth) - win:
+        neighborhood = smooth[index - win : index + win + 1]
+        if smooth[index] >= float(neighborhood.max()) - 1e-12 and smooth[index] - baseline >= min_prom:
+            left = index
+            while left > 0 and abs(smooth[left - 1] - smooth[index]) <= plateau_eps:
+                left -= 1
+            right = index
+            while right < len(smooth) - 1 and abs(smooth[right + 1] - smooth[index]) <= plateau_eps:
+                right += 1
+            candidates.append((left + right) // 2)
+            index = right + 1
+            continue
+        index += 1
+    candidates = sorted(set(candidates), key=lambda i: smooth[i], reverse=True)
+    peaks: list[int] = []
+    for peak in candidates:
+        if all(abs(peak - other) >= distance for other in peaks):
+            peaks.append(peak)
+        if expected_lanes and len(peaks) >= max(1, expected_lanes):
+            break
+    return sorted(peaks)
+
+
+def separators_from_profile(
+    profile: np.ndarray,
+    roi: RoiRect,
+    *,
+    expected_lanes: int | None = None,
+) -> list[float]:
+    """Place lane separators at valleys between profile peaks."""
+    peaks = find_profile_peaks(profile, expected_lanes=expected_lanes or None)
+    if len(peaks) < 2:
+        if expected_lanes and expected_lanes > 1:
+            return default_separators(roi, expected_lanes)
+        return []
+    smooth = _smooth_profile(profile, max(2, profile.size // 80))
+    separators: list[float] = []
+    for left, right in zip(peaks, peaks[1:], strict=False):
+        if right - left < 3:
+            continue
+        valley = left + int(np.argmin(smooth[left : right + 1]))
+        # Keep valley away from peak centers.
+        valley = int(np.clip(valley, left + 2, right - 2))
+        separators.append(float(roi.x + valley))
+    return separators
 
 
 def lane_boundaries(roi: RoiRect, separators: list[float]) -> list[tuple[int, int]]:
