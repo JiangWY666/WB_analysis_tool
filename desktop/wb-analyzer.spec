@@ -20,6 +20,7 @@ a = Analysis(
         "wb_analyzer.gui",
         "wb_analyzer.normalize",
         "wb_analyzer.roi",
+        "tkinterdnd2",
     ],
     hookspath=[],
     hooksconfig={},

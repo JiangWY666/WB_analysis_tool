@@ -50,6 +50,26 @@ def to_gray(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
 
+def angle_to_horizontal(x0: float, y0: float, x1: float, y1: float) -> float:
+    """Return degrees to rotate so the segment becomes horizontal."""
+    return float(np.degrees(np.arctan2(y1 - y0, x1 - x0)))
+
+
+def angle_to_vertical(x0: float, y0: float, x1: float, y1: float) -> float:
+    """Return degrees to rotate so the segment becomes vertical."""
+    return float(np.degrees(np.arctan2(y1 - y0, x1 - x0)) - 90.0)
+
+
+def normalize_angle(angle_deg: float) -> float:
+    """Map angle into (-90, 90] for blot straightening."""
+    angle = ((float(angle_deg) + 180.0) % 360.0) - 180.0
+    if angle > 90.0:
+        angle -= 180.0
+    elif angle <= -90.0:
+        angle += 180.0
+    return angle
+
+
 def rotate_image(image: np.ndarray, angle_deg: float) -> np.ndarray:
     """Rotate image around center, expanding canvas so content is not cropped."""
     if abs(angle_deg) < 1e-6:

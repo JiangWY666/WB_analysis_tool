@@ -4,9 +4,12 @@ import cv2
 import numpy as np
 
 from wb_analyzer.normalize import AnalysisSession, QuantEntry, export_normalized_csv, lane_intensities_from_measurements
+from wb_analyzer.export import export_figure
 from wb_analyzer.roi import (
     RoiRect,
+    angle_to_horizontal,
     default_separators,
+    normalize_angle,
     quantify_roi_lanes,
     roi_intensity_profile,
     rotate_image,
@@ -97,3 +100,15 @@ def test_to_gray_accepts_gray_and_bgr() -> None:
     bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     assert to_gray(gray).ndim == 2
     assert to_gray(bgr).shape == gray.shape
+
+
+def test_ruler_angle_and_figure_export(tmp_path: Path) -> None:
+    assert abs(angle_to_horizontal(0, 0, 10, 0)) < 1e-6
+    assert abs(normalize_angle(angle_to_horizontal(0, 0, 10, 10)) - 45.0) < 1e-6
+    image = cv2.cvtColor(synthetic_lanes(), cv2.COLOR_GRAY2BGR)
+    roi = RoiRect(20, 40, 200, 80)
+    path = export_figure(image, tmp_path / "fig.png", roi=roi, pad=4)
+    assert path.exists()
+    exported = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert exported is not None
+    assert exported.shape[1] <= 200 + 8 + 2
