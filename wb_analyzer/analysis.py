@@ -250,20 +250,21 @@ def _smooth_1d(values: np.ndarray, radius: int) -> np.ndarray:
     return np.convolve(values.astype(float), kernel, mode="same")
 
 
-def _projection_regions(scores: np.ndarray, sensitivity: float, min_width: int, max_gap: int) -> list[tuple[int, int]]:
-    """Find signal runs from a 1D projection using a peak-relative threshold."""
-    if scores.size == 0:
-        return []
-    smooth = _smooth_1d(scores, max(1, min_width // 3))
-    baseline = float(np.percentile(smooth, 35))
-    peak = float(smooth.max())
-    if peak <= baseline + 1e-3:
-        return []
-    # Lower sensitivity => lower threshold => more inclusive detection.
-    rel = float(np.clip(0.18 + 0.28 * sensitivity, 0.12, 0.75))
-    thr = baseline + (peak - baseline) * rel
-    thr = min(thr, peak - max(1e-3, 0.01 * (peak - baseline)))
-    return _segments(smooth >= thr, minimum=min_width, max_gap=max_gap)
+def _content_bbox(gray: np.ndarray, dark_bands: bool) -> tuple[int, int, int, int]:
+    """Largest membrane-like region, ignoring huge empty margins."""
+    h, w = gray.shape
+    mask = ((gray < 248) if dark_bands else (gray > 8)).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    if count <= 1:
+        return 0, 0, w, h
+    index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x, y, bw, bh, area = (int(v) for v in stats[index])
+    if area < 0.01 * h * w:
+        return 0, 0, w, h
+    pad = 6
+    return max(0, x - pad), max(0, y - pad), min(w, x + bw + pad), min(h, y + bh + pad)
 
 
 def _prepare_signal(gray: np.ndarray, dark_bands: bool, kernel_size: int) -> np.ndarray:
@@ -273,6 +274,105 @@ def _prepare_signal(gray: np.ndarray, dark_bands: bool, kernel_size: int) -> np.
     background = cv2.morphologyEx(enhanced, cv2.MORPH_OPEN, np.ones((kernel_size, kernel_size), np.uint8))
     corrected = cv2.subtract(enhanced, background)
     return cv2.GaussianBlur(corrected, (5, 5), 0)
+
+
+def _split_bimodal_box(corr: np.ndarray, box: tuple[int, int, int, int]) -> list[tuple[int, int, int, int]]:
+    """Split a wide box if its column profile has two clear peaks."""
+    x, y, w, h = box
+    if w < 55:
+        return [box]
+    strip = corr[y : y + h, x : x + w].astype(float)
+    if strip.size == 0:
+        return [box]
+    profile = _smooth_1d(strip.mean(axis=0), 3)
+    peak_floor = float(profile.max()) * 0.35
+    candidates = [
+        i
+        for i in range(3, len(profile) - 3)
+        if profile[i] >= max(profile[i - 3 : i + 4]) and profile[i] >= peak_floor
+    ]
+    candidates = sorted(candidates, key=lambda i: profile[i], reverse=True)
+    peaks: list[int] = []
+    for idx in candidates:
+        if all(abs(idx - other) >= max(12, w // 6) for other in peaks):
+            peaks.append(idx)
+        if len(peaks) == 2:
+            break
+    if len(peaks) < 2:
+        return [box]
+    left_peak, right_peak = sorted(peaks[:2])
+    valley = left_peak + int(np.argmin(profile[left_peak : right_peak + 1]))
+    if valley <= 6 or valley >= w - 6:
+        return [box]
+    return [(x, y, valley, h), (x + valley, y, w - valley, h)]
+
+
+def _boxes_from_membrane_components(
+    gray: np.ndarray,
+    *,
+    dark_bands: bool,
+    sensitivity: float,
+    kernel_size: int | None,
+) -> list[tuple[int, int, int, int]]:
+    """Detect bands as connected components inside the membrane crop."""
+    x1, y1, x2, y2 = _content_bbox(gray, dark_bands)
+    crop_gray = gray[y1:y2, x1:x2]
+    if min(crop_gray.shape) < 16:
+        return []
+    local_kernel = kernel_size or max(15, (min(crop_gray.shape) // 5) | 1)
+    corrected = _prepare_signal(crop_gray, dark_bands, local_kernel)
+    # Sparse chemiluminescence blots: a high percentile threshold isolates each band.
+    percentile = float(np.clip(91.0 + 3.0 * (sensitivity - 1.0), 86.0, 96.5))
+    thr = float(np.percentile(corrected, percentile))
+    otsu_thr, _ = cv2.threshold(corrected, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr = max(thr, float(otsu_thr) * (0.55 + 0.25 * sensitivity), 3.0)
+    binary = (corrected >= thr).astype(np.uint8) * 255
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3, 2), np.uint8))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    h, w = corrected.shape
+    min_area = max(40.0, 0.0008 * h * w / max(sensitivity, 0.5))
+    boxes: list[tuple[int, int, int, int]] = []
+    for index in range(1, count):
+        x, y, bw, bh, area = (int(v) for v in stats[index])
+        if area < min_area or bw < 8 or bh < 4:
+            continue
+        if bw > 0.45 * w or bh > 0.7 * h:
+            # Likely merged doublet or membrane fragment; keep for optional split.
+            if bw <= 0.55 * w and bh <= 0.75 * h and area >= min_area:
+                boxes.append((x, y, bw, bh))
+            continue
+        boxes.append((x, y, bw, bh))
+
+    split: list[tuple[int, int, int, int]] = []
+    for box in boxes:
+        split.extend(_split_bimodal_box(corrected, box))
+
+    pad_x, pad_y = 2, 3
+    absolute: list[tuple[int, int, int, int]] = []
+    for x, y, bw, bh in split:
+        ax = max(0, x1 + x - pad_x)
+        ay = max(0, y1 + y - pad_y)
+        aw = min(gray.shape[1], x1 + x + bw + pad_x) - ax
+        ah = min(gray.shape[0], y1 + y + bh + pad_y) - ay
+        if aw >= 6 and ah >= 4:
+            absolute.append((ax, ay, aw, ah))
+    return sorted(absolute, key=lambda b: (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0))
+
+
+def _projection_regions(scores: np.ndarray, sensitivity: float, min_width: int, max_gap: int) -> list[tuple[int, int]]:
+    """Find signal runs from a 1D projection using a peak-relative threshold."""
+    if scores.size == 0:
+        return []
+    smooth = _smooth_1d(scores, max(1, min_width // 3))
+    baseline = float(np.percentile(smooth, 35))
+    peak = float(smooth.max())
+    if peak <= baseline + 1e-3:
+        return []
+    rel = float(np.clip(0.18 + 0.28 * sensitivity, 0.12, 0.75))
+    thr = baseline + (peak - baseline) * rel
+    thr = min(thr, peak - max(1e-3, 0.01 * (peak - baseline)))
+    return _segments(smooth >= thr, minimum=min_width, max_gap=max_gap)
 
 
 def _boxes_from_projection(corrected: np.ndarray, sensitivity: float) -> list[tuple[int, int, int, int]]:
@@ -288,7 +388,6 @@ def _boxes_from_projection(corrected: np.ndarray, sensitivity: float) -> list[tu
         for raw_y1, raw_y2 in bands:
             y_pad = max(1, (raw_y2 - raw_y1) // 3)
             y1, y2 = max(0, raw_y1 - y_pad), min(h, raw_y2 + y_pad)
-            # Keep band-like aspect: reject near-full-height blobs.
             if (y2 - y1) > 0.55 * h:
                 continue
             boxes.append((x1, y1, x2 - x1, y2 - y1))
@@ -297,7 +396,6 @@ def _boxes_from_projection(corrected: np.ndarray, sensitivity: float) -> list[tu
 
 def _boxes_from_contours(corrected: np.ndarray, sensitivity: float) -> list[tuple[int, int, int, int]]:
     h, w = corrected.shape
-    # Sensitivity scales Otsu threshold downward (more inclusive) or upward.
     otsu_thr, _ = cv2.threshold(corrected, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     thr = float(np.clip(otsu_thr * (0.65 + 0.35 * sensitivity), 1, 254))
     _, binary = cv2.threshold(corrected, thr, 255, cv2.THRESH_BINARY)
@@ -317,7 +415,6 @@ def _boxes_from_contours(corrected: np.ndarray, sensitivity: float) -> list[tupl
             continue
         if bw > 0.8 * w and bh > 0.8 * h:
             continue
-        # Prefer horizontal band shapes; keep squarish spots too.
         aspect = bw / max(bh, 1)
         if aspect < 0.6 and bh > 0.25 * h:
             continue
@@ -363,15 +460,21 @@ def analyze_array(image: np.ndarray, config: AnalysisConfig | None = None) -> An
 
     dark_bands = _resolve_dark_bands(gray, cfg.background_mode)
     kernel_size = cfg.kernel_size or _auto_kernel_size(gray)
-    corrected = _prepare_signal(gray, dark_bands, kernel_size)
 
-    proj_boxes = _boxes_from_projection(corrected, cfg.sensitivity)
-    contour_boxes = _boxes_from_contours(corrected, cfg.sensitivity)
-    # Prefer projection when it finds a structured blot; otherwise fall back to contours.
-    if len(proj_boxes) >= 2:
-        boxes = _merge_boxes(proj_boxes + contour_boxes)
-    else:
-        boxes = _merge_boxes(contour_boxes + proj_boxes)
+    # Primary path: membrane crop + connected components (works for sparse chemiluminescence).
+    boxes = _boxes_from_membrane_components(
+        gray,
+        dark_bands=dark_bands,
+        sensitivity=cfg.sensitivity,
+        kernel_size=cfg.kernel_size,
+    )
+
+    # Fallback for dense/full-frame blots.
+    if len(boxes) < 2:
+        corrected = _prepare_signal(gray, dark_bands, kernel_size)
+        proj_boxes = _boxes_from_projection(corrected, cfg.sensitivity)
+        contour_boxes = _boxes_from_contours(corrected, cfg.sensitivity)
+        boxes = _merge_boxes(proj_boxes + contour_boxes if len(proj_boxes) >= 2 else contour_boxes + proj_boxes)
 
     placeholders = [
         BandMeasurement(
