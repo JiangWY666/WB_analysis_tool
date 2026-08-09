@@ -18,6 +18,8 @@ a = Analysis(
         "wb_analyzer.analysis",
         "wb_analyzer.export",
         "wb_analyzer.gui",
+        "wb_analyzer.normalize",
+        "wb_analyzer.roi",
     ],
     hookspath=[],
     hooksconfig={},

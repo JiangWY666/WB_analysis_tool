@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wb-gray-analyzer"
-version = "0.1.2"
-description = "Automatic Western Blot lane, band and grayscale analyzer"
+version = "0.2.0"
+description = "Western Blot lane/band densitometry with ROI, profile QC and normalization"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
