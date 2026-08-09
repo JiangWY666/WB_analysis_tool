@@ -51,12 +51,12 @@ def to_gray(image: np.ndarray) -> np.ndarray:
 
 
 def angle_to_horizontal(x0: float, y0: float, x1: float, y1: float) -> float:
-    """Return degrees to rotate so the segment becomes horizontal."""
+    """Return the segment tilt in degrees relative to horizontal (image coords)."""
     return float(np.degrees(np.arctan2(y1 - y0, x1 - x0)))
 
 
 def angle_to_vertical(x0: float, y0: float, x1: float, y1: float) -> float:
-    """Return degrees to rotate so the segment becomes vertical."""
+    """Return the segment tilt in degrees relative to vertical (image coords)."""
     return float(np.degrees(np.arctan2(y1 - y0, x1 - x0)) - 90.0)
 
 
@@ -71,12 +71,16 @@ def normalize_angle(angle_deg: float) -> float:
 
 
 def rotate_image(image: np.ndarray, angle_deg: float) -> np.ndarray:
-    """Rotate image around center, expanding canvas so content is not cropped."""
+    """Rotate image around center.
+
+    Positive degrees follow OpenCV/image-coordinate convention: they reduce a
+    down-right (positive atan2) tilt, i.e. lift the right side.
+    """
     if abs(angle_deg) < 1e-6:
         return image.copy()
     h, w = image.shape[:2]
     center = (w / 2.0, h / 2.0)
-    matrix = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    matrix = cv2.getRotationMatrix2D(center, float(angle_deg), 1.0)
     cos = abs(matrix[0, 0])
     sin = abs(matrix[0, 1])
     new_w = int(h * sin + w * cos)
