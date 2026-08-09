@@ -243,6 +243,115 @@ def rebuild_result(
     )
 
 
+def _smooth_1d(values: np.ndarray, radius: int) -> np.ndarray:
+    radius = max(1, int(radius))
+    kernel = np.ones(radius * 2 + 1, dtype=float)
+    kernel /= kernel.sum()
+    return np.convolve(values.astype(float), kernel, mode="same")
+
+
+def _projection_regions(scores: np.ndarray, sensitivity: float, min_width: int, max_gap: int) -> list[tuple[int, int]]:
+    """Find signal runs from a 1D projection using a peak-relative threshold."""
+    if scores.size == 0:
+        return []
+    smooth = _smooth_1d(scores, max(1, min_width // 3))
+    baseline = float(np.percentile(smooth, 35))
+    peak = float(smooth.max())
+    if peak <= baseline + 1e-3:
+        return []
+    # Lower sensitivity => lower threshold => more inclusive detection.
+    rel = float(np.clip(0.18 + 0.28 * sensitivity, 0.12, 0.75))
+    thr = baseline + (peak - baseline) * rel
+    thr = min(thr, peak - max(1e-3, 0.01 * (peak - baseline)))
+    return _segments(smooth >= thr, minimum=min_width, max_gap=max_gap)
+
+
+def _prepare_signal(gray: np.ndarray, dark_bands: bool, kernel_size: int) -> np.ndarray:
+    signal = 255 - gray if dark_bands else gray
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(signal)
+    background = cv2.morphologyEx(enhanced, cv2.MORPH_OPEN, np.ones((kernel_size, kernel_size), np.uint8))
+    corrected = cv2.subtract(enhanced, background)
+    return cv2.GaussianBlur(corrected, (5, 5), 0)
+
+
+def _boxes_from_projection(corrected: np.ndarray, sensitivity: float) -> list[tuple[int, int, int, int]]:
+    h, w = corrected.shape
+    min_lane = max(4, w // 80)
+    lanes = _projection_regions(corrected.mean(axis=0), sensitivity, min_lane, max_gap=max(3, w // 60))
+    boxes: list[tuple[int, int, int, int]] = []
+    for raw_x1, raw_x2 in lanes:
+        pad = max(1, (raw_x2 - raw_x1) // 8)
+        x1, x2 = max(0, raw_x1 - pad), min(w, raw_x2 + pad)
+        min_band = max(2, h // 120)
+        bands = _projection_regions(corrected[:, x1:x2].mean(axis=1), sensitivity, min_band, max_gap=max(2, h // 80))
+        for raw_y1, raw_y2 in bands:
+            y_pad = max(1, (raw_y2 - raw_y1) // 3)
+            y1, y2 = max(0, raw_y1 - y_pad), min(h, raw_y2 + y_pad)
+            # Keep band-like aspect: reject near-full-height blobs.
+            if (y2 - y1) > 0.55 * h:
+                continue
+            boxes.append((x1, y1, x2 - x1, y2 - y1))
+    return boxes
+
+
+def _boxes_from_contours(corrected: np.ndarray, sensitivity: float) -> list[tuple[int, int, int, int]]:
+    h, w = corrected.shape
+    # Sensitivity scales Otsu threshold downward (more inclusive) or upward.
+    otsu_thr, _ = cv2.threshold(corrected, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr = float(np.clip(otsu_thr * (0.65 + 0.35 * sensitivity), 1, 254))
+    _, binary = cv2.threshold(corrected, thr, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = max(20.0, (h * w) * (0.00025 / max(sensitivity, 0.35)))
+    max_area = (h * w) * 0.25
+    boxes: list[tuple[int, int, int, int]] = []
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        area = float(bw * bh)
+        if area < min_area or area > max_area:
+            continue
+        if bw < 4 or bh < 2:
+            continue
+        if bw > 0.8 * w and bh > 0.8 * h:
+            continue
+        # Prefer horizontal band shapes; keep squarish spots too.
+        aspect = bw / max(bh, 1)
+        if aspect < 0.6 and bh > 0.25 * h:
+            continue
+        if bh > 0.5 * h:
+            continue
+        boxes.append((x, y, bw, bh))
+    return boxes
+
+
+def _merge_boxes(boxes: list[tuple[int, int, int, int]], iou_thr: float = 0.35) -> list[tuple[int, int, int, int]]:
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+    kept: list[tuple[int, int, int, int]] = []
+
+    def iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+        ax2, ay2 = a[0] + a[2], a[1] + a[3]
+        bx2, by2 = b[0] + b[2], b[1] + b[3]
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        union = a[2] * a[3] + b[2] * b[3] - inter
+        return inter / max(union, 1)
+
+    for box in boxes:
+        if any(iou(box, other) >= iou_thr for other in kept):
+            continue
+        kept.append(box)
+    return kept
+
+
 def analyze_array(image: np.ndarray, config: AnalysisConfig | None = None) -> AnalysisResult:
     """Analyze a BGR or grayscale image and return detected band measurements."""
     cfg = (config or AnalysisConfig()).normalized()
@@ -253,30 +362,16 @@ def analyze_array(image: np.ndarray, config: AnalysisConfig | None = None) -> An
         raise ValueError("图片尺寸过小（宽和高至少为 20 像素）")
 
     dark_bands = _resolve_dark_bands(gray, cfg.background_mode)
-    signal = 255 - gray if dark_bands else gray
-
     kernel_size = cfg.kernel_size or _auto_kernel_size(gray)
-    background = cv2.morphologyEx(signal, cv2.MORPH_OPEN, np.ones((kernel_size, kernel_size), np.uint8))
-    corrected = cv2.subtract(signal, background)
-    corrected = cv2.GaussianBlur(corrected, (3, 3), 0)
+    corrected = _prepare_signal(gray, dark_bands, kernel_size)
 
-    column_score = corrected.mean(axis=0)
-    lane_threshold = _adaptive_threshold(column_score, percentile=55, std_k=0.2, sensitivity=cfg.sensitivity)
-    min_lane = max(3, gray.shape[1] // 120)
-    lanes = _segments(column_score >= lane_threshold, min_lane, max_gap=max(2, gray.shape[1] // 80))
-
-    boxes: list[tuple[int, int, int, int]] = []
-    for raw_x1, raw_x2 in lanes:
-        margin = max(1, (raw_x2 - raw_x1) // 5)
-        x1, x2 = max(0, raw_x1 - margin), min(gray.shape[1], raw_x2 + margin)
-        row_score = corrected[:, x1:x2].mean(axis=1)
-        band_threshold = _adaptive_threshold(row_score, percentile=65, std_k=0.45, sensitivity=cfg.sensitivity)
-        min_band = max(2, gray.shape[0] // 160)
-        bands = _segments(row_score >= band_threshold, min_band, max_gap=max(2, gray.shape[0] // 100))
-        for raw_y1, raw_y2 in bands:
-            y_margin = max(1, (raw_y2 - raw_y1) // 2)
-            y1, y2 = max(0, raw_y1 - y_margin), min(gray.shape[0], raw_y2 + y_margin)
-            boxes.append((x1, y1, x2 - x1, y2 - y1))
+    proj_boxes = _boxes_from_projection(corrected, cfg.sensitivity)
+    contour_boxes = _boxes_from_contours(corrected, cfg.sensitivity)
+    # Prefer projection when it finds a structured blot; otherwise fall back to contours.
+    if len(proj_boxes) >= 2:
+        boxes = _merge_boxes(proj_boxes + contour_boxes)
+    else:
+        boxes = _merge_boxes(contour_boxes + proj_boxes)
 
     placeholders = [
         BandMeasurement(
