@@ -1,19 +1,20 @@
 # WB 灰度统计工具
 
-一个面向 Windows 的 Western Blot（WB）条带自动灰度分析工具。选择图片后，程序会自动判断明暗背景、校正不均匀背景、识别泳道与条带，并导出带标注的预览图和 CSV 数据，减少 ImageJ 中重复框选和测量操作。
+一个面向 Windows 的 Western Blot（WB）条带灰度分析工具。支持自动检测、旋转对齐、ROI 泳道定量、强度剖面质控，以及内参归一化与历史复用。
 
-> 当前版本是可运行的 MVP。自动识别结果仍应由实验人员检查；曝光饱和、弯曲泳道、强噪声或背景极不均匀的图片可能需要重新拍摄、调整参数，或手动删框/补框。
+> 当前版本仍建议由实验人员复核结果；曝光饱和、强噪声或背景极不均匀的图片可能需要调整参数、旋转，或改用 ROI 半自动路径。
 
 ## 功能
 
 - Windows 桌面软件（可打包为 `.exe`，也可用 Python 直接运行）
-- 自动识别“深色条带/浅色背景”和“浅色条带/深色背景”，也支持手动指定
-- 自动背景校正、泳道检测和条带检测
-- 可调灵敏度与形态学核大小，适配不同曝光与条带粗细
-- 输出每个条带的包围框、面积、平均灰度、背景校正积分灰度和饱和占比
-- GUI 支持删除误检、拖拽画框补检后再导出
-- 自动保存 CSV 结果及标注预览图
-- 同一个分析核心可通过命令行调用，方便批处理和后续扩展
+- **旋转对齐**：预处理滑条纠正倾斜泳道
+- **自动检测**：背景校正、泳道/条带识别，可调灵敏度与形态学核
+- **ROI + 可拖拽分隔线**：框选一整排条带，按重复数切分并手动微调泳道
+- **强度剖面**：查看 ROI 横向信号峰，检查分隔线与背景是否合理
+- **内参归一化**：保存 Loading Control / Target 历史，导出或导入内参 CSV 复用
+- GUI 支持删除误检、自动模式下画框补检
+- 导出条带 CSV、标注预览图、归一化结果 CSV
+- 命令行可调用同一分析核心做单张自动分析
 
 ## Windows 软件（推荐）
 
@@ -33,25 +34,22 @@ py -m venv .venv
 powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
 ```
 
-完成后得到：
+> 首次运行若被 Windows SmartScreen 拦截，选“更多信息 → 仍要运行”。请保留整个 `WB-Analyzer` 文件夹。
 
-- `dist\WB-Analyzer\WB-Analyzer.exe`：主程序
-- `dist\WB-Analyzer-Windows.zip`：可直接分发的压缩包
+### 软件内推荐流程
 
-> 首次运行若被 Windows SmartScreen 拦截，选“更多信息 → 仍要运行”。当前未做代码签名。请保留整个 `WB-Analyzer` 文件夹，不要只拷贝单个 exe。
-
-### 软件内使用步骤
-
-1. 打开 `WB-Analyzer.exe`
-2. 选择 WB 图片（PNG / JPG / BMP / TIFF）
-3. 需要时调节灵敏度、形态学核、背景模式
-4. 点击 **自动分析**
-5. 检查预览：删除误检，或勾选「拖拽画框添加」补框
-6. 点击 **导出结果**，得到 CSV 与标注预览图
+1. 选择 WB 图片
+2. **预处理**：微调旋转，使泳道接近垂直；设置背景模式
+3. 二选一：
+   - **自动检测**：点“自动分析”，在条带列表中删误检 / 画框补检
+   - **ROI 泳道**：切换模式后拖拽青色 ROI，拖动橙色分隔线对齐，点“ROI 定量”
+4. 点 **强度剖面** 检查峰形与分隔线
+5. 在 **内参归一化** 页：先把内参（如 Actin）加入历史，再分析目标蛋白并加入；可导出/导入内参 CSV 复用
+6. 导出条带结果与归一化结果
 
 ## 开发模式安装（Python）
 
-需要 Python 3.10 或更高版本。Windows PowerShell 中运行：
+需要 Python 3.10 或更高版本：
 
 ```powershell
 py -m venv .venv
@@ -60,18 +58,14 @@ pip install -e .
 wb-analyzer
 ```
 
-也可使用命令行直接分析单张图片：
+命令行单张自动分析：
 
 ```powershell
 wb-analyze .\example.tif --output .\results
 wb-analyze .\example.tif -o .\results --sensitivity 0.8 --background dark_bands
-wb-analyze .\example.tif -o .\results --kernel-size 31 --background auto
 ```
 
-支持 PNG、JPG、JPEG、BMP 和 TIFF。结果目录包含：
-
-- `<原文件名>_bands.csv`：条带数据
-- `<原文件名>_annotated.png`：检测框和编号预览
+支持 PNG、JPG、JPEG、BMP 和 TIFF。
 
 ## 参数说明
 
@@ -83,15 +77,21 @@ wb-analyze .\example.tif -o .\results --kernel-size 31 --background auto
 
 ## CSV 字段
 
+### 条带结果 `*_bands.csv`
+
 | 字段 | 含义 |
 | --- | --- |
-| `lane` / `band` | 从左到右的泳道编号、从上到下的条带编号 |
-| `x`, `y`, `width`, `height` | 条带包围框（像素） |
-| `area` | 包围框面积（像素） |
-| `mean_intensity` | 原图中条带区域的平均灰度（0–255） |
-| `background` | 条带四周估算的局部背景灰度 |
-| `integrated_density` | 背景校正积分灰度；数值越大表示条带信号越强 |
-| `saturated_fraction` | 区域内疑似饱和像素占比；GUI 中橙色框表示可能饱和 |
+| `lane` / `band` | 泳道编号 / 条带编号 |
+| `x`, `y`, `width`, `height` | 包围框（像素） |
+| `mean_intensity` | 区域平均灰度 |
+| `background` | 背景估计 |
+| `integrated_density` | 背景校正积分灰度（越大信号越强） |
+| `saturated_fraction` | 疑似饱和像素占比 |
+
+### 内参 / 归一化
+
+- 内参 CSV：`kind,name,group,lane,integrated_density,...`，可供下次导入复用
+- 归一化 CSV：`target / loading_control / normalized`（Target ÷ Loading Control）
 
 ## 开发
 
@@ -100,11 +100,10 @@ pip install -e '.[dev]'
 pytest
 ```
 
-打包相关文件：
+关键模块：
 
-- `desktop/run_gui.py`：exe 入口
-- `desktop/wb-analyzer.spec`：PyInstaller 配置
-- `scripts/build_windows.ps1`：Windows 一键打包
-- `.github/workflows/build-windows.yml`：CI 自动出 Windows 包
-
-分析算法位于 `wb_analyzer/analysis.py`，桌面界面位于 `wb_analyzer/gui.py`。后续可在此基础上增加安装程序（如 Inno Setup）、代码签名、检测框拖拽微调和内参归一化。
+- `wb_analyzer/analysis.py`：自动检测
+- `wb_analyzer/roi.py`：旋转、ROI 泳道定量、强度剖面
+- `wb_analyzer/normalize.py`：内参历史与归一化
+- `wb_analyzer/gui.py`：桌面界面
+- `desktop/` + `scripts/build_windows.ps1`：Windows 打包
