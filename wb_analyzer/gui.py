@@ -204,7 +204,7 @@ class AnalyzerApp(_TkBase):
         ttk.Button(rot, text="归零", command=lambda: self.rotation.set(0.0)).pack(side=tk.LEFT, padx=4)
         ttk.Label(
             prep,
-            text="标尺工具：沿条带上沿或泳道边点两点，可一键旋正到水平/垂直。",
+            text="旋转：正值抬高右侧（纠正右低左高），负值相反。也可用标尺拖两点后一键旋正。",
             wraplength=320,
             justify=tk.LEFT,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
@@ -590,11 +590,12 @@ class AnalyzerApp(_TkBase):
             messagebox.showinfo("提示", "请先用“标尺对齐”工具在图上拖一条线。")
             return
         current = float(self.rotation.get())
-        # ruler_angle is the segment's angle relative to horizontal.
+        # Positive UI rotation is clockwise. In image coordinates, clockwise increases atan2 tilt,
+        # so subtract the measured tilt to straighten to horizontal/vertical.
         if orientation == "horizontal":
             new_angle = normalize_angle(current - self.ruler_angle)
         else:
-            new_angle = normalize_angle(current + (90.0 - self.ruler_angle))
+            new_angle = normalize_angle(current - normalize_angle(self.ruler_angle - 90.0))
         self.rotation.set(new_angle)
         self.status.config(text=f"已按标尺旋正为{'水平' if orientation == 'horizontal' else '垂直'}（{new_angle:.2f}°）")
 

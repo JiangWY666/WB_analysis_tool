@@ -14,7 +14,7 @@ from wb_analyzer.roi import (
     roi_intensity_profile,
     rotate_image,
     to_gray,
-)
+)  # rotate_image: positive degrees are clockwise
 from wb_analyzer.analysis import analyze_array
 
 
@@ -112,3 +112,27 @@ def test_ruler_angle_and_figure_export(tmp_path: Path) -> None:
     exported = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
     assert exported is not None
     assert exported.shape[1] <= 200 + 8 + 2
+
+
+def test_rotate_positive_lifts_right_side() -> None:
+    image = np.zeros((101, 101), dtype=np.uint8)
+    image[50, 80] = 255  # point to the right of center
+    rotated = rotate_image(image, 90.0)
+    # Positive OpenCV/UI angle: right -> top (corrects down-right blot tilt).
+    ys, xs = np.where(rotated > 200)
+    assert len(ys) > 0
+    assert abs(float(np.mean(xs)) - 50) < 4
+    assert float(np.mean(ys)) < 30
+
+
+def test_positive_rotation_reduces_down_right_tilt() -> None:
+    image = np.zeros((201, 201), dtype=np.uint8)
+    for t in range(-40, 41):
+        image[100 + t // 4, 100 + t] = 255
+    ys, xs = np.where(image > 0)
+    tilt0 = float(np.degrees(np.arctan(np.polyfit(xs, ys, 1)[0])))
+    rotated = rotate_image(image, tilt0)
+    ys, xs = np.where(rotated > 0)
+    tilt1 = float(np.degrees(np.arctan(np.polyfit(xs, ys, 1)[0])))
+    assert tilt0 > 5
+    assert abs(tilt1) < abs(tilt0) / 3
