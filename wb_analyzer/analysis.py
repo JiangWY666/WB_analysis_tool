@@ -307,6 +307,107 @@ def _split_bimodal_box(corr: np.ndarray, box: tuple[int, int, int, int]) -> list
     return [(x, y, valley, h), (x + valley, y, w - valley, h)]
 
 
+def _score_band_boxes(
+    boxes: list[tuple[int, int, int, int]],
+    height: int,
+    width: int,
+    corrected: np.ndarray | None = None,
+) -> float:
+    """Higher is better: prefer a plausible number of similarly sized band boxes."""
+    count = len(boxes)
+    if count == 0:
+        return -1.0
+    if count > 28:
+        return 0.0
+    widths = np.array([box[2] for box in boxes], dtype=float)
+    heights = np.array([box[3] for box in boxes], dtype=float)
+    med_w = float(np.median(widths))
+    med_h = float(np.median(heights))
+
+    if 4 <= count <= 14:
+        score = 12.0
+    elif 2 <= count <= 20:
+        score = 6.0
+    else:
+        score = 1.0
+    # Mild bias against missing bands, without rewarding noise splinters.
+    score += min(count, 12) * 0.35
+
+    if med_w > 0:
+        score -= float(widths.std() / med_w) * 22.0
+        score -= float(np.sum(widths < 0.45 * med_w)) * 7.0
+        score -= float(np.sum(widths > 1.85 * med_w)) * 5.0
+    if med_h > 0:
+        score -= float(heights.std() / med_h) * 8.0
+
+    centers_y = [y + h / 2.0 for _, y, _, h in boxes]
+    if max(centers_y) - min(centers_y) < 0.4 * height:
+        score += 6.0
+    # Noise blobs often cling to the top margin on uneven gradients.
+    score -= sum(1 for _, y, _, h in boxes if y <= 2 and h < 0.22 * height) * 5.0
+
+    if corrected is not None and count:
+        dens = np.array(
+            [float(corrected[y : y + h, x : x + w].sum()) for x, y, w, h in boxes],
+            dtype=float,
+        )
+        ref = float(np.percentile(dens, 75))
+        if ref > 0:
+            score += float(np.median(dens)) / max(ref, 1.0) * 4.0
+            score -= float(np.sum(dens < 0.18 * ref)) * 6.0
+
+    if all(w < 0.4 * width for _, _, w, _ in boxes):
+        score += 3.0
+    if all(h < 0.65 * height for _, _, _, h in boxes):
+        score += 2.0
+    return score
+
+
+def _filter_weak_component_boxes(
+    boxes: list[tuple[int, int, int, int]],
+    corrected: np.ndarray,
+) -> list[tuple[int, int, int, int]]:
+    """Drop low-signal fragments relative to the strongest components."""
+    if len(boxes) < 2:
+        return boxes
+    dens = np.array(
+        [float(corrected[y : y + h, x : x + w].sum()) for x, y, w, h in boxes],
+        dtype=float,
+    )
+    ref = float(np.percentile(dens, 75))
+    if ref <= 1e-6:
+        return boxes
+    kept = [box for box, value in zip(boxes, dens, strict=True) if value >= 0.16 * ref]
+    return kept or boxes
+
+
+def _components_at_threshold(
+    corrected: np.ndarray,
+    threshold: float,
+    *,
+    min_area: float,
+) -> list[tuple[int, int, int, int]]:
+    binary = (corrected >= threshold).astype(np.uint8) * 255
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3, 2), np.uint8))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    h, w = corrected.shape
+    boxes: list[tuple[int, int, int, int]] = []
+    for index in range(1, count):
+        x, y, bw, bh, area = (int(v) for v in stats[index])
+        if area < min_area or bw < 7 or bh < 3:
+            continue
+        if bw > 0.45 * w or bh > 0.7 * h:
+            if bw <= 0.58 * w and bh <= 0.78 * h and area >= min_area:
+                boxes.append((x, y, bw, bh))
+            continue
+        boxes.append((x, y, bw, bh))
+    split: list[tuple[int, int, int, int]] = []
+    for box in boxes:
+        split.extend(_split_bimodal_box(corrected, box))
+    return split
+
+
 def _boxes_from_membrane_components(
     gray: np.ndarray,
     *,
@@ -321,36 +422,35 @@ def _boxes_from_membrane_components(
         return []
     local_kernel = kernel_size or max(15, (min(crop_gray.shape) // 5) | 1)
     corrected = _prepare_signal(crop_gray, dark_bands, local_kernel)
-    # Sparse chemiluminescence blots: a high percentile threshold isolates each band.
-    percentile = float(np.clip(91.0 + 3.0 * (sensitivity - 1.0), 86.0, 96.5))
-    thr = float(np.percentile(corrected, percentile))
-    otsu_thr, _ = cv2.threshold(corrected, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    thr = max(thr, float(otsu_thr) * (0.55 + 0.25 * sensitivity), 3.0)
-    binary = (corrected >= thr).astype(np.uint8) * 255
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3, 2), np.uint8))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    count, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     h, w = corrected.shape
-    min_area = max(40.0, 0.0008 * h * w / max(sensitivity, 0.5))
-    boxes: list[tuple[int, int, int, int]] = []
-    for index in range(1, count):
-        x, y, bw, bh, area = (int(v) for v in stats[index])
-        if area < min_area or bw < 8 or bh < 4:
-            continue
-        if bw > 0.45 * w or bh > 0.7 * h:
-            # Likely merged doublet or membrane fragment; keep for optional split.
-            if bw <= 0.55 * w and bh <= 0.75 * h and area >= min_area:
-                boxes.append((x, y, bw, bh))
-            continue
-        boxes.append((x, y, bw, bh))
+    min_area = max(28.0, 0.00055 * h * w / max(sensitivity, 0.5))
+    base_pct = float(np.clip(90.0 + 3.0 * (sensitivity - 1.0), 84.0, 96.0))
+    otsu_thr, _ = cv2.threshold(corrected, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresholds = [
+        max(float(np.percentile(corrected, base_pct - 3.0)), 2.0),
+        max(float(np.percentile(corrected, base_pct)), 2.0),
+        max(float(np.percentile(corrected, min(base_pct + 2.0, 97.0))), 2.0),
+        max(float(otsu_thr) * (0.45 + 0.25 * sensitivity), 2.0),
+    ]
 
-    split: list[tuple[int, int, int, int]] = []
-    for box in boxes:
-        split.extend(_split_bimodal_box(corrected, box))
+    best_boxes: list[tuple[int, int, int, int]] = []
+    best_score = -1e9
+    # Prefer stricter thresholds on ties so weak-threshold over-splits lose.
+    for thr in sorted(set(thresholds), reverse=True):
+        boxes = _filter_weak_component_boxes(
+            _components_at_threshold(corrected, thr, min_area=min_area),
+            corrected,
+        )
+        score = _score_band_boxes(boxes, h, w, corrected)
+        if score >= best_score:
+            best_score = score
+            best_boxes = boxes
+
+    best_boxes = _filter_weak_component_boxes(best_boxes, corrected)
 
     pad_x, pad_y = 2, 3
     absolute: list[tuple[int, int, int, int]] = []
-    for x, y, bw, bh in split:
+    for x, y, bw, bh in best_boxes:
         ax = max(0, x1 + x - pad_x)
         ay = max(0, y1 + y - pad_y)
         aw = min(gray.shape[1], x1 + x + bw + pad_x) - ax
@@ -496,12 +596,6 @@ def analyze_array(image: np.ndarray, config: AnalysisConfig | None = None) -> An
 
 def analyze_image(path: str | Path, config: AnalysisConfig | None = None) -> AnalysisResult:
     """Read and analyze an image while supporting non-ASCII Windows paths."""
-    path = Path(path)
-    try:
-        data = np.fromfile(path, dtype=np.uint8)
-    except OSError as exc:
-        raise ValueError(f"无法读取图片：{path}") from exc
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError(f"不支持或已损坏的图片：{path}")
-    return analyze_array(image, config=config)
+    from .roi import load_bgr
+
+    return analyze_array(load_bgr(path), config=config)

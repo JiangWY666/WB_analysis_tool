@@ -15,4 +15,4 @@ __all__ = [
     "quantify_roi_lanes",
     "rotate_image",
 ]
-__version__ = "0.2.2"
+__version__ = "0.2.3"

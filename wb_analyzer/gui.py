@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import re
+import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -18,6 +18,7 @@ from .analysis import (
     analyze_array,
     rebuild_result,
 )
+from .dnd import decode_drop_token, parse_drop_paths
 from .export import export_figure, export_result
 from .normalize import (
     AnalysisSession,
@@ -34,6 +35,7 @@ from .roi import (
     quantify_roi_lanes,
     roi_intensity_profile,
     rotate_image,
+    separators_from_profile,
     to_gray,
 )
 
@@ -41,14 +43,20 @@ try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
 
     _TkBase = TkinterDnD.Tk
-    _HAS_DND = True
+    _HAS_TKDND = True
 except Exception:  # pragma: no cover - optional at runtime
     _TkBase = tk.Tk
     DND_FILES = None
-    _HAS_DND = False
+    _HAS_TKDND = False
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+BG_MODE_LABELS = {
+    "自动（推荐）": "auto",
+    "深色条带 / 浅底": "dark_bands",
+    "浅色条带 / 深底": "light_bands",
+}
+BG_MODE_VALUES = {value: label for label, value in BG_MODE_LABELS.items()}
 
 
 class ProfileDialog(tk.Toplevel):
@@ -118,11 +126,9 @@ class AnalyzerApp(_TkBase):
 
         self.tool = tk.StringVar(value="roi")
         self.rotation = tk.DoubleVar(value=0.0)
-        self.sensitivity = tk.DoubleVar(value=1.0)
-        self.kernel_mode = tk.StringVar(value="自动")
-        self.kernel_size = tk.IntVar(value=31)
-        self.background_mode = tk.StringVar(value="auto")
-        self.lane_count = tk.IntVar(value=3)
+        self.weak_band_level = tk.DoubleVar(value=55.0)  # 0=strict, 100=catch weak
+        self.background_label = tk.StringVar(value="自动（推荐）")
+        self.lane_count = tk.IntVar(value=0)  # 0 = auto from profile peaks
         self.show_guides = tk.BooleanVar(value=True)
         self.entry_kind = tk.StringVar(value="loading_control")
         self.protein_name = tk.StringVar(value="Actin")
@@ -136,6 +142,7 @@ class AnalyzerApp(_TkBase):
         self.lane_count.trace_add("write", self._on_lane_count_changed)
         self.tool.trace_add("write", self._on_tool_changed)
         self.show_guides.trace_add("write", lambda *_: self._redraw_overlays())
+        self._sync_weak_band_label()
         self._on_tool_changed()
 
     def _build_layout(self) -> None:
@@ -215,36 +222,47 @@ class AnalyzerApp(_TkBase):
         ttk.Button(ruler_btns, text="旋正为水平", command=lambda: self.apply_ruler("horizontal")).pack(side=tk.LEFT)
         ttk.Button(ruler_btns, text="旋正为垂直", command=lambda: self.apply_ruler("vertical")).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(prep, text="灵敏度").grid(row=5, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(prep, text="弱条带检出").grid(row=5, column=0, sticky="w", pady=(12, 0))
         sens = ttk.Frame(prep)
         sens.grid(row=5, column=1, sticky="ew", pady=(12, 0))
-        ttk.Scale(sens, from_=0.5, to=1.8, variable=self.sensitivity, orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.sensitivity_label = ttk.Label(sens, text="1.00", width=6)
-        self.sensitivity_label.pack(side=tk.LEFT)
-        self.sensitivity.trace_add("write", lambda *_: self.sensitivity_label.config(text=f"{float(self.sensitivity.get()):.2f}"))
+        ttk.Label(sens, text="保守").pack(side=tk.LEFT)
+        ttk.Scale(sens, from_=0, to=100, variable=self.weak_band_level, orient=tk.HORIZONTAL).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=4
+        )
+        ttk.Label(sens, text="灵敏").pack(side=tk.LEFT)
+        self.weak_band_label = ttk.Label(prep, text="当前：适中（漏检时可往右拖）")
+        self.weak_band_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self.weak_band_level.trace_add("write", self._sync_weak_band_label)
 
-        ttk.Label(prep, text="形态学核").grid(row=6, column=0, sticky="w", pady=(10, 0))
-        kernel_row = ttk.Frame(prep)
-        kernel_row.grid(row=6, column=1, sticky="w", pady=(10, 0))
-        ttk.Combobox(kernel_row, textvariable=self.kernel_mode, values=("自动", "手动"), width=6, state="readonly").pack(side=tk.LEFT)
-        ttk.Spinbox(kernel_row, from_=11, to=101, increment=2, textvariable=self.kernel_size, width=6).pack(side=tk.LEFT, padx=6)
-        ttk.Label(prep, text="背景模式").grid(row=7, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(prep, text="条带颜色").grid(row=7, column=0, sticky="w", pady=(10, 0))
         ttk.Combobox(
             prep,
-            textvariable=self.background_mode,
-            values=("auto", "dark_bands", "light_bands"),
+            textvariable=self.background_label,
+            values=tuple(BG_MODE_LABELS.keys()),
             state="readonly",
-            width=14,
+            width=18,
         ).grid(row=7, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(
+            prep,
+            text="普通白底深带选“深色条带”；黑底发光选“浅色条带”。一般保持自动即可。",
+            wraplength=320,
+            justify=tk.LEFT,
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
         prep.columnconfigure(1, weight=1)
 
-        ttk.Label(roi_tab, text="泳道数").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(roi_tab, from_=1, to=24, textvariable=self.lane_count, width=6).grid(row=0, column=1, sticky="w")
-        ttk.Button(roi_tab, text="等分重置分隔线", command=self.reset_separators).grid(row=1, column=0, columnspan=2, sticky="ew", pady=8)
+        ttk.Label(roi_tab, text="期望条带数").grid(row=0, column=0, sticky="w")
+        lane_row = ttk.Frame(roi_tab)
+        lane_row.grid(row=0, column=1, sticky="w")
+        ttk.Spinbox(lane_row, from_=0, to=24, textvariable=self.lane_count, width=6).pack(side=tk.LEFT)
+        ttk.Label(lane_row, text="（0=按剖面峰自动）").pack(side=tk.LEFT, padx=4)
+        ttk.Button(roi_tab, text="按剖面峰谷划分", command=self.reset_separators).grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=8
+        )
         ttk.Button(roi_tab, text="清除 ROI", command=self.clear_roi).grid(row=2, column=0, columnspan=2, sticky="ew")
         ttk.Label(
             roi_tab,
-            text="1) 点顶部“框选 ROI”\n2) 在图上拖出青色框\n3) 用“调整分隔线”拖橙色竖线\n4) 点“ROI 定量”",
+            text="1) 点顶部“框选 ROI”\n2) 拖出青色框后，橙线会按剖面峰谷自动划分\n"
+            "3) 可再拖橙线微调\n4) 点“ROI 定量”或“强度剖面”检查",
             wraplength=320,
             justify=tk.LEFT,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
@@ -287,30 +305,56 @@ class AnalyzerApp(_TkBase):
         self.canvas.bind("<Escape>", lambda _e: self._cancel_draw())
 
     def _setup_dnd(self) -> None:
-        if not _HAS_DND or DND_FILES is None:
-            return
-        try:
-            self.canvas.drop_target_register(DND_FILES)
-            self.canvas.dnd_bind("<<Drop>>", self._on_drop)
-            self.drop_target_register(DND_FILES)
-            self.dnd_bind("<<Drop>>", self._on_drop)
-        except Exception:
-            pass
+        hooked = False
+        if sys.platform.startswith("win"):
+            try:
+                import windnd
+
+                windnd.hook_dropfiles(self, func=self._on_windnd_drop)
+                windnd.hook_dropfiles(self.canvas, func=self._on_windnd_drop)
+                hooked = True
+            except Exception:
+                hooked = False
+        if _HAS_TKDND and DND_FILES is not None:
+            try:
+                self.canvas.drop_target_register(DND_FILES)
+                self.canvas.dnd_bind("<<Drop>>", self._on_drop)
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind("<<Drop>>", self._on_drop)
+                hooked = True
+            except Exception:
+                pass
+        if not hooked:
+            self.status.config(text="当前环境不支持拖拽，请用“打开”按钮选图（含 TIF）")
+
+    def _on_windnd_drop(self, files) -> None:  # noqa: ANN001
+        paths = [Path(decode_drop_token(item)) for item in (files or []) if decode_drop_token(item)]
+        self._open_first_image(paths)
 
     def _on_drop(self, event) -> None:  # noqa: ANN001
-        paths = self._parse_drop_paths(getattr(event, "data", ""))
-        for path in paths:
-            if path.suffix.lower() in IMAGE_SUFFIXES and path.exists():
-                self.load_image(path)
-                return
-        messagebox.showwarning("拖拽失败", "请拖入 PNG/JPG/BMP/TIFF 图片文件。")
+        self._open_first_image(parse_drop_paths(getattr(event, "data", "")))
 
-    @staticmethod
-    def _parse_drop_paths(data: str) -> list[Path]:
-        if not data:
-            return []
-        parts = re.findall(r"\{([^}]+)\}|[^\s]+", data)
-        return [Path(part.strip().strip("{}")) for part in parts if part.strip()]
+    def _open_first_image(self, paths: list[Path]) -> None:
+        for path in paths:
+            candidate = path.expanduser()
+            if candidate.suffix.lower() in IMAGE_SUFFIXES and candidate.exists():
+                try:
+                    self.load_image(candidate)
+                    return
+                except ValueError as exc:
+                    messagebox.showerror("无法打开图片", str(exc))
+                    return
+        messagebox.showwarning("拖拽失败", "请拖入 PNG / JPG / BMP / TIF / TIFF 图片文件。")
+
+    def _sync_weak_band_label(self, *_args: object) -> None:
+        value = float(self.weak_band_level.get())
+        if value < 35:
+            text = "当前：保守（减少杂点，可能漏弱带）"
+        elif value > 70:
+            text = "当前：灵敏（更容易抓弱带，也可能多检）"
+        else:
+            text = "当前：适中（漏检时可往右拖）"
+        self.weak_band_label.config(text=text)
 
     def _on_tool_changed(self, *_args: object) -> None:
         tips = {
@@ -323,12 +367,17 @@ class AnalyzerApp(_TkBase):
         cursors = {"roi": "crosshair", "ruler": "tcross", "band": "plus", "select": "sb_h_double_arrow"}
         self.canvas.config(cursor=cursors.get(self.tool.get(), "arrow"))
 
+    def _background_mode_value(self) -> str:
+        return BG_MODE_LABELS.get(self.background_label.get(), "auto")
+
     def _current_config(self) -> AnalysisConfig:
-        kernel = None if self.kernel_mode.get() == "自动" else int(self.kernel_size.get())
+        # UI: higher weak-band level => more inclusive => lower internal sensitivity.
+        level = float(np.clip(self.weak_band_level.get(), 0.0, 100.0))
+        sensitivity = float(np.clip(1.65 - 1.15 * (level / 100.0), 0.45, 1.8))
         return AnalysisConfig(
-            sensitivity=float(self.sensitivity.get()),
-            kernel_size=kernel,
-            background_mode=self.background_mode.get(),  # type: ignore[arg-type]
+            sensitivity=sensitivity,
+            kernel_size=None,
+            background_mode=self._background_mode_value(),  # type: ignore[arg-type]
         )
 
     def choose_image(self) -> None:
@@ -355,7 +404,7 @@ class AnalyzerApp(_TkBase):
         self.export_button.config(state=tk.DISABLED)
         self.band_list.delete(0, tk.END)
         self.tool.set("roi")
-        self.status.config(text=f"已加载 {path.name} — 可直接框选 ROI，或拖图进来换图")
+        self.status.config(text=f"已加载 {path.name} — 支持拖入 TIF/PNG 等图片，也可框选 ROI")
 
     def _schedule_rotation(self, *_args: object) -> None:
         self.rotation_label.config(text=f"{float(self.rotation.get()):.1f}°")
@@ -440,14 +489,27 @@ class AnalyzerApp(_TkBase):
                 self.canvas.create_line(sx, y1, sx, y2, fill="#ffb300", width=3, tags=("overlay", f"sep-{index}"))
 
     def reset_separators(self) -> None:
-        if self.roi is None:
+        if self.roi is None or self.working_bgr is None:
             return
         try:
-            n = int(self.lane_count.get())
+            expected = int(self.lane_count.get())
         except (tk.TclError, ValueError):
-            n = 1
-        self.separators = default_separators(self.roi, max(1, n))
+            expected = 0
+        profile, _ = roi_intensity_profile(
+            to_gray(self.working_bgr),
+            self.roi,
+            background_mode=self._background_mode_value(),  # type: ignore[arg-type]
+        )
+        self.separators = separators_from_profile(
+            profile,
+            self.roi,
+            expected_lanes=expected if expected > 0 else None,
+        )
+        if not self.separators and expected > 1:
+            self.separators = default_separators(self.roi, expected)
+        lane_n = len(self.separators) + 1 if self.separators else max(1, expected)
         self._redraw_overlays()
+        self.status.config(text=f"已按剖面峰谷划分成 {lane_n} 个泳道（可拖橙线微调）")
 
     def clear_roi(self) -> None:
         self.roi = None
@@ -574,7 +636,7 @@ class AnalyzerApp(_TkBase):
             dark_bands = (
                 self.result.dark_bands
                 if self.result is not None
-                else _resolve_dark_bands(gray, self.background_mode.get())  # type: ignore[arg-type]
+                else _resolve_dark_bands(gray, self._background_mode_value())  # type: ignore[arg-type]
             )
             existing = list(self.result.measurements) if self.result is not None else []
             added = BandMeasurement(0, 0, x1, y1, x2 - x1, y2 - y1, 0, 0.0, 0.0, 0.0)
@@ -633,7 +695,7 @@ class AnalyzerApp(_TkBase):
                 to_gray(self.working_bgr),
                 self.roi,
                 self.separators,
-                background_mode=self.background_mode.get(),  # type: ignore[arg-type]
+                background_mode=self._background_mode_value(),  # type: ignore[arg-type]
             )
             self._refresh_band_list()
             self._refresh_view(keep_overlays=False)
@@ -649,7 +711,7 @@ class AnalyzerApp(_TkBase):
         profile, _ = roi_intensity_profile(
             to_gray(self.working_bgr),
             self.roi,
-            background_mode=self.background_mode.get(),  # type: ignore[arg-type]
+            background_mode=self._background_mode_value(),  # type: ignore[arg-type]
         )
         rel = [max(0.0, min(float(self.roi.width - 1), sep - self.roi.x)) for sep in self.separators]
         ProfileDialog(self, profile, rel)

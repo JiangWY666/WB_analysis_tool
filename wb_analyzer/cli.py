@@ -17,19 +17,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--sensitivity",
         type=float,
         default=1.0,
-        help="检测灵敏度，越小越容易检出弱条带（默认 1.0，范围约 0.35–2.5）",
+        help="内部阈值强度：越小越容易检出弱条带（默认 1.0）",
     )
     parser.add_argument(
         "--kernel-size",
         type=int,
         default=None,
-        help="背景校正形态学核大小（奇数像素）；省略则自动估计",
+        help="背景平滑尺度（奇数像素，一般不用改；省略=自动）",
     )
     parser.add_argument(
         "--background",
         choices=("auto", "dark_bands", "light_bands"),
         default="auto",
-        help="背景模式：auto / dark_bands（深带浅底）/ light_bands（浅带深底）",
+        help="条带颜色：auto / dark_bands（深带浅底）/ light_bands（浅带深底）",
     )
     return parser
 
