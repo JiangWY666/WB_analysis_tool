@@ -590,12 +590,12 @@ class AnalyzerApp(_TkBase):
             messagebox.showinfo("提示", "请先用“标尺对齐”工具在图上拖一条线。")
             return
         current = float(self.rotation.get())
-        # Positive UI rotation is clockwise. In image coordinates, clockwise increases atan2 tilt,
-        # so subtract the measured tilt to straighten to horizontal/vertical.
+        # Measured tilt uses image atan2 (down-right is positive). OpenCV positive
+        # rotation reduces that tilt, so add the measured angle to straighten.
         if orientation == "horizontal":
-            new_angle = normalize_angle(current - self.ruler_angle)
+            new_angle = normalize_angle(current + self.ruler_angle)
         else:
-            new_angle = normalize_angle(current - normalize_angle(self.ruler_angle - 90.0))
+            new_angle = normalize_angle(current + (self.ruler_angle - 90.0))
         self.rotation.set(new_angle)
         self.status.config(text=f"已按标尺旋正为{'水平' if orientation == 'horizontal' else '垂直'}（{new_angle:.2f}°）")
 
