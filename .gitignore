@@ -6,3 +6,6 @@ build/
 dist/
 *.egg-info/
 results/
+*.spec.bak
+desktop/*.toc
+desktop/warn-*.txt

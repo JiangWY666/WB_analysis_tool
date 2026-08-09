@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wb-gray-analyzer"
-version = "0.1.1"
+version = "0.1.2"
 description = "Automatic Western Blot lane, band and grayscale analyzer"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,10 +16,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
+build = ["pyinstaller>=6.3"]
 
 [project.scripts]
 wb-analyzer = "wb_analyzer.gui:main"
 wb-analyze = "wb_analyzer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wb_analyzer*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
