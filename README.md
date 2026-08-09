@@ -6,7 +6,7 @@
 
 ## 功能
 
-- Windows 桌面界面（Tkinter，无需浏览器）
+- Windows 桌面软件（可打包为 `.exe`，也可用 Python 直接运行）
 - 自动识别“深色条带/浅色背景”和“浅色条带/深色背景”，也支持手动指定
 - 自动背景校正、泳道检测和条带检测
 - 可调灵敏度与形态学核大小，适配不同曝光与条带粗细
@@ -15,7 +15,41 @@
 - 自动保存 CSV 结果及标注预览图
 - 同一个分析核心可通过命令行调用，方便批处理和后续扩展
 
-## 安装与运行
+## Windows 软件（推荐）
+
+形态是 **绿色免安装包**：解压后双击 `WB-Analyzer.exe` 即可使用，无需先装 Python。
+
+### 获取现成安装包
+
+1. 打开本仓库 GitHub 页面的 **Actions** → 工作流 **Build Windows EXE**
+2. 选一次成功的运行记录，下载 Artifact：`WB-Analyzer-Windows`
+3. 解压 zip 后进入文件夹，双击 `WB-Analyzer.exe`
+
+也可在本机自己打包（需 Windows + Python 3.10+）：
+
+```powershell
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
+```
+
+完成后得到：
+
+- `dist\WB-Analyzer\WB-Analyzer.exe`：主程序
+- `dist\WB-Analyzer-Windows.zip`：可直接分发的压缩包
+
+> 首次运行若被 Windows SmartScreen 拦截，选“更多信息 → 仍要运行”。当前未做代码签名。请保留整个 `WB-Analyzer` 文件夹，不要只拷贝单个 exe。
+
+### 软件内使用步骤
+
+1. 打开 `WB-Analyzer.exe`
+2. 选择 WB 图片（PNG / JPG / BMP / TIFF）
+3. 需要时调节灵敏度、形态学核、背景模式
+4. 点击 **自动分析**
+5. 检查预览：删除误检，或勾选「拖拽画框添加」补框
+6. 点击 **导出结果**，得到 CSV 与标注预览图
+
+## 开发模式安装（Python）
 
 需要 Python 3.10 或更高版本。Windows PowerShell 中运行：
 
@@ -66,4 +100,11 @@ pip install -e '.[dev]'
 pytest
 ```
 
-分析算法位于 `wb_analyzer/analysis.py`，桌面界面位于 `wb_analyzer/gui.py`。后续可在此基础上增加检测框拖拽微调、内参归一化、分组统计和 Excel 报告。
+打包相关文件：
+
+- `packaging/run_gui.py`：exe 入口
+- `packaging/wb-analyzer.spec`：PyInstaller 配置
+- `scripts/build_windows.ps1`：Windows 一键打包
+- `.github/workflows/build-windows.yml`：CI 自动出 Windows 包
+
+分析算法位于 `wb_analyzer/analysis.py`，桌面界面位于 `wb_analyzer/gui.py`。后续可在此基础上增加安装程序（如 Inno Setup）、代码签名、检测框拖拽微调和内参归一化。
