@@ -34,6 +34,8 @@ class NormalizedRow:
     target_name: str
     target: float
     normalized: float | None
+    fold_change: float | None = None
+    """Normalized value relative to the control lane (control lane = 1.0)."""
 
 
 class AnalysisSession:
@@ -92,6 +94,7 @@ class AnalysisSession:
         self,
         target: QuantEntry,
         loading_control: QuantEntry | None = None,
+        control_lane: int = 1,
     ) -> list[NormalizedRow]:
         lc = loading_control or self.latest_loading_control(target.group)
         if lc is None:
@@ -99,29 +102,38 @@ class AnalysisSession:
         count = min(len(target.intensities), len(lc.intensities))
         if count == 0:
             raise ValueError("目标与内参没有可对齐的泳道")
-        rows: list[NormalizedRow] = []
+        ratios: list[float | None] = []
         for index in range(count):
             lc_val = float(lc.intensities[index])
             target_val = float(target.intensities[index])
-            ratio = (target_val / lc_val) if lc_val > 0 else None
+            ratios.append((target_val / lc_val) if lc_val > 0 else None)
+        control_index = int(np_clip_index(control_lane - 1, count))
+        control_ratio = ratios[control_index]
+        rows: list[NormalizedRow] = []
+        for index in range(count):
+            ratio = ratios[index]
+            fold = None
+            if ratio is not None and control_ratio is not None and control_ratio > 0:
+                fold = round(ratio / control_ratio, 6)
             rows.append(
                 NormalizedRow(
                     group=target.group,
                     lane=index + 1,
                     loading_control_name=lc.name,
-                    loading_control=lc_val,
+                    loading_control=float(lc.intensities[index]),
                     target_name=target.name,
-                    target=target_val,
+                    target=float(target.intensities[index]),
                     normalized=None if ratio is None else round(ratio, 6),
+                    fold_change=fold,
                 )
             )
         return rows
 
-    def normalize_all(self) -> list[NormalizedRow]:
+    def normalize_all(self, control_lane: int = 1) -> list[NormalizedRow]:
         rows: list[NormalizedRow] = []
         for target in self.targets():
             try:
-                rows.extend(self.normalize(target))
+                rows.extend(self.normalize(target, control_lane=control_lane))
             except ValueError:
                 continue
         return rows
@@ -193,6 +205,10 @@ class AnalysisSession:
         return count
 
 
+def np_clip_index(index: int, count: int) -> int:
+    return max(0, min(int(index), count - 1))
+
+
 def export_normalized_csv(rows: list[NormalizedRow], path: str | Path) -> Path:
     path = Path(path)
     fields = [
@@ -203,6 +219,7 @@ def export_normalized_csv(rows: list[NormalizedRow], path: str | Path) -> Path:
         "target_name",
         "target",
         "normalized",
+        "fold_change",
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -217,6 +234,7 @@ def export_normalized_csv(rows: list[NormalizedRow], path: str | Path) -> Path:
                     "target_name": row.target_name,
                     "target": row.target,
                     "normalized": "" if row.normalized is None else row.normalized,
+                    "fold_change": "" if row.fold_change is None else row.fold_change,
                 }
             )
     return path

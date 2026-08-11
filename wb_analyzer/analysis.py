@@ -340,13 +340,15 @@ def _score_band_boxes(
     if med_h > 0:
         score -= float(heights.std() / med_h) * 8.0
 
+    # Same-row and density-median bonuses are meaningless for a single box (a
+    # lone membrane-sized blob would trivially collect them), so gate on >= 2.
     centers_y = [y + h / 2.0 for _, y, _, h in boxes]
-    if max(centers_y) - min(centers_y) < 0.4 * height:
+    if count >= 2 and max(centers_y) - min(centers_y) < 0.4 * height:
         score += 6.0
     # Noise blobs often cling to the top margin on uneven gradients.
     score -= sum(1 for _, y, _, h in boxes if y <= 2 and h < 0.22 * height) * 5.0
 
-    if corrected is not None and count:
+    if corrected is not None and count >= 2:
         dens = np.array(
             [float(corrected[y : y + h, x : x + w].sum()) for x, y, w, h in boxes],
             dtype=float,
@@ -354,7 +356,9 @@ def _score_band_boxes(
         ref = float(np.percentile(dens, 75))
         if ref > 0:
             score += float(np.median(dens)) / max(ref, 1.0) * 4.0
-            score -= float(np.sum(dens < 0.18 * ref)) * 6.0
+            # Real strong/weak pairs reach ~10x ratios; only punish boxes far
+            # weaker than that (noise splinters), not genuine faint bands.
+            score -= float(np.sum(dens < 0.08 * ref)) * 6.0
 
     if all(w < 0.4 * width for _, _, w, _ in boxes):
         score += 3.0
@@ -377,7 +381,9 @@ def _filter_weak_component_boxes(
     ref = float(np.percentile(dens, 75))
     if ref <= 1e-6:
         return boxes
-    kept = [box for box, value in zip(boxes, dens, strict=True) if value >= 0.16 * ref]
+    # Keep genuine faint bands (strong/weak pairs reach ~10x); drop only
+    # fragments far below the strong boxes.
+    kept = [box for box, value in zip(boxes, dens, strict=True) if value >= 0.08 * ref]
     return kept or boxes
 
 
@@ -426,11 +432,18 @@ def _boxes_from_membrane_components(
     min_area = max(28.0, 0.00055 * h * w / max(sensitivity, 0.5))
     base_pct = float(np.clip(90.0 + 3.0 * (sensitivity - 1.0), 84.0, 96.0))
     otsu_thr, _ = cv2.threshold(corrected, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    peak_level = float(corrected.max())
     thresholds = [
         max(float(np.percentile(corrected, base_pct - 3.0)), 2.0),
         max(float(np.percentile(corrected, base_pct)), 2.0),
         max(float(np.percentile(corrected, min(base_pct + 2.0, 97.0))), 2.0),
         max(float(otsu_thr) * (0.45 + 0.25 * sensitivity), 2.0),
+        # Peak-relative rungs: percentile/Otsu thresholds collapse to the noise
+        # floor (or jump past the band range) on mostly-empty membranes, so the
+        # correct mid-range candidates would never be generated without these.
+        max(peak_level * 0.10, 2.0),
+        max(peak_level * 0.18, 2.0),
+        max(peak_level * 0.30, 2.0),
     ]
 
     best_boxes: list[tuple[int, int, int, int]] = []
@@ -441,6 +454,10 @@ def _boxes_from_membrane_components(
             _components_at_threshold(corrected, thr, min_area=min_area),
             corrected,
         )
+        if not boxes:
+            # An empty candidate must never outrank a real (if penalized)
+            # detection; small membranes easily score below the old -1.0.
+            continue
         score = _score_band_boxes(boxes, h, w, corrected)
         if score >= best_score:
             best_score = score
