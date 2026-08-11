@@ -84,11 +84,20 @@ def normalize_angle(angle_deg: float) -> float:
     return angle
 
 
-def rotate_image(image: np.ndarray, angle_deg: float) -> np.ndarray:
+def rotate_image(
+    image: np.ndarray,
+    angle_deg: float,
+    *,
+    border_value: float | None = None,
+) -> np.ndarray:
     """Rotate image around center.
 
     Positive degrees follow OpenCV/image-coordinate convention: they reduce a
     down-right (positive atan2) tilt, i.e. lift the right side.
+
+    ``border_value=None`` fills the expanded corners with the median tone of
+    the image border, so dark-background blots don't get white wedges that
+    would skew background estimates.
     """
     if abs(angle_deg) < 1e-6:
         return image.copy()
@@ -101,7 +110,11 @@ def rotate_image(image: np.ndarray, angle_deg: float) -> np.ndarray:
     new_h = int(h * cos + w * sin)
     matrix[0, 2] += (new_w / 2.0) - center[0]
     matrix[1, 2] += (new_h / 2.0) - center[1]
-    border = (255, 255, 255) if image.ndim == 3 else 255
+    if border_value is None:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        edges = np.concatenate((gray[0], gray[-1], gray[:, 0], gray[:, -1]))
+        border_value = float(np.median(edges))
+    border = (border_value,) * 3 if image.ndim == 3 else border_value
     return cv2.warpAffine(
         image,
         matrix,
@@ -167,6 +180,9 @@ def find_profile_peaks(
             index = right + 1
             continue
         index += 1
+    # 肩部假峰不在这里合并：真实样图基准扫描证明任何谷深合并阈值都会误合并
+    # 多膜拼贴图的真峰（合并越激进正确率越低）；肩峰问题由
+    # separators_from_profile 的等宽网格路径结构性规避。
     candidates = sorted(set(candidates), key=lambda i: smooth[i], reverse=True)
     peaks: list[int] = []
     for peak in candidates:
@@ -177,19 +193,179 @@ def find_profile_peaks(
     return sorted(peaks)
 
 
+GRID_SNAP_WINDOW_FRAC = 0.25
+"""网格分隔线的谷位吸附半窗，占单泳道宽度的比例。"""
+
+AUTO_GRID_MAX_SEPARATOR_HEIGHT = 0.55
+"""自动网格分隔线允许的最大相对高度（0=谷底 1=最高峰），超出则回退峰谷。"""
+
+
+def _grid_valley_positions(
+    smooth: np.ndarray,
+    lanes: int,
+    *,
+    window_frac: float = GRID_SNAP_WINDOW_FRAC,
+    center_pull: float = 0.03,
+) -> list[int]:
+    """等宽网格初始化 + 谷位吸附后的分隔位（相对 ROI 的列索引）。
+
+    泳道由梳子成型、物理上近似等宽：先按 ``lanes`` 等分给出 n-1 个初始
+    分隔位，再让每根线在 ±window_frac×泳道宽 内吸附到平滑剖面的局部最低
+    点。``center_pull`` 给一个朝网格位的微小拉力，让大片空白（平坦谷）里
+    的分隔线停在网格附近而不是漂到窗口边缘。窗口 ≤ 半泳道宽保证相邻
+    分隔线不会交叉，额外再做单调钳制兜底。
+    """
+    size = int(smooth.size)
+    lane_w = size / float(lanes)
+    span = float(smooth.max() - smooth.min())
+    if span <= 1e-9:
+        # 平坦剖面（空白 ROI）：直接用精确等分位。
+        return [int(round(lane_w * i)) for i in range(1, lanes)]
+    half = lane_w * float(min(window_frac, 0.49))
+    positions: list[int] = []
+    prev = 0
+    for i in range(1, lanes):
+        center = lane_w * i
+        lo = max(int(np.ceil(center - half)), prev + 2, 1)
+        hi = min(int(np.floor(center + half)), size - 2)
+        if hi < lo:
+            pos = int(np.clip(round(center), prev + 1, size - 1))
+        else:
+            idx = np.arange(lo, hi + 1)
+            pull = span * float(center_pull) * np.abs(idx - center) / max(half, 1.0)
+            pos = int(idx[int(np.argmin(smooth[lo : hi + 1] + pull))])
+        positions.append(pos)
+        prev = pos
+    return positions
+
+
+def _estimate_lane_count(
+    smooth: np.ndarray,
+    *,
+    ac_min: float = 0.25,
+    sub_min: float = 0.10,
+    max_lanes: int = 24,
+) -> int | None:
+    """用剖面自相关的主周期估计泳道数（等宽先验）；周期性不足返回 None。
+
+    强弱交替的泳道布局会让自相关主峰落在 2×真实间距上（强带与强带对齐）；
+    只要半周期处也存在幅度 ≥ ``sub_min`` 的局部峰（说明半间距上真有条带），
+    就取更细的周期。
+    """
+    size = int(smooth.size)
+    if size < 24:
+        return None
+    x = smooth - float(smooth.mean())
+    denom = float(np.dot(x, x))
+    if denom <= 1e-12:
+        return None
+    ac = np.correlate(x, x, mode="full")[size - 1 :] / denom
+    min_lag = max(8, size // max_lanes)
+    max_lag = size // 2
+    if max_lag <= min_lag + 1:
+        return None
+    best_lag = None
+    best_val = float(ac_min)
+    for lag in range(min_lag, max_lag + 1):
+        left = float(ac[lag - 1])
+        right = float(ac[lag + 1]) if lag + 1 < ac.size else -np.inf
+        if ac[lag] >= left and ac[lag] >= right and float(ac[lag]) >= best_val:
+            best_lag, best_val = lag, float(ac[lag])
+    if best_lag is None:
+        return None
+    lag = best_lag
+    while lag // 2 >= min_lag:
+        lo = max(min_lag, lag // 2 - 2)
+        hi = min(max_lag, lag // 2 + 3)
+        j = lo + int(np.argmax(ac[lo : hi + 1]))
+        is_peak = (
+            0 < j < ac.size - 1
+            and float(ac[j]) >= float(ac[j - 1])
+            and float(ac[j]) >= float(ac[j + 1])
+            and float(ac[j]) >= float(sub_min)
+        )
+        if not is_peak:
+            break
+        lag = j
+    lanes = int(round(size / float(lag)))
+    if lanes < 2 or lanes > max_lanes:
+        return None
+    return lanes
+
+
+def _pick_lane_count(size: int, lanes: int, peaks: list[int], *, max_lanes: int = 24) -> int:
+    """在 ``lanes`` 与 ``2×lanes`` 之间用峰证据消歧。
+
+    强弱交替布局（强-弱-强-弱）会让自相关主峰落在 2×真实泳道间距上（弱带
+    太弱时半周期处甚至没有自相关峰）。判据：把 ROI 等分成候选数量的格子，
+    统计每格内检出峰的数量——正确的泳道数应让大多数格子恰好 1 峰；格子里
+    挤了 ≥2 个峰说明划分过粗。空格子不罚分（空白泳道合法）。
+    """
+    candidates = [lanes]
+    doubled = lanes * 2
+    if doubled <= max_lanes and size / doubled >= 8:
+        candidates.append(doubled)
+    if len(candidates) == 1 or not peaks:
+        return lanes
+
+    def score(n: int) -> float:
+        counts = [0] * n
+        cell_w = size / n
+        for peak in peaks:
+            counts[min(n - 1, int(peak / cell_w))] += 1
+        exact = sum(1 for c in counts if c == 1)
+        crowded = sum(1 for c in counts if c >= 2)
+        return exact - 0.5 * crowded
+
+    return max(candidates, key=score)
+
+
+def _max_relative_height(smooth: np.ndarray, positions: list[int]) -> float:
+    """分隔位处平滑剖面的最大相对高度（0=基线 1=最高峰）。"""
+    baseline = float(np.percentile(smooth, 30))
+    span = float(smooth.max() - baseline)
+    if span <= 1e-9 or not positions:
+        return 0.0
+    return max((float(smooth[p]) - baseline) / span for p in positions)
+
+
 def separators_from_profile(
     profile: np.ndarray,
     roi: RoiRect,
     *,
     expected_lanes: int | None = None,
 ) -> list[float]:
-    """Place lane separators at valleys between profile peaks."""
-    peaks = find_profile_peaks(profile, expected_lanes=expected_lanes or None)
-    if len(peaks) < 2:
-        if expected_lanes and expected_lanes > 1:
-            return default_separators(roi, expected_lanes)
+    """Place lane separators on an ROI column profile.
+
+    - ``expected_lanes`` 已知（≥2）：等宽网格初始化 + 谷位吸附，完全不依赖
+      峰检测，强带的肩部假峰不会再让分隔线切进条带。
+    - 未知（自动）：先用剖面自相关估计泳道间距（等宽先验），拟合等宽网格
+      并吸附谷位；周期性不足或分隔线落在过高的剖面位置时，回退到原有的
+      峰-谷逻辑（候选峰带肩部假峰合并）。
+    """
+    profile = np.asarray(profile, dtype=float)
+    n_target = int(expected_lanes) if expected_lanes else 0
+    if n_target == 1:
+        return []
+    if n_target >= 2:
+        if profile.size < max(8, n_target * 2):
+            return default_separators(roi, n_target)
+        smooth = _smooth_profile(profile, max(2, profile.size // 80))
+        positions = _grid_valley_positions(smooth, n_target)
+        return [float(roi.x + p) for p in positions]
+    if profile.size < 8:
         return []
     smooth = _smooth_profile(profile, max(2, profile.size // 80))
+    peaks = find_profile_peaks(profile)
+    lanes = _estimate_lane_count(smooth)
+    if lanes is not None:
+        lanes = _pick_lane_count(profile.size, lanes, peaks)
+        if profile.size >= lanes * 2:
+            positions = _grid_valley_positions(smooth, lanes)
+            if positions and _max_relative_height(smooth, positions) <= AUTO_GRID_MAX_SEPARATOR_HEIGHT:
+                return [float(roi.x + p) for p in positions]
+    if len(peaks) < 2:
+        return []
     separators: list[float] = []
     for left, right in zip(peaks, peaks[1:], strict=False):
         if right - left < 3:

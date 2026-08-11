@@ -1,19 +1,33 @@
 # WB 灰度统计工具
 
-一个面向 Windows 的 Western Blot（WB）条带灰度分析工具。支持自动检测、旋转对齐、ROI 泳道定量、强度剖面质控，以及内参归一化与历史复用。
+一个面向 Windows 的 Western Blot（WB）条带灰度分析工具。PySide6 桌面界面 + 原生位深定量核心：16 位 TIFF 不降位深直接定量，ROI 泳道划分、强度剖面质控、内参归一化与 fold change 一步完成。
 
 > 当前版本仍建议由实验人员复核结果；曝光饱和、强噪声或背景极不均匀的图片可能需要调整参数、旋转，或改用 ROI 半自动路径。
 
 ## 功能
 
-- Windows 桌面软件（可打包为 `.exe`，也可用 Python 直接运行）
-- **拖拽导入**：支持把 PNG/JPG/TIF/TIFF 直接拖进窗口（Windows 优先用系统拖放）
-- **可调预览窗格**：左右拖拽分隔条调整预览/侧栏宽度
-- **标尺对齐**：拖两点测倾角并一键旋正；旋转时有十字参考线
-- **ROI 峰谷划分**：框选后按强度剖面峰谷自动分泳道，不再默认等分
-- **参数简化**：只保留“弱条带检出”“条带颜色”等白话选项
-- **自动检测**：膜区裁剪 + 多阈值连通域，减少漏检；复杂膜仍建议 ROI
-- **强度剖面 / 内参归一化 / 展示图导出**
+- **现代深色界面**（PySide6）：图像画布支持滚轮缩放、拖拽平移、适应窗口/1:1，右侧控制面板与底部剖面面板可停靠、可折叠
+- **16 位 TIFF 原生支持**：加载与定量都在原始位深（8/16 位）上进行，显示层单独做 8 位映射，不损失定量精度
+- **可调 ROI**：拖拽框选，8 向手柄改大小、整体拖动换位置；橙色泳道分隔线按强度剖面峰谷自动划分，可拖动微调、双击添加、右键删除
+- **双向同步剖面面板**（pyqtgraph）：ROI 列强度剖面与画布实时联动，分隔线在画布和剖面图里都能拖；定量后可逐泳道查看剖面与基线
+- **标尺对齐**：沿条带方向拖一条线，一键“旋正为水平/垂直”；旋转后 ROI 与分隔线自动重映射，无需重画
+- **ROI 定量**（推荐路径）：ImageJ 式基线扣除逐泳道定量；另有整图自动检测 + 补画条带兜底
+- **结果表格**：逐条带位置、平均灰度、背景、积分密度、饱和占比；选中行高亮对应条带，可删除误检
+- **归一化与 fold change**：内参（Loading Control）与目标蛋白按组配对，自动计算 normalized（Target ÷ LC）与相对对照泳道的 fold change；历史支持导出/导入 CSV 复用
+- **导出**：条带 CSV + 标注预览图；或按 ROI 裁切的展示图（可选带检测标注）
+
+## 快捷键
+
+| 快捷键 | 功能 |
+| --- | --- |
+| `1` / `2` / `3` / `4` | 框选 ROI / 标尺对齐 / 补画条带 / 调整 |
+| `Ctrl+O` | 打开图片 |
+| `Ctrl+E` | 导出数据（CSV + 标注图） |
+| `Ctrl+Shift+E` | 导出展示图 |
+| `Ctrl+0` / `Ctrl+1` | 适应窗口 / 1:1 |
+| `Ctrl+Z` | 撤销 ROI / 分隔线操作 |
+| `Delete` | 清除 ROI |
+| `F1` | 使用说明 |
 
 ## Windows 软件（推荐）
 
@@ -37,12 +51,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
 
 ### 软件内推荐流程
 
-1. 打开图片，或把图片拖进预览区
-2. 用 **标尺对齐** 沿条带上沿/泳道边拖一条线，点“旋正为水平/垂直”（也可看绿色参考线手动转）
-3. 点顶部 **框选 ROI**，拖出青色框；再切到 **调整分隔线** 拖橙色竖线
-4. 点 **ROI 定量**（复杂膜优先这条路径；自动分析仅作粗检）
-5. **强度剖面** 检查峰形；归一化页保存 LC/Target
-6. **导出展示图**（按 ROI 裁切）或导出数据 CSV
+1. 打开图片，或把图片直接拖进窗口（支持 8/16 位 TIF/TIFF、PNG、JPG、BMP）
+2. 图片歪斜时，用 **标尺对齐**（`2`）沿条带上沿拖一条线，点“旋正为水平/垂直”；ROI 会随旋转自动重映射
+3. 用 **框选 ROI**（`1`）拖出定量区域，分隔线按剖面峰谷自动划分泳道；期望泳道数可在“调整”页指定，分隔线在画布或底部剖面图中都能拖动微调，“调整”模式（`4`）下双击添加、右键删除
+4. 点 **ROI 定量**：逐泳道基线扣除，结果表、画布条带框与泳道剖面同时更新；漏检可用 **补画条带**（`3`）补充，误检在结果表删除
+5. 在 **归一化** 页把内参与目标分别加入历史（选好类型/蛋白名/分组），同组自动配对计算 normalized 与 fold change，可设对照泳道
+6. **导出数据**（`Ctrl+E`，条带 CSV + 标注图）或 **导出展示图**（`Ctrl+Shift+E`，按 ROI 裁切）
 
 ## 开发模式安装（Python）
 
@@ -52,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -e .
-wb-analyzer
+wb-analyzer                              # 或：python -m wb_analyzer.ui.app [图片路径]
 ```
 
 命令行单张自动分析：
@@ -64,7 +78,7 @@ wb-analyze .\example.tif -o .\results --sensitivity 0.8 --background dark_bands
 
 支持 PNG、JPG、JPEG、BMP 和 TIFF。
 
-## 参数说明
+## 参数说明（CLI）
 
 | 参数 | 含义 |
 | --- | --- |
@@ -88,7 +102,7 @@ wb-analyze .\example.tif -o .\results --sensitivity 0.8 --background dark_bands
 ### 内参 / 归一化
 
 - 内参 CSV：`kind,name,group,lane,integrated_density,...`，可供下次导入复用
-- 归一化 CSV：`target / loading_control / normalized`（Target ÷ Loading Control）
+- 归一化 CSV：`target / loading_control / normalized / fold_change`（normalized = Target ÷ LC；fold_change = 相对对照泳道，对照泳道 = 1.0）
 
 ## 开发
 
@@ -99,8 +113,18 @@ pytest
 
 关键模块：
 
-- `wb_analyzer/analysis.py`：自动检测
-- `wb_analyzer/roi.py`：旋转、ROI 泳道定量、强度剖面
-- `wb_analyzer/normalize.py`：内参历史与归一化
-- `wb_analyzer/gui.py`：桌面界面
+- `wb_analyzer/imageio.py`：原生位深加载（BlotImage）、旋转与坐标重映射
+- `wb_analyzer/quant.py`：泳道定量核心（列剖面、基线扣除、原生位深测量/重测）
+- `wb_analyzer/analysis.py`：整图自动检测
+- `wb_analyzer/roi.py`：ROI、剖面峰谷分隔、旋转工具
+- `wb_analyzer/normalize.py`：内参历史、归一化与 fold change
+- `wb_analyzer/ui/`：PySide6 界面（`canvas` 画布、`profile_panel` 剖面、`results_panel` 结果、`normalize_panel` 归一化、`main_window` 主窗口）
 - `desktop/` + `scripts/build_windows.ps1`：Windows 打包
+
+本机打包（也可直接用 spec）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
+# 或
+python -m PyInstaller desktop/wb-analyzer.spec --noconfirm
+```

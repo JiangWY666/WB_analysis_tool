@@ -4,16 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wb-gray-analyzer"
-version = "0.2.3"
-description = "Western Blot densitometry with ROI tools, ruler align, and figure export"
+version = "0.3.0"
+description = "Western Blot densitometry with a PySide6 GUI: native bit-depth quantification, ROI lane tools, intensity profiles, and fold-change normalization"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",
   "opencv-python>=4.8",
   "Pillow>=10.0",
-  "tkinterdnd2>=0.3.0",
-  "windnd>=1.0.7; platform_system == 'Windows'",
+  "PySide6>=6.6",
+  "pyqtgraph>=0.13",
 ]
 
 [project.optional-dependencies]
@@ -21,7 +21,7 @@ dev = ["pytest>=7.4"]
 build = ["pyinstaller>=6.3"]
 
 [project.scripts]
-wb-analyzer = "wb_analyzer.gui:main"
+wb-analyzer = "wb_analyzer.ui.app:main"
 wb-analyze = "wb_analyzer.cli:main"
 
 [tool.setuptools.packages.find]

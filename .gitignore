@@ -7,5 +7,9 @@ dist/
 *.egg-info/
 results/
 *.spec.bak
+
+# 私人实验数据，禁止提交
+0809wb/
+private_data/
 desktop/*.toc
 desktop/warn-*.txt
