@@ -100,6 +100,135 @@ def test_flat_profile_expected_lanes_gives_exact_grid() -> None:
     assert separators_from_profile(profile, roi, expected_lanes=None) == []
 
 
+BAND_HALF_WIDTH = 20.0
+SMILE_DIP = 0.30
+SMILE_SIGMA = 7.0
+
+
+def smiling_comb(size: int, centers: list[float], heights: list[float]) -> np.ndarray:
+    """合成列剖面：平顶宽条带，中间带一个"微笑"浅凹。
+
+    真实化学发光膜上的条带常常是弯的：同一行像素只切到条带的左右两端，列
+    剖面里一条条带因此出现两个局部峰、中间一个 10~30% 的浅凹（样例图实测
+    6%~27%），两个鼓包相距约半个泳道间距。这是分隔线放置最容易被骗的地
+    方——浅凹和真正的泳道间谷（掉 50%~70%）长得很像，间距还刚好一半。
+    """
+    x = np.arange(size, dtype=float)
+    profile = np.zeros(size, dtype=float)
+    for center, height in zip(centers, heights, strict=True):
+        body = np.exp(-(((x - center) / BAND_HALF_WIDTH) ** 4))
+        smile = 1.0 - SMILE_DIP * np.exp(-0.5 * ((x - center) / SMILE_SIGMA) ** 2)
+        profile += height * body * smile
+    return profile
+
+
+def lane_spans(roi: RoiRect, separators: list[float]) -> list[tuple[float, float]]:
+    edges = [float(roi.x), *sorted(separators), float(roi.x + roi.width)]
+    return list(zip(edges, edges[1:], strict=False))
+
+
+def assert_one_band_per_lane(roi: RoiRect, separators: list[float], centers: list[float]) -> None:
+    spans = lane_spans(roi, separators)
+    assert len(spans) == len(centers), f"泳道数 {len(spans)} ≠ 条带数 {len(centers)}"
+    for index, center in enumerate(centers):
+        left, right = spans[index]
+        assert left < roi.x + center < right, f"第 {index + 1} 条条带没落在自己的泳道里"
+
+
+def test_tight_neighbours_are_split_even_when_one_is_faint() -> None:
+    # 用户真实样图的核心症状：一条弱带紧挨着一条强带（间距与其余泳道相同），
+    # 旧的等宽网格把两者并成一个双倍宽的泳道。分隔线必须落在两者之间。
+    centers = [45.0 + 47.0 * i for i in range(8)]
+    heights = [30.0, 100.0, 95.0, 70.0, 60.0, 90.0, 100.0, 65.0]
+    profile = smiling_comb(400, centers, heights)
+    roi = RoiRect(0, 0, 400, 40)
+    assert_one_band_per_lane(
+        roi, separators_from_profile(profile, roi, expected_lanes=None), centers
+    )
+
+
+def test_blank_gap_gets_one_separator_and_no_extra_lane() -> None:
+    # ROI 中段整整空出两个泳道的宽度、两侧留白还不等宽：那里不能凭空多出泳道，
+    # 分隔线要落在空白中间，两侧泳道各分一半（收紧足迹后谁都不会把空白算进积分）。
+    left = [75.0 + 47.0 * i for i in range(4)]
+    right = [75.0 + 47.0 * i for i in range(6, 10)]
+    centers = left + right
+    profile = smiling_comb(560, centers, [80.0] * len(centers))
+    roi = RoiRect(0, 0, 560, 40)
+    separators = separators_from_profile(profile, roi, expected_lanes=None)
+    assert_one_band_per_lane(roi, separators, centers)
+    gap_center = (left[-1] + right[0]) / 2.0
+    in_gap = [s for s in separators if abs(s - gap_center) <= 15.0]
+    assert len(in_gap) == 1, f"空白正中应恰好一条分隔线，实得 {separators}"
+
+
+def test_non_uniform_spacing_follows_the_bands() -> None:
+    # 泳道间距不必相等（这里是两两成组、组间稍宽）：分隔线应跟着条带走，
+    # 而不是把 ROI 均分。
+    centers = [40.0, 86.0, 132.0, 196.0, 242.0, 305.0, 351.0, 397.0]
+    profile = smiling_comb(450, centers, [70.0] * len(centers))
+    roi = RoiRect(200, 0, 450, 40)
+    separators = separators_from_profile(profile, roi, expected_lanes=None)
+    assert_one_band_per_lane(roi, separators, centers)
+    for sep, (left, right) in zip(
+        separators, zip(centers, centers[1:], strict=False), strict=True
+    ):
+        # 落在两条带的中点附近，而不是贴着某一条
+        assert abs((sep - roi.x) - (left + right) / 2.0) <= 0.25 * (right - left)
+
+
+def test_smiling_bands_are_not_cut_in_half() -> None:
+    # 微笑形条带自身的中间凹陷间距约等于半个泳道间距，最容易被误判成泳道间谷。
+    centers = [40.0 + 48.0 * i for i in range(8)]
+    profile = smiling_comb(400, centers, [90.0] * 8)
+    roi = RoiRect(0, 0, 400, 40)
+    for expected in (None, 8):
+        separators = separators_from_profile(profile, roi, expected_lanes=expected)
+        assert len(separators) == 7, f"expected_lanes={expected} 切出了 {len(separators)} 条分隔线"
+        for sep in separators:
+            nearest = min(abs(sep - center) for center in centers)
+            assert nearest >= BAND_HALF_WIDTH, f"分隔线 {sep} 切进了条带"
+
+
+def test_blank_roi_margin_does_not_move_the_separators() -> None:
+    # 旧的等宽网格把相位钉死在 ROI 两端，左边多框一点空白整排分隔线就跟着挪
+    # （评审实测：左侧加 40px 空白泳道数从 8 变 9，加 120px 变 10）。
+    centers = [40.0 + 48.0 * i for i in range(6)]
+    base = smiling_comb(320, centers, [80.0] * 6)
+    reference = separators_from_profile(base, RoiRect(0, 0, 320, 40), expected_lanes=None)
+    assert len(reference) == 5
+    for margin in (40, 120):
+        padded = np.concatenate((np.zeros(margin), base))
+        separators = separators_from_profile(
+            padded, RoiRect(0, 0, padded.size, 40), expected_lanes=None
+        )
+        assert len(separators) == len(reference), f"左侧留白 {margin}px 改变了泳道数"
+        for shifted, plain in zip(separators, reference, strict=True):
+            assert abs((shifted - margin) - plain) <= 4.0
+
+
+def test_crowded_lanes_on_a_wide_roi_are_all_split() -> None:
+    # 高分辨率扫描 + 满梳 24 泳道：相邻泳道之间只掉 25%，而峰检测的最小间距
+    # 启发式按 ROI 宽度缩放（size/20），到这个密度已经分不开相邻两条了。
+    pitch = 60.0
+    centers = [pitch * (index + 1) for index in range(24)]
+    profile = smiling_comb(1500, centers, [80.0] * len(centers))
+    roi = RoiRect(0, 0, 1500, 40)
+    assert_one_band_per_lane(
+        roi, separators_from_profile(profile, roi, expected_lanes=None), centers
+    )
+
+
+def test_band_clipped_by_the_roi_edge_still_gets_a_lane() -> None:
+    # 用户常把 ROI 贴着最外侧条带画，边上那条会被切掉一半——它仍然是一条泳道。
+    centers = [30.0, 78.0, 126.0, 174.0, 222.0]
+    profile = smiling_comb(235, centers, [80.0] * len(centers))  # 末条带被右边界切断
+    roi = RoiRect(0, 0, 235, 40)
+    assert_one_band_per_lane(
+        roi, separators_from_profile(profile, roi, expected_lanes=None), centers
+    )
+
+
 def test_demo_profile_split_on_real_roi() -> None:
     demo = Path(__file__).resolve().parents[1] / "pad4_001(1)_signal.tif"
     if not demo.exists():
