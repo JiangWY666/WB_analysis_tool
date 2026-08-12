@@ -18,8 +18,47 @@ BORDER = "#3a3d43"
 BORDER_LIGHT = "#4a4e55"
 TEXT = "#e8eaed"
 TEXT_DIM = "#9aa0a6"
+TEXT_BRIGHT = "#dfe3e8"
 TEXT_DISABLED = "#5f6469"
+TEXT_FAINT = "#6a6f76"
 WARN = "#ffb74d"
+
+# ---------------------------------------------------------------- 画布 / 图表配色
+# 画布（canvas.py）与剖面图（profile_panel.py）以前各自抄了一份颜色，改主题
+# 时必然漏掉一处。这里是唯一来源，两边只做 QColor / pg.mkPen 的类型转换。
+CANVAS_BG = BG_BASE
+ROI_LINE = "#00e5ff"
+ROI_FILL_RGBA = (0, 229, 255, 16)
+HANDLE_BORDER = "#04333b"
+SEPARATOR = "#ffb300"
+SEPARATOR_HOVER = "#ffd54f"
+SEPARATOR_FOCUS = "#fff176"
+RULER = "#ff4081"
+BAND_DRAW = "#7cff6b"
+RESULT_BOX = "#ff5252"
+RESULT_BOX_SAT = "#ff9800"
+RESULT_BOX_WEAK = "#8b9096"  # 低于检出限：压暗，别和真实条带抢注意力
+SELECT = ACCENT
+SELECT_FILL_RGBA = (79, 195, 247, 50)
+GUIDE_RGBA = (0, 255, 156, 150)
+BASELINE = WARN
+LANE_LABEL = "#bfe9ff"
+PLOT_REGION_RGBA = ((79, 195, 247, 26), (255, 255, 255, 8))
+PLOT_FILL_RGBA = (79, 195, 247, 70)
+
+# 中文界面首选雅黑，但非中文 Windows / 精简版镜像里它可能不存在；
+# QFont 的 families 回退链能保证退到别的可用无衬线字体而不是方框。
+FONT_FAMILIES = (
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "Segoe UI",
+    "Noto Sans CJK SC",
+    "Source Han Sans SC",
+    "PingFang SC",
+    "SimHei",
+    "sans-serif",
+)
+FONT_POINT_SIZE = 9.5
 
 
 def _palette() -> QPalette:
@@ -369,6 +408,21 @@ QStatusBar QLabel {{
     color: {TEXT_DIM};
     padding: 0 4px;
 }}
+QStatusBar QPushButton {{
+    padding: 2px 10px;
+    min-height: 14px;
+}}
+
+QProgressBar {{
+    background: {BG_BASE};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    max-height: 12px;
+}}
+QProgressBar::chunk {{
+    background: {ACCENT_DIM};
+    border-radius: 3px;
+}}
 
 QToolTip {{
     background: {BG_RAISED};
@@ -383,14 +437,32 @@ QSplitter::handle {{
 QSplitter::handle:hover {{
     background: {ACCENT_DIM};
 }}
+
+/* 参数面板里的说明性小字，以前在 main_window 里逐处内联同一个色值 */
+QLabel#dimHint {{
+    color: {TEXT_DIM};
+    font-weight: 400;
+}}
+
+#rulerPopup {{
+    background: {BG_RAISED};
+    border: 1px solid {BORDER_LIGHT};
+    border-radius: 6px;
+}}
 """
+
+
+def app_font() -> QFont:
+    """带回退族的界面字体：雅黑缺失时不至于掉成方框。"""
+    font = QFont(FONT_FAMILIES[0])
+    font.setFamilies(list(FONT_FAMILIES))
+    font.setPointSizeF(FONT_POINT_SIZE)
+    return font
 
 
 def apply_theme(app: QApplication) -> None:
     """应用 Fusion 深色主题与统一 QSS。"""
     app.setStyle("Fusion")
     app.setPalette(_palette())
-    font = QFont("Microsoft YaHei UI")
-    font.setPointSizeF(9.5)
-    app.setFont(font)
+    app.setFont(app_font())
     app.setStyleSheet(_QSS)

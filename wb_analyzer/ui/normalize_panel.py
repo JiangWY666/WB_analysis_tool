@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .tablefmt import NumberDelegate, full_precision
+
 HISTORY_HEADERS = ["类型", "名称", "分组", "泳道数", "来源文件"]
 RESULT_HEADERS = ["分组", "泳道", "目标值", "内参值", "归一化", "Fold Change"]
 
@@ -76,8 +78,11 @@ def _numeric_item(value: float | int | None, tooltip: str = "") -> QTableWidgetI
     else:
         item.setData(Qt.ItemDataRole.EditRole, value)
     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-    if tooltip:
-        item.setToolTip(tooltip)
+    tips = [tooltip] if tooltip else []
+    if isinstance(value, float):
+        tips.append(f"精确值：{full_precision(value)}")
+    if tips:
+        item.setToolTip("\n".join(tips))
     return item
 
 
@@ -173,6 +178,7 @@ class NormalizePanel(QWidget):
         control_row.addWidget(self._control_spin)
         control_row.addStretch(1)
         self.result_table = _make_table(RESULT_HEADERS)
+        self.result_table.setItemDelegate(NumberDelegate(self.result_table))
         export_norm_button = QPushButton("导出归一化 CSV")
         export_norm_button.clicked.connect(self.exportNormalizedRequested)
         self._result_hint = QLabel(DEFAULT_RESULT_HINT)
@@ -242,34 +248,43 @@ class NormalizePanel(QWidget):
             self._updating = False
 
     def set_rows(self, rows: list) -> None:
+        """填归一化结果表。
+
+        按泳道号配对后，只在一侧出现的泳道也会成行，其目标 / 内参值为
+        ``None``——那是"这个泳道没配上"，得显示成“—”并带上原因，不能当成
+        数字去 float()。
+        """
         self.result_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
-            fold = getattr(row, "fold_change", None)
-            self.result_table.setItem(row_index, 0, _text_item(row.group))
-            self.result_table.setItem(row_index, 1, _numeric_item(int(row.lane)))
+            note = getattr(row, "note", "") or ""
+            self.result_table.setItem(row_index, 0, _text_item(row.group, note))
+            self.result_table.setItem(row_index, 1, _numeric_item(int(row.lane), note))
             self.result_table.setItem(
                 row_index,
                 2,
-                _numeric_item(float(row.target), f"目标：{row.target_name}"),
+                _numeric_item(
+                    None if row.target is None else float(row.target),
+                    note or f"目标：{row.target_name}",
+                ),
             )
             self.result_table.setItem(
                 row_index,
                 3,
                 _numeric_item(
-                    float(row.loading_control), f"内参：{row.loading_control_name}"
+                    None if row.loading_control is None else float(row.loading_control),
+                    note or f"内参：{row.loading_control_name}",
                 ),
             )
             normalized = None if row.normalized is None else round(float(row.normalized), 4)
-            self.result_table.setItem(row_index, 4, _numeric_item(normalized))
-            fold_value = None if fold is None else round(float(fold), 4)
-            self.result_table.setItem(row_index, 5, _numeric_item(fold_value))
-        self._result_hint.setVisible(not rows)
-        if rows:
-            self.set_diagnosis(None)
+            self.result_table.setItem(row_index, 4, _numeric_item(normalized, note))
+            fold = None if row.fold_change is None else round(float(row.fold_change), 4)
+            self.result_table.setItem(row_index, 5, _numeric_item(fold, note))
+        # 可见性统一交给 set_diagnosis：有结果但有警告时提示也得露出来
 
     def set_diagnosis(self, text: str | None) -> None:
-        """结果为空时给出可操作的诊断提示（如忘切类型）。"""
+        """结果下方的提示：没结果时说原因，有结果但有泳道没配上时给警告。"""
         self._result_hint.setText(text or DEFAULT_RESULT_HINT)
+        self._result_hint.setVisible(bool(text) or self.result_table.rowCount() == 0)
 
     # ------------------------------------------------------------------ 编辑 / 删除
 

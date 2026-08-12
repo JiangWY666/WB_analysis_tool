@@ -35,17 +35,24 @@ from PySide6.QtWidgets import (
     QStyle,
 )
 
-ROI_COLOR = QColor("#00e5ff")
-ROI_FILL = QColor(0, 229, 255, 16)
-HANDLE_BORDER = QColor("#04333b")
-SEPARATOR_COLOR = QColor("#ffb300")
-RULER_COLOR = QColor("#ff4081")
-BAND_COLOR = QColor("#7cff6b")
-RESULT_COLOR = QColor("#ff5252")
-RESULT_SAT_COLOR = QColor("#ff9800")
-BAND_SELECT_COLOR = QColor("#4fc3f7")
-BAND_SELECT_FILL = QColor(79, 195, 247, 50)
-GUIDE_COLOR = QColor(0, 255, 156, 150)
+from . import errorlog, theme
+
+# 配色统一取自 theme，本模块只做 QColor 转换
+ROI_COLOR = QColor(theme.ROI_LINE)
+ROI_FILL = QColor(*theme.ROI_FILL_RGBA)
+HANDLE_BORDER = QColor(theme.HANDLE_BORDER)
+SEPARATOR_COLOR = QColor(theme.SEPARATOR)
+SEPARATOR_FOCUS_COLOR = QColor(theme.SEPARATOR_FOCUS)
+RULER_COLOR = QColor(theme.RULER)
+BAND_COLOR = QColor(theme.BAND_DRAW)
+RESULT_COLOR = QColor(theme.RESULT_BOX)
+RESULT_SAT_COLOR = QColor(theme.RESULT_BOX_SAT)
+RESULT_WEAK_COLOR = QColor(theme.RESULT_BOX_WEAK)
+BAND_SELECT_COLOR = QColor(theme.SELECT)
+BAND_SELECT_FILL = QColor(*theme.SELECT_FILL_RGBA)
+GUIDE_COLOR = QColor(*theme.GUIDE_RGBA)
+CANVAS_BG_COLOR = QColor(theme.CANVAS_BG)
+EMPTY_HINT_COLOR = QColor(theme.TEXT_FAINT)
 EMPTY_HINT = "打开或拖入 WB 图片（PNG / JPG / BMP / TIF）"
 
 HANDLE_PX = 8.0
@@ -53,6 +60,12 @@ HIT_PX = 7.0
 MIN_ROI_PX = 3.0
 SEP_MARGIN = 2.0
 EMIT_INTERVAL = 0.03
+# 分隔线吸附：只有落到谷底 SNAP_PX 图像像素以内才吸，明显想放别处时不硬拽
+SNAP_PX = 6.0
+
+# QPixmap 的边长与显存上限：超过就先降采样，否则 fromImage 直接返回空图（一片黑）
+MAX_DISPLAY_EDGE = 16384
+MAX_DISPLAY_PIXELS = 80_000_000
 
 
 class Tool(enum.Enum):
@@ -174,7 +187,7 @@ class BlotCanvas(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setBackgroundBrush(QBrush(QColor("#141518")))
+        self.setBackgroundBrush(QBrush(CANVAS_BG_COLOR))
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
@@ -187,6 +200,8 @@ class BlotCanvas(QGraphicsView):
         self._pixmap_item.setVisible(False)
         self._scene.addItem(self._pixmap_item)
         self._image_ref: np.ndarray | None = None
+        self._display_ref: np.ndarray | None = None  # 上屏用的（可能降采样的）缓冲
+        self._display_step_used = 1
         self._image_w = 0
         self._image_h = 0
 
@@ -226,6 +241,11 @@ class BlotCanvas(QGraphicsView):
         self._roi: QRectF | None = None
         self._separators: list[float] = []
         self._sep_items: list[QGraphicsLineItem] = []
+        # 键盘微调的目标：None / ("roi", -1) / ("sep", 序号)。最后一次鼠标操作
+        # 决定它，方向键就作用在"刚才动过的那个"上
+        self._nudge_target: tuple[str, int] | None = None
+        self._snap_targets: list[float] = []
+        self._snap_enabled = True
 
         self._tool = Tool.ROI
         self._drag: dict | None = None
@@ -241,25 +261,67 @@ class BlotCanvas(QGraphicsView):
 
     # ------------------------------------------------------------------ 图像
 
-    def set_image(self, display_bgr: np.ndarray) -> None:
-        """显示 uint8 BGR 图像；scene 坐标与像素坐标一致。"""
+    def set_image(self, display_bgr: np.ndarray) -> bool:
+        """显示 uint8 BGR 图像；scene 坐标始终等于原图像素坐标。
+
+        超大图先按整数倍降采样再上屏，并给 pixmap item 一个补偿缩放——
+        QPixmap 有边长与显存上限，直接塞进去只会得到一片黑。返回 False 表示
+        连降采样后都无法生成 pixmap（数据仍可正常定量，只是没有预览）。
+        """
         array = np.ascontiguousarray(display_bgr)
         if array.ndim == 2:
             array = np.ascontiguousarray(np.dstack([array] * 3))
         height, width = array.shape[:2]
-        image = QImage(
-            array.data, width, height, array.strides[0], QImage.Format.Format_BGR888
-        )
         self._image_ref = array  # 持引用防悬垂
         self._image_w, self._image_h = width, height
-        self._pixmap_item.setPixmap(QPixmap.fromImage(image))
-        self._pixmap_item.setVisible(True)
+
+        pixmap = QPixmap()
+        step = self._display_step(width, height)
+        while True:
+            sample = array if step == 1 else np.ascontiguousarray(array[::step, ::step])
+            image = QImage(
+                sample.data,
+                sample.shape[1],
+                sample.shape[0],
+                sample.strides[0],
+                QImage.Format.Format_BGR888,
+            )
+            pixmap = QPixmap.fromImage(image)
+            if not pixmap.isNull():
+                self._display_ref = sample
+                break
+            if min(sample.shape[0], sample.shape[1]) // 2 < 1 or step > 64:
+                errorlog.log_message(
+                    f"无法为 {width}×{height} 的图片生成预览（降采样步长 {step}）"
+                )
+                break
+            step *= 2
+
+        if pixmap.isNull():
+            self._pixmap_item.setPixmap(QPixmap())
+            self._pixmap_item.setVisible(False)
+        else:
+            self._pixmap_item.setPixmap(pixmap)
+            self._pixmap_item.setScale(float(step))
+            self._pixmap_item.setVisible(True)
+        self._display_step_used = step
         self._scene.setSceneRect(0, 0, width, height)
         self._guide_h.setLine(0, height / 2.0, width, height / 2.0)
         self._guide_v.setLine(width / 2.0, 0, width / 2.0, height)
         self._update_guides()
         self.clear_ruler()
         self.viewport().update()
+        return not pixmap.isNull()
+
+    @staticmethod
+    def _display_step(width: int, height: int) -> int:
+        step = 1
+        while (
+            max(width // step, height // step) > MAX_DISPLAY_EDGE
+            or (width // step) * (height // step) > MAX_DISPLAY_PIXELS
+        ):
+            step += 1
+        return step
 
     def has_image(self) -> bool:
         return self._image_ref is not None
@@ -270,7 +332,10 @@ class BlotCanvas(QGraphicsView):
     def fit_view(self) -> None:
         if self._image_ref is None:
             return
-        self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        if self._pixmap_item.pixmap().isNull():
+            self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        else:
+            self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
         self.zoomChanged.emit(self.current_scale())
 
     def zoom_100(self) -> None:
@@ -364,6 +429,108 @@ class BlotCanvas(QGraphicsView):
     def separators(self) -> list[float]:
         return list(self._separators)
 
+    # ------------------------------------------------------------------ 吸附 / 键盘微调
+
+    def set_snap_targets(self, targets) -> None:
+        """设定分隔线可吸附的位置（图像 x 坐标，通常是剖面谷底）。"""
+        self._snap_targets = sorted(float(t) for t in (targets or []))
+
+    def set_snap_enabled(self, enabled: bool) -> None:
+        self._snap_enabled = bool(enabled)
+
+    def snap_targets(self) -> list[float]:
+        return list(self._snap_targets)
+
+    def _snap_separator_x(self, x: float, lo: float, hi: float) -> float:
+        """把 x 吸到最近的谷底——但只在 SNAP_PX 之内，且不越过相邻分隔线。"""
+        if not self._snap_enabled or not self._snap_targets:
+            return x
+        best = min(self._snap_targets, key=lambda t: abs(t - x))
+        if abs(best - x) > SNAP_PX or not (lo <= best <= hi):
+            return x
+        return float(best)
+
+    def nudge_target(self) -> tuple[str, int] | None:
+        return self._nudge_target
+
+    def set_nudge_target(self, target: tuple[str, int] | None) -> None:
+        self._nudge_target = target
+        self._sync_roi_items()
+
+    def _default_nudge_target(self) -> tuple[str, int] | None:
+        if self._nudge_target is not None:
+            kind, index = self._nudge_target
+            if kind == "sep" and 0 <= index < len(self._separators):
+                return self._nudge_target
+            if kind == "roi" and self._roi is not None:
+                return self._nudge_target
+        return ("roi", -1) if self._roi is not None else None
+
+    def nudge(self, dx: float, dy: float) -> bool:
+        """方向键微调：作用于最后动过的分隔线，否则整体平移 ROI。
+
+        鼠标拖动受 scene↔viewport 往返精度限制（误差约 0.5/缩放倍数，20% 缩放
+        时是 ±2.5 图像像素），而 ROI 边界直接决定积分区间，必须能像素级微调。
+        """
+        target = self._default_nudge_target()
+        if target is None or self._roi is None:
+            return False
+        kind, index = target
+        if kind == "sep":
+            if not (0 <= index < len(self._separators)) or abs(dx) < 1e-9:
+                return False
+            lo = self._roi.left() + SEP_MARGIN
+            hi = self._roi.right() - SEP_MARGIN
+            if index > 0:
+                lo = max(lo, self._separators[index - 1] + SEP_MARGIN)
+            if index < len(self._separators) - 1:
+                hi = min(hi, self._separators[index + 1] - SEP_MARGIN)
+            if hi < lo:
+                return False
+            moved = float(min(max(self._separators[index] + dx, lo), hi))
+            if abs(moved - self._separators[index]) < 1e-9:
+                return False
+            self._separators[index] = moved
+            self._sync_roi_items()
+            self.separatorsChanged.emit(list(self._separators))
+            self.separatorsEditFinished.emit()
+            return True
+        rect = self._roi
+        new_x = min(max(rect.x() + dx, 0.0), max(0.0, self._image_w - rect.width()))
+        new_y = min(max(rect.y() + dy, 0.0), max(0.0, self._image_h - rect.height()))
+        if abs(new_x - rect.x()) < 1e-9 and abs(new_y - rect.y()) < 1e-9:
+            return False
+        shift = new_x - rect.x()
+        self._roi = QRectF(new_x, new_y, rect.width(), rect.height())
+        self._separators = [s + shift for s in self._separators]
+        self._sync_roi_items()
+        self.roiChanged.emit(new_x, new_y, rect.width(), rect.height())
+        self.roiEditFinished.emit()
+        return True
+
+    def resize_roi_by(self, dx: float, dy: float) -> bool:
+        """Ctrl+方向键：只挪 ROI 的右 / 下边界，用于精调积分区间宽高。"""
+        if self._roi is None:
+            return False
+        rect = self._roi
+        width = min(
+            max(rect.width() + dx, MIN_ROI_PX), max(MIN_ROI_PX, self._image_w - rect.x())
+        )
+        height = min(
+            max(rect.height() + dy, MIN_ROI_PX),
+            max(MIN_ROI_PX, self._image_h - rect.y()),
+        )
+        if abs(width - rect.width()) < 1e-9 and abs(height - rect.height()) < 1e-9:
+            return False
+        self._roi = QRectF(rect.x(), rect.y(), width, height)
+        lo = self._roi.left() + 1.0
+        hi = self._roi.right() - 1.0
+        self._separators = [min(max(s, lo), hi) for s in self._separators]
+        self._sync_roi_items()
+        self.roiChanged.emit(rect.x(), rect.y(), width, height)
+        self.roiEditFinished.emit()
+        return True
+
     def _sync_roi_items(self) -> None:
         if self._roi is None or self._roi.width() <= 0 or self._roi.height() <= 0:
             self._roi_item.setVisible(False)
@@ -382,15 +549,21 @@ class BlotCanvas(QGraphicsView):
 
         while len(self._sep_items) > len(self._separators):
             self._scene.removeItem(self._sep_items.pop())
-        sep_pen = QPen(SEPARATOR_COLOR, 3)
-        sep_pen.setCosmetic(True)
         while len(self._sep_items) < len(self._separators):
             line = QGraphicsLineItem()
-            line.setPen(sep_pen)
             line.setZValue(11)
             self._scene.addItem(line)
             self._sep_items.append(line)
-        for item, sep in zip(self._sep_items, self._separators):
+        focus = self._nudge_target
+        focused = focus[1] if focus is not None and focus[0] == "sep" else None
+        for index, (item, sep) in enumerate(zip(self._sep_items, self._separators)):
+            # 键盘微调的目标要看得出来，否则按方向键不知道动的是哪根
+            if index == focused:
+                pen = QPen(SEPARATOR_FOCUS_COLOR, 4, Qt.PenStyle.DashLine)
+            else:
+                pen = QPen(SEPARATOR_COLOR, 3)
+            pen.setCosmetic(True)
+            item.setPen(pen)
             x = min(max(sep, rect.left()), rect.right())
             item.setLine(x, rect.top(), x, rect.bottom())
 
@@ -402,8 +575,12 @@ class BlotCanvas(QGraphicsView):
         self._updating_selection = True
         try:
             for index, m in enumerate(measurements):
-                saturated = float(getattr(m, "saturated_fraction", 0.0)) >= 0.05
-                color = RESULT_SAT_COLOR if saturated else RESULT_COLOR
+                saturated = float(m.saturated_fraction) >= 0.05
+                weak = bool(m.below_detection)
+                if weak:
+                    color = RESULT_WEAK_COLOR
+                else:
+                    color = RESULT_SAT_COLOR if saturated else RESULT_COLOR
                 box = BandBoxItem(
                     index=index,
                     lane=int(m.lane),
@@ -415,7 +592,9 @@ class BlotCanvas(QGraphicsView):
                     f"积分灰度：{m.integrated_density:,.1f}\n"
                     f"平均灰度：{m.mean_intensity:.1f}\n"
                     f"背景：{m.background:.1f}\n"
-                    f"饱和：{m.saturated_fraction * 100:.1f}%"
+                    f"饱和：{m.saturated_fraction * 100:.1f}%\n"
+                    f"信噪比：{m.snr:.1f}" + (f"（检出限 {m.detection_limit:,.0f}）" if weak else "")
+                    + ("\n⚠ 低于检出限，该积分与空白泳道无法区分" if weak else "")
                     + ("\n⚠ 饱和比例偏高，定量可能失真" if saturated else "")
                     + "\n（点击选中，Delete 删除；右键更多操作）"
                 )
@@ -562,6 +741,7 @@ class BlotCanvas(QGraphicsView):
                     "orig_rect": QRectF(self._roi),
                     "orig_seps": list(self._separators),
                 }
+                self.set_nudge_target(("roi", -1))
                 event.accept()
                 return
             sep_index = self._separator_at(vp_pos)
@@ -571,6 +751,7 @@ class BlotCanvas(QGraphicsView):
                     "index": sep_index,
                     "orig_seps": list(self._separators),
                 }
+                self.set_nudge_target(("sep", sep_index))
                 event.accept()
                 return
 
@@ -608,6 +789,7 @@ class BlotCanvas(QGraphicsView):
                 "orig_rect": QRectF(self._roi),
                 "orig_seps": list(self._separators),
             }
+            self.set_nudge_target(("roi", -1))
             self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
             event.accept()
             return
@@ -660,7 +842,9 @@ class BlotCanvas(QGraphicsView):
         elif kind == "resize_roi":
             self._drag_resize_roi(scene_pos)
         elif kind == "sep":
-            self._drag_separator(scene_pos)
+            # 按住 Alt 临时关闭吸附：想放在谷底旁边时不用先去开关一趟
+            snap = not bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+            self._drag_separator(scene_pos, snap=snap)
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
@@ -756,7 +940,7 @@ class BlotCanvas(QGraphicsView):
         self._sync_roi_items()
         self._emit_roi_throttled()
 
-    def _drag_separator(self, scene_pos: QPointF) -> None:
+    def _drag_separator(self, scene_pos: QPointF, snap: bool = True) -> None:
         if self._roi is None:
             return
         drag = self._drag
@@ -769,7 +953,10 @@ class BlotCanvas(QGraphicsView):
             hi = min(hi, self._separators[index + 1] - SEP_MARGIN)
         if hi < lo:
             return
-        self._separators[index] = float(min(max(scene_pos.x(), lo), hi))
+        x = float(scene_pos.x())
+        if snap:
+            x = self._snap_separator_x(x, lo, hi)
+        self._separators[index] = float(min(max(x, lo), hi))
         self._sync_roi_items()
         now = time.monotonic()
         if now - self._last_emit >= EMIT_INTERVAL:
@@ -940,6 +1127,13 @@ class BlotCanvas(QGraphicsView):
             self.zoomChanged.emit(self.current_scale())
         event.accept()
 
+    _ARROW_DELTAS = {
+        Qt.Key.Key_Left: (-1.0, 0.0),
+        Qt.Key.Key_Right: (1.0, 0.0),
+        Qt.Key.Key_Up: (0.0, -1.0),
+        Qt.Key.Key_Down: (0.0, 1.0),
+    }
+
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
             self._space_down = True
@@ -947,6 +1141,16 @@ class BlotCanvas(QGraphicsView):
                 self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
             event.accept()
             return
+        if event.key() in self._ARROW_DELTAS and self._roi is not None:
+            step = 10.0 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1.0
+            dx, dy = self._ARROW_DELTAS[event.key()]
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                handled = self.resize_roi_by(dx * step, dy * step)
+            else:
+                handled = self.nudge(dx * step, dy * step)
+            if handled:
+                event.accept()
+                return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             # Delete 只删除选中的条带；不再清除 ROI（清除 ROI 走显式入口）
             selected = self.selected_bands()
@@ -981,7 +1185,7 @@ class BlotCanvas(QGraphicsView):
         super().paintEvent(event)
         if self._image_ref is None:
             painter = QPainter(self.viewport())
-            painter.setPen(QColor("#6a6f76"))
+            painter.setPen(EMPTY_HINT_COLOR)
             font = QFont(self.font().family())
             font.setPointSizeF(12.5)
             painter.setFont(font)

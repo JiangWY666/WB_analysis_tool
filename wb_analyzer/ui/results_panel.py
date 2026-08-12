@@ -15,8 +15,48 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-HEADERS = ["泳道", "条带", "X", "Y", "宽", "高", "积分灰度", "背景", "平均灰度", "饱和 %"]
+from . import theme
+from .tablefmt import NumberDelegate, full_precision
+
+HEADERS = ["泳道", "条带", "X", "Y", "宽", "高", "积分灰度", "背景", "平均灰度", "饱和 %", "S/N"]
 SATURATED_COLOR = QColor("#ffb74d")
+BELOW_DETECTION_COLOR = QColor(theme.RESULT_BOX_WEAK)
+"""低于检出限的行整体压暗：数值还在，但不该被当成真实信号读。"""
+
+# 积分灰度 / 背景 / 平均灰度：显示按千分位取整，悬停给全精度
+FULL_PRECISION_COLUMNS = (6, 7, 8)
+LOD_TIP = "信噪比 < 3，低于检出限：该积分与空白泳道无法区分，不要用它做比值"
+
+
+def _row_values(m) -> tuple:
+    """一行的列值，顺序与 :data:`HEADERS` 一致（表格与复制共用一份）。"""
+    return (
+        int(m.lane),
+        int(m.band),
+        int(m.x),
+        int(m.y),
+        int(m.width),
+        int(m.height),
+        float(m.integrated_density),
+        float(m.background),
+        float(m.mean_intensity),
+        round(float(m.saturated_fraction) * 100.0, 2),
+        round(float(m.snr), 2),
+    )
+
+
+def _summary(measurements: list) -> str:
+    if not measurements:
+        return "暂无结果"
+    head = f"共 {len(measurements)} 个条带"
+    saturated = sum(1 for m in measurements if float(m.saturated_fraction) >= 0.05)
+    weak = sum(1 for m in measurements if m.below_detection)
+    flags = []
+    if saturated:
+        flags.append(f"{saturated} 个饱和 ⚠")
+    if weak:
+        flags.append(f"{weak} 个低于检出限 ⚠")
+    return f"{head}，其中 {'、'.join(flags)}" if flags else head
 
 
 class ResultsPanel(QWidget):
@@ -51,6 +91,7 @@ class ResultsPanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setDefaultSectionSize(72)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setItemDelegate(NumberDelegate(self.table))
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
 
         layout = QVBoxLayout(self)
@@ -78,42 +119,32 @@ class ResultsPanel(QWidget):
         self.table.setRowCount(len(self._measurements))
         for row, m in enumerate(self._measurements):
             saturated = float(m.saturated_fraction) >= 0.05
-            values = (
-                int(m.lane),
-                int(m.band),
-                int(m.x),
-                int(m.y),
-                int(m.width),
-                int(m.height),
-                float(m.integrated_density),
-                float(m.background),
-                float(m.mean_intensity),
-                round(float(m.saturated_fraction) * 100.0, 2),
-            )
-            for col, value in enumerate(values):
+            weak = bool(m.below_detection)
+            for col, value in enumerate(_row_values(m)):
                 item = QTableWidgetItem()
-                # EditRole 存数值：显示与排序都按数值处理
+                # EditRole 存数值：排序按数值走，显示交给 NumberDelegate
                 item.setData(Qt.ItemDataRole.EditRole, value)
                 item.setData(Qt.ItemDataRole.UserRole, row)
                 item.setTextAlignment(
                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                 )
-                if saturated:
+                tips = []
+                if col in FULL_PRECISION_COLUMNS:
+                    tips.append(f"精确值：{full_precision(value)}")
+                # 饱和是「数值偏低但确实有信号」，低于检出限是「可能压根没有信号」，
+                # 后者更根本，两者同时命中时按它着色。
+                if weak:
+                    item.setForeground(BELOW_DETECTION_COLOR)
+                    tips.append(LOD_TIP)
+                elif saturated:
                     item.setForeground(SATURATED_COLOR)
-                    item.setToolTip("饱和比例 ≥ 5%，定量可能失真")
+                if saturated:
+                    tips.append("饱和比例 ≥ 5%，定量可能失真")
+                if tips:
+                    item.setToolTip("\n".join(tips))
                 self.table.setItem(row, col, item)
         self.table.setSortingEnabled(True)
-        saturated_count = sum(
-            1 for m in self._measurements if float(m.saturated_fraction) >= 0.05
-        )
-        if not self._measurements:
-            self._count_label.setText("暂无结果")
-        elif saturated_count:
-            self._count_label.setText(
-                f"共 {len(self._measurements)} 个条带，其中 {saturated_count} 个饱和 ⚠"
-            )
-        else:
-            self._count_label.setText(f"共 {len(self._measurements)} 个条带")
+        self._count_label.setText(_summary(self._measurements))
 
     def measurements(self) -> list:
         return list(self._measurements)
@@ -135,23 +166,7 @@ class ResultsPanel(QWidget):
         lines = ["\t".join(HEADERS)]
         for index in originals:
             m = self._measurements[index]
-            lines.append(
-                "\t".join(
-                    str(v)
-                    for v in (
-                        m.lane,
-                        m.band,
-                        m.x,
-                        m.y,
-                        m.width,
-                        m.height,
-                        m.integrated_density,
-                        m.background,
-                        m.mean_intensity,
-                        round(m.saturated_fraction * 100.0, 2),
-                    )
-                )
-            )
+            lines.append("\t".join(str(v) for v in _row_values(m)))
         QGuiApplication.clipboard().setText("\n".join(lines))
 
     def _request_delete(self) -> None:
