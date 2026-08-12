@@ -368,10 +368,44 @@ BAND_LEVEL_FRAC = 0.12
 """判定"这一列上有条带"的电平，从剖面地板起算，占动态范围的比例。"""
 
 BAND_COUNT_DEPTH = 0.40
-"""条带数的下界：谷深到这个程度，两侧一定是两条不同的条带。"""
+"""条带数的起点：谷深到这个程度，两侧一定是两条不同的条带。"""
 
 BAND_COUNT_DEPTH_LOOSE = 0.20
-"""条带数的上界：谷浅到这个程度以下，两侧一定是同一条条带的两个鼓包。"""
+"""整条剖面一个深谷都没有时，退而求其次的起点谷深。
+
+只在"没有任何谷深过 :data:`BAND_COUNT_DEPTH`"（泳道挨得极紧的膜）时才用得上。
+它**不再决定条带数**——真实样图上同一条条带的微笑凹陷深到 0.20、而紧邻两条
+泳道之间的真谷浅到 0.08，谷深根本分不开这两件事，任何取值都是掷硬币。条带数
+改由 :func:`_resolved_band_count` 按"宽度"判定。
+"""
+
+BAND_NOISE_DEPTH = 0.05
+"""条带数的硬上界：谷浅到这个程度，两侧只能是噪声或同一条条带的纹理。
+
+宽度判据只看峰在哪，不看峰有多高，所以一条平顶宽带上的噪声起伏也会被它当成
+可以分开的鼓包（真实症状：16 位合成图上一条 80px 宽的平顶带，顶上三个 0.005
+深的噪声波纹被数成 2 条条带，单位宽度腰斩，指定 2 条泳道时那条带被从中间劈
+开）。这里按谷深封顶——0.005 量级的谷是噪声，这个判断没有歧义，不像"微笑凹陷
+还是泳道间隙"那样两拨值互相穿插。
+
+窗口很宽：下边界是噪声波纹的 0.008，上边界是样例图上必须保住的第 7 条真谷
+0.197，取 0.05 离两头都有 4~6 倍的余量。
+"""
+
+BAND_MERGE_FRAC = 0.57
+"""两个局部峰相距不足这个比例的条带宽时，判定它们是同一条条带的两个鼓包。
+
+这是条带计数唯一的尺度先验，取的是**宽度**而不是**幅度**：两条不同泳道的条带
+中心至少隔一整个条带宽（否则它们就重叠了），而同一条条带的微笑双峰、肩峰只隔
+半个身位。样例图上真实泳道的最近峰距 25px、条带宽 49px（0.51 倍），同一条条带
+的两个鼓包相距 17~23px（0.35~0.47 倍）。
+
+上下界都由回归用例钉住，可用区间实测为 [0.55, 0.60]，这里取几何中点：
+* 调到 0.61 以上，样例图上紧邻的两条泳道被并成一条（
+  ``test_demo_blot_split_is_the_same_at_every_roi_height`` 变红）；
+* 调到 0.54 以下，微笑凹陷 0.19 的弯条带被从每条条带正中劈开（
+  ``test_curved_blot_split_is_the_same_at_every_roi_height`` 变红）。
+"""
 
 LANE_NARROW_TOLERANCE = 0.45
 """泳道足迹比单位宽度窄多少算"一个标准差"。窄一半就要付 ~1.2 的代价。"""
@@ -480,19 +514,99 @@ def _valley_depths(
     return depths
 
 
-def _peak_detector_count(profile: np.ndarray, floor: float) -> int:
-    """:func:`find_profile_peaks` 数出来的条带数，两端补一段"地板"再数。
+def _peaks_after_merge(smooth: np.ndarray, peaks: list[int], distance: float) -> int:
+    """把相距不足 ``distance`` 的峰当作同一条条带归并后还剩几条。
 
-    它的扫描窗够不到数组端点，贴着 ROI 边缘的那条条带会漏掉；补出来的地板
-    把它变成一个正常的内部峰。这条路线的短板是内部基线取的是剖面 30 分位
-    数：条带把 ROI 占满时（合成图常见）30 分位数会落在最弱那条条带身上，
-    它就被判成"没有起伏"而漏掉。
+    从最高的峰开始占位，后来的峰离已占位的峰太近就并进去。先高后低是为了让
+    每条条带由它自己最高的那个鼓包代表，弱带不会被强邻居的肩峰顶掉。
     """
-    pad = max(4, int(profile.size) // 40)
-    padded = np.concatenate(
-        (np.full(pad, floor), np.asarray(profile, dtype=float), np.full(pad, floor))
-    )
-    return len(find_profile_peaks(padded))
+    kept: list[int] = []
+    for peak in sorted(peaks, key=lambda index: -float(smooth[index])):
+        if all(abs(peak - other) >= distance for other in kept):
+            kept.append(peak)
+    return len(kept)
+
+
+def _band_spans(
+    smooth: np.ndarray, peaks: list[int], level: float, count: int, unit: float
+) -> list[tuple[int, int]]:
+    """每条条带自己横跨的列区间（最左鼓包到最右鼓包）；分不清就返回空表。
+
+    分隔线落进其中任何一个区间，就等于把一条条带劈成两半分给两个泳道，所以
+    这些区间是分隔线的禁区。
+
+    条带数 ``count`` 已经由 :func:`_band_count` 定下来了，分组因此不必再按
+    半径贪心占位——直接把峰序列按**最大的 count-1 个间距**切开。这个划分与
+    相位无关，而贪心占位不是：峰距均匀时（微笑凹陷深到与泳道间隙同宽）它会
+    从某个位置起整体错半格，把条带内的凹陷与条带之间的空隙对调，禁区正好设
+    反。
+
+    划分只在两拨间距**真的分得开**时才作数，尺子就是既有的"同一条条带"归并
+    距离（:data:`BAND_MERGE_FRAC` × 条带宽）：组内的每个间距都得短于它，组间
+    的每个间距都得够得着它。达不到就返回空表，让 DP 回到只看足迹与谷深的老
+    判据——禁区设错地方比不设禁区糟得多。
+
+    这道门槛必须两边都卡死，只要求"组间比组内大"是不够的。样例图上 8 条条带
+    共 14 个鼓包，组间最小间距 25px、组内最大 23px，两拨值实际上是连在一起
+    的；ROI 换一个高度，25 和 23 的次序就翻过来，禁区跟着挪到隔壁，一条真分
+    隔线就没了。
+    """
+    above = [peak for peak in peaks if smooth[peak] > level]
+    if unit <= 0 or len(above) < 2 or not 1 <= count < len(above):
+        return []
+    gaps = [b - a for a, b in zip(above, above[1:], strict=False)]
+    order = sorted(range(len(gaps)), key=lambda index: gaps[index])
+    split = len(gaps) - (count - 1)
+    inside, cuts = order[:split], sorted(order[split:])
+    distance = BAND_MERGE_FRAC * unit
+    if max(gaps[index] for index in inside) >= distance:
+        return []
+    if cuts and min(gaps[index] for index in cuts) < distance:
+        return []
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for stop in (*cuts, len(above) - 1):
+        if stop > start:
+            spans.append((above[start], above[stop]))
+        start = stop + 1
+    return spans
+
+
+def _resolved_band_count(
+    smooth: np.ndarray,
+    peaks: list[int],
+    level: float,
+    band_columns: float,
+    seed: int,
+    ceiling: int,
+) -> int:
+    """从保守起点出发，按"条带有多宽"把剖面上的峰归并成条带，返回条带数。
+
+    归并半径取 :data:`BAND_MERGE_FRAC` × 当前假设的条带宽（= 电平以上的总列
+    数 ÷ 当前条带数），所以判据是自洽的：条带数越多、每条越窄、归并半径越小、
+    分得出的条带就越多。从 ``seed``（谷深给出的可靠下界）单调往上松弛到不动
+    点为止——只增不减保证一定收敛，也保证深谷两侧永远算两条条带；``ceiling``
+    （噪声级谷深给出的可靠上界）挡住噪声波纹把计数顶穿。
+
+    这一步替掉了原先的峰检测计数。那条路线按**绝对幅度**（剖面 30 分位数基线
+    + 8% 动态范围）取舍，ROI 往上多框十几行空白就会让两个 0.02 深的肩峰消失，
+    样例图上条带数因此从 8 掉到 6、单位宽度虚高 34%，动态规划跟着丢掉 3 条
+    分隔线。宽度判据只看峰的相对位置，ROI 高度变化对它是仿射变换，天然不敏感。
+    """
+    above = [peak for peak in peaks if smooth[peak] > level]
+    if not above or band_columns <= 0:
+        return seed
+    ceiling = max(1, min(ceiling, len(above)))
+    count = max(1, min(seed, ceiling))
+    for _ in range(len(above)):
+        merged = min(
+            _peaks_after_merge(smooth, above, BAND_MERGE_FRAC * band_columns / count),
+            ceiling,
+        )
+        if merged <= count:
+            break
+        count = merged
+    return count
 
 
 def _valley_group_count(
@@ -518,40 +632,37 @@ def _valley_group_count(
 
 
 def _band_count(
-    profile: np.ndarray,
     smooth: np.ndarray,
     peaks: list[int],
     depths: list[float],
-    floor: float,
     level: float,
+    band_columns: float,
 ) -> int:
     """剖面上有几条条带。
 
-    谷深先给出一个可靠的区间：深过 :data:`BAND_COUNT_DEPTH` 的谷两侧一定是
-    两条条带（下界），浅过 :data:`BAND_COUNT_DEPTH_LOOSE` 的一定是同一条的
-    两个鼓包（上界）。峰检测在区间内定夺——它分辨力更好（数得出被强邻居压住
-    的弱带），但它的最小间距启发式随 ROI 宽度缩放，小 ROI 上会把同一条条带
-    的两个鼓包数成两条，大 ROI 上又会把相邻两条并成一条，所以两头都得夹住。
+    谷深只负责圈出一个**两头都可靠**的区间：深过 :data:`BAND_COUNT_DEPTH` 的
+    谷两侧一定是两条条带（下界），浅过 :data:`BAND_NOISE_DEPTH` 的一定不是
+    （上界）。区间内由 :func:`_resolved_band_count` 按宽度定夺，它数得出被强
+    邻居压住、谷又浅的弱带。
+
+    区间中段不能再靠谷深定夺了：真实样图上同一条条带的微笑凹陷能深到 0.20，
+    而紧邻两条泳道之间的真谷能浅到 0.08，两拨值互相穿插，没有哪个阈值分得开。
     """
     lower = _valley_group_count(smooth, peaks, depths, level, BAND_COUNT_DEPTH)
-    upper = _valley_group_count(smooth, peaks, depths, level, BAND_COUNT_DEPTH_LOOSE)
-    if lower <= 1 and upper >= 3:
+    if lower <= 1:
         # 整条剖面上没有一个谷深到"一定是泳道间隙"的程度，说明这块膜上泳道
-        # 挨得很紧、深谷浅谷根本分不成两拨。那就认所有结构都是泳道，别让峰
-        # 检测那个随宽度缩放的最小间距把它们并掉。
-        lower = upper
-    return min(max(_peak_detector_count(profile, floor), lower), upper)
+        # 挨得很紧、深谷浅谷根本分不成两拨。放宽起点，免得从 1 起步松弛不动。
+        loose = _valley_group_count(smooth, peaks, depths, level, BAND_COUNT_DEPTH_LOOSE)
+        if loose >= 3:
+            lower = loose
+    ceiling = _valley_group_count(smooth, peaks, depths, level, BAND_NOISE_DEPTH)
+    lower = max(1, lower)
+    return _resolved_band_count(
+        smooth, peaks, level, band_columns, lower, max(lower, ceiling)
+    )
 
 
-def _lane_unit_width(
-    profile: np.ndarray,
-    smooth: np.ndarray,
-    peaks: list[int],
-    depths: list[float],
-    band_columns: float,
-    floor: float,
-    level: float,
-) -> float | None:
+def _lane_unit_width(smooth: np.ndarray, count: int, band_columns: float) -> float | None:
     """估计"一条泳道该有多少条带足迹"（像素列数）。
 
     直接量：电平以上的总列数 ÷ 条带数。这个量与泳道怎么排布无关——泳道之间
@@ -562,9 +673,8 @@ def _lane_unit_width(
     膜上它抓到的是"组"的周期（样例图 141，真实单位 47），强弱交替时又会锁
     在 2× 上。
 
-    条带数由 :func:`_band_count` 给出；一条都数不出来时才退回自相关周期。
+    ``count`` 由 :func:`_band_count` 给出；一条都数不出来时才退回自相关周期。
     """
-    count = _band_count(profile, smooth, peaks, depths, floor, level)
     if count and band_columns > 0:
         unit = band_columns / count
         return unit if unit >= 4.0 else None
@@ -677,20 +787,25 @@ def _dp_boundaries(
 
 
 def _fit_lane_separators(
-    profile: np.ndarray, smooth: np.ndarray, *, lane_count: int | None = None
+    smooth: np.ndarray, *, lane_count: int | None = None
 ) -> list[int] | None:
     """按剖面地形直接放泳道分隔线；证据不足时返回 ``None`` 让调用方回退。
 
     流程：局部极值 → 持久性剪枝去掉空白区噪声峰 → 算每个谷相对两侧峰顶的
-    下探深度 → 量出单条泳道的条带足迹宽度 → 在条带区内用动态规划挑一组
-    分隔线 → 抹掉空白泳道 → 空白里的分隔线挪到空白正中。
+    下探深度 → 量出单条泳道的条带足迹宽度 → **划掉落在条带内部的候选谷** →
+    在条带区内用动态规划挑一组分隔线 → 抹掉空白泳道 → 空白里的分隔线挪到
+    空白正中。
 
     与旧的"等宽网格 + 谷位吸附"的本质区别有两条。一是网格的相位被硬钉在
     ROI 两端，ROI 左右留白不等就整体错位，之后 ±¼ 泳道宽的吸附窗救不回来；
     这里的位置完全由剖面决定。二是旧网格约束的是泳道的几何宽度，中间有
     空白时必然错，而这里约束的是泳道里装了多少条带足迹——空白不算数。
-    条带自身的肩部/微笑凹陷则被这个先验挡住：在那里切一刀会切出两个只装了
-    半条条带的泳道，代价远大于省下的那点谷质量代价。
+
+    足迹先验挡不住的是"把一条宽条带从中间劈开"：劈完两半各自都像一条装了
+    一条条带的正常泳道，代价反而比留一宽一窄两道更低（真实膜实测：完美足迹
+    下劈开代价 1.9，切在真空隙上 5.9）。所以候选谷先过一道
+    :func:`_band_spans` —— 落在同一条条带两个鼓包之间的谷根本不进 DP。
+    这一步不看谷有多深，只看"两个鼓包是不是同一条条带"，判据与条带计数同源。
     """
     size = int(smooth.size)
     span = float(smooth.max() - smooth.min())
@@ -706,9 +821,8 @@ def _fit_lane_separators(
     depths = _valley_depths(smooth, peaks, valleys, floor)
     level = floor + span * BAND_LEVEL_FRAC
     band_columns = np.concatenate(([0], np.cumsum(smooth > level))).astype(float)
-    unit = _lane_unit_width(
-        profile, smooth, peaks, depths, float(band_columns[-1]), floor, level
-    )
+    count = _band_count(smooth, peaks, depths, level, float(band_columns[-1]))
+    unit = _lane_unit_width(smooth, count, float(band_columns[-1]))
     if unit is None:
         if not lane_count or lane_count < 2:
             return None
@@ -722,9 +836,19 @@ def _fit_lane_separators(
     if hi - lo < max(8.0, unit):
         return None
     inner = [(v, d) for v, d in zip(valleys, depths, strict=True) if lo < v < hi]
-    nodes = [lo, *(v for v, _ in inner), hi]
-    node_cost = [0.0, *(SEPARATOR_QUALITY_WEIGHT * (1.0 - d) for _, d in inner), 0.0]
-    chosen = _dp_boundaries(nodes, node_cost, band_columns, unit, lane_count)
+    spans = _band_spans(smooth, peaks, level, count, unit)
+    between = [(v, d) for v, d in inner if not any(a < v < b for a, b in spans)]
+
+    def fit(candidates: list[tuple[int, float]]) -> list[int] | None:
+        nodes = [lo, *(v for v, _ in candidates), hi]
+        cost = [0.0, *(SEPARATOR_QUALITY_WEIGHT * (1.0 - d) for _, d in candidates), 0.0]
+        return _dp_boundaries(nodes, cost, band_columns, unit, lane_count)
+
+    chosen = fit(between)
+    if chosen is None and len(between) < len(inner):
+        # 只有"指定泳道数比条带数还多"时才可能凑不出这么多泳道。宁可切在条带
+        # 里也要给够泳道数——用户说了有这么多道，界面上看得见、挪得动。
+        chosen = fit(inner)
     if chosen is None:
         return None
     edges = [lo, *chosen, hi]
@@ -789,7 +913,7 @@ def separators_from_profile(
     if profile.size < 8:
         return []
     smooth = _smooth_profile(profile, max(2, profile.size // 80))
-    fitted = _fit_lane_separators(profile, smooth, lane_count=n_target or None)
+    fitted = _fit_lane_separators(smooth, lane_count=n_target or None)
     if fitted is not None:
         return [float(roi.x + p) for p in fitted]
     if n_target >= 2:
