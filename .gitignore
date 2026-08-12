@@ -9,7 +9,32 @@ results/
 *.spec.bak
 
 # 私人实验数据，禁止提交
+0716wb/
 0809wb/
 private_data/
+
+# 打包构建产物
 desktop/*.toc
 desktop/warn-*.txt
+
+# 日期式实验数据目录（覆盖 0716wb / 0809wb 等，与上方显式规则互为双保险）
+[0-9][0-9][0-9][0-9]wb/
+[0-9][0-9][0-9][0-9]WB/
+[0-9][0-9][0-9][0-9]wb*/
+
+# 原始实验图像数据，一律不入库
+*.tif
+*.tiff
+*.czi
+*.scn
+*.nd2
+*.lif
+*.svs
+*.ndpi
+
+# 例外：tests/ 下必要的小体积测试图像资源仍可提交
+!tests/**/*.tif
+!tests/**/*.tiff
+
+# 例外：仓库既有示例图（已入库，tests/test_demo_blot.py 等依赖它）
+!/pad4_001(1)_signal.tif
