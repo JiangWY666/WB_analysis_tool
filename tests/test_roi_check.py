@@ -23,7 +23,9 @@ from wb_analyzer.roi_check import (
     ISSUE_EDGE_BOTTOM,
     ISSUE_EDGE_TOP,
     ISSUE_EMPTY_LANE,
+    ISSUE_FOOTPRINT_CLIPPED,
     ISSUE_FORCED_COUNT,
+    ISSUE_SEPARATOR_IN_BAND,
     check_roi_quality,
     check_roi_quality_from_measurements,
 )
@@ -422,3 +424,334 @@ def test_issues_come_worst_first() -> None:
 
 def test_the_public_name_is_the_same_function() -> None:
     assert exported_check is check_roi_quality
+
+
+# --- 判据 3：横向足迹 --------------------------------------------------------
+#
+# 前两条判据只读条带框的上下沿，横向那一维它们从来没看过。实测有过一个上下留白
+# 84 px（要求 25 px）、条带数完全正常的 ROI，横向足迹只剩泳道宽度的 18.4%、积分
+# 只剩全宽的 59.8%，而自检报的是"通过"。下面这批用合成膜复现同一个形态。
+
+LAT_PITCH = 90
+"""合成膜的泳道间距。比条带宽得多，正是真实样图上那种"细带落在宽泳道里"。"""
+
+LAT_LANES = 6
+LAT_HEIGHT = 240
+LAT_MEMBRANE = (40, 200)
+LAT_BAND_ROW = 120.0
+LAT_EVEN = (70.0, 60.0, 90.0, 50.0, 55.0, 45.0)
+LAT_AMPLITUDES = (70.0, 60.0, 90.0, 0.0, 55.0, 45.0)
+"""第 4 道故意留空：第 3 道那条强带会被滑过去，占掉本该属于第 4 道的位置。"""
+
+LAT_WIDTH = 2 * ROI_X + LAT_LANES * LAT_PITCH
+LAT_SEPARATORS = [float(ROI_X + i * LAT_PITCH) for i in range(1, LAT_LANES)]
+
+
+def lateral_membrane(
+    *,
+    slide: float = 0.0,
+    amplitudes: Sequence[float] = LAT_AMPLITUDES,
+    sigma_x: float = 11.0,
+    seed: int = 0,
+) -> np.ndarray:
+    """每道一条高斯带的窄膜；``slide`` 把第 3 道那条带往右推。
+
+    推得够远时它就跨过第 3/4 道的分隔线，两侧各留一截——分隔线切在条带里面的
+    合成版。膜的上下边留得很宽，判据 2 因此完全满意，正是那个盲区的形态。
+    """
+    rng = np.random.default_rng(seed)
+    rows = np.arange(LAT_HEIGHT, dtype=float)
+    cols = np.arange(LAT_WIDTH, dtype=float)
+    raw = np.full((LAT_HEIGHT, LAT_WIDTH), DARK_LEVEL, dtype=np.float64)
+    raw[LAT_MEMBRANE[0] : LAT_MEMBRANE[1], :] = MEMBRANE_LEVEL
+    for index, amplitude in enumerate(amplitudes):
+        if amplitude <= 0.0:
+            continue
+        centre = ROI_X + index * LAT_PITCH + LAT_PITCH / 2
+        if index == 2:
+            centre += slide
+        raw += amplitude * np.outer(
+            np.exp(-0.5 * ((rows - LAT_BAND_ROW) / 9.0) ** 2),
+            np.exp(-0.5 * ((cols - centre) / sigma_x) ** 2),
+        )
+    raw += rng.normal(0.0, 0.25, raw.shape)
+    return raw.astype(np.float32)
+
+
+LAT_ROI = RoiRect(ROI_X, 60, LAT_LANES * LAT_PITCH, 120)
+
+
+def lateral_profiles(raw: np.ndarray, separators: Sequence[float] | None = None):
+    return compute_lane_profiles(
+        raw,
+        LAT_ROI,
+        list(LAT_SEPARATORS if separators is None else separators),
+        dark_bands=False,
+        white_level=255.0,
+    )
+
+
+def spans_to_boxes(
+    roi: RoiRect, spans: Sequence[tuple[int, int]], *, band: tuple[int, int] = (30, 50)
+) -> list[BandMeasurement]:
+    """每道一条条带，横向足迹由 ``spans``（相对 ROI 左边）给定。
+
+    纵向一律画在同一个位置且离上下边很远，这样判据 1 和判据 2 都插不上话，
+    断言里剩下的只有横向那一条。
+    """
+    top, bottom = band
+    return [
+        BandMeasurement(
+            lane=lane,
+            band=1,
+            x=roi.x + x1,
+            y=roi.y + top,
+            width=x2 - x1,
+            height=bottom - top,
+            area=(x2 - x1) * (bottom - top),
+            mean_intensity=100.0,
+            background=10.0,
+            integrated_density=1000.0,
+        )
+        for lane, (x1, x2) in enumerate(spans, start=1)
+    ]
+
+
+BOXES_ROI = RoiRect(0, 0, 140, 100)
+
+
+def test_an_evenly_spread_lateral_layout_passes() -> None:
+    """条带端端正正落在各自泳道中间：横向这一条无话可说。"""
+    report = check_roi_quality(lateral_profiles(lateral_membrane(amplitudes=LAT_EVEN)))
+    assert report.ok
+    assert not report.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert not report.of_kind(ISSUE_SEPARATOR_IN_BAND)
+    assert report.lane_pitch == pytest.approx(LAT_PITCH, abs=2.0)
+    assert report.required_footprint == pytest.approx(report.lane_pitch * 0.5)
+    assert report.footprint_frac is not None
+    assert report.footprint_frac > 0.5
+
+
+def test_a_perfect_roi_can_still_hide_a_collapsed_footprint() -> None:
+    """本条判据的存在理由：ROI 画得挑不出毛病，横向足迹却已经塌了。
+
+    第 3 道那条强带被推过了第 3/4 道的分隔线，第 3 道只剩它左边一截。前两条
+    判据全票通过——条带数正好是"6 泳道 × 每道 1 条"，条带框离 ROI 上下边 37 px
+    而只要求 24 px——而第 3 道的足迹只剩泳道宽度的 18%，报出来的积分只有这条带
+    真实积分的一成多。
+    """
+    lanes = lateral_profiles(lateral_membrane(slide=57.0))
+    report = check_roi_quality(lanes)
+
+    # 前两条判据：一声不吭，而且不是勉强通过
+    assert not report.of_kind(ISSUE_BAND_COUNT)
+    assert not report.of_kind(ISSUE_EDGE_TOP)
+    assert not report.of_kind(ISSUE_EDGE_BOTTOM)
+    assert (report.lane_count, report.band_count) == (LAT_LANES, LAT_LANES)
+    assert report.top_clearance is not None and report.bottom_clearance is not None
+    assert min(report.top_clearance, report.bottom_clearance) > report.required_clearance * 1.4
+
+    # 横向：足迹塌到 18%
+    clipped = lanes[2]
+    assert (clipped.x2 - clipped.x1) / LAT_PITCH == pytest.approx(0.18, abs=0.02)
+
+    # 损失：同一条带，把分隔线挪进空白里量出来的是它的十几倍
+    moved = list(LAT_SEPARATORS)
+    moved[2] = float(ROI_X + 2 * LAT_PITCH + 17.0)
+    whole = lateral_profiles(lateral_membrane(slide=57.0), moved)[3]
+    assert clipped.total_density < whole.total_density * 0.2
+
+    (issue,) = report.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert issue.severity == "error"
+    assert 3 in issue.lanes
+    assert not report.ok
+
+
+def test_the_separator_that_cuts_the_band_is_named_on_its_own() -> None:
+    """哪条分隔线画错了要单独说，因为要动的是它，不是那两个泳道的数字。"""
+    report = check_roi_quality(lateral_profiles(lateral_membrane(slide=57.0)))
+    (issue,) = report.of_kind(ISSUE_SEPARATOR_IN_BAND)
+    assert issue.severity == "error"
+    assert issue.lanes == (3, 4)
+    assert "第 3 道与第 4 道之间" in issue.detail
+    assert "空隙" in issue.detail
+
+
+def test_the_report_says_it_looked_sideways_even_when_it_passes() -> None:
+    """"通过"两个字之所以曾经骗过人，就是因为它只讲了纵向。"""
+    report = check_roi_quality(lateral_profiles(lateral_membrane(amplitudes=LAT_EVEN)))
+    summary = report.summary()
+    assert "通过" in summary
+    assert "泳道分界" in summary
+    assert f"{report.footprint_frac:.0%}" in summary
+
+
+def test_a_footprint_that_fills_its_lane_is_not_a_clipped_one() -> None:
+    """两侧都贴着邻居 = 这条足迹压根没收紧过，是整条泳道条，不是被切断的。
+
+    收紧不动的泳道会整条退回泳道全宽，那种足迹左右都顶着邻居。真实样图上
+    5378 条两侧都贴的足迹里，收紧过的一条也没有——所以"两侧都贴"必须放行，
+    否则准确率从 0.83 掉到 0.63。
+    """
+    report = check_roi_quality_from_measurements(
+        spans_to_boxes(BOXES_ROI, [(0, 60), (60, 75), (75, 135)]), BOXES_ROI
+    )
+    assert report.footprint_frac is not None
+    assert report.footprint_frac < 0.5  # 中间那道确实又窄又贴边
+    assert not report.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert not report.of_kind(ISSUE_SEPARATOR_IN_BAND)
+    assert report.ok
+
+
+def test_the_same_lane_five_pixels_looser_on_one_side_is_reported() -> None:
+    """和上一条只差 5 px：一侧收得动，另一侧却正好停在分界上。
+
+    那 5 px 空白就是"这条足迹收紧过"的全部证据——收得动却没收，说明是被挡住的。
+    """
+    report = check_roi_quality_from_measurements(
+        spans_to_boxes(BOXES_ROI, [(0, 55), (60, 75), (75, 135)]), BOXES_ROI
+    )
+    (issue,) = report.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert issue.severity == "warning"
+    assert issue.lanes == (2,)
+    assert "第 2 道" in issue.detail
+    (separator,) = report.of_kind(ISSUE_SEPARATOR_IN_BAND)
+    assert separator.lanes == (2, 3)  # 只点右边那条分界，左边留着空白
+
+
+def test_a_narrow_band_with_room_on_both_sides_is_left_alone() -> None:
+    """细带落在宽泳道里完全正常——只按"窄"点名的准确率比瞎猜还低。"""
+    report = check_roi_quality_from_measurements(
+        spans_to_boxes(BOXES_ROI, [(5, 20), (50, 65), (95, 110)]), BOXES_ROI
+    )
+    assert report.footprint_frac is not None
+    assert report.footprint_frac < 0.4
+    assert not report.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert report.ok
+
+
+def test_severity_splits_at_a_quarter_of_the_lane_pitch() -> None:
+    """分档看的是丢了多少，不是把握有多大：剩两成时被切掉的比留下的还多。"""
+    warning = check_roi_quality_from_measurements(
+        spans_to_boxes(BOXES_ROI, [(0, 55), (60, 75), (75, 135)]), BOXES_ROI
+    )
+    (issue,) = warning.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert issue.severity == "warning"
+    severe = check_roi_quality_from_measurements(
+        spans_to_boxes(BOXES_ROI, [(0, 65), (68, 75), (75, 135)]), BOXES_ROI
+    )
+    (issue,) = severe.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert issue.severity == "error"
+    assert "泳道宽" in issue.detail
+
+
+def test_the_lane_pitch_is_measured_not_assumed() -> None:
+    """标尺是这批泳道自己的间距，换放大倍率、换分辨率都不用调参数。"""
+    narrow = check_roi_quality_from_measurements(
+        spans_to_boxes(BOXES_ROI, [(0, 20), (30, 50), (60, 80)]), BOXES_ROI
+    )
+    wide = check_roi_quality_from_measurements(
+        spans_to_boxes(BOXES_ROI, [(0, 20), (55, 75), (110, 130)]), BOXES_ROI
+    )
+    assert narrow.lane_pitch == pytest.approx(30.0)
+    assert wide.lane_pitch == pytest.approx(55.0)
+    assert wide.required_footprint > narrow.required_footprint
+    assert narrow.ok and wide.ok  # 两个都两侧留白，间距变了也不该报
+
+
+def test_the_named_bands_let_the_interface_highlight_the_boxes() -> None:
+    """足迹是整条泳道的属性，所以这条泳道的每个条带框都要点到。"""
+    roi = roi_of(0, 100)
+    spans = [(0, 55), (60, 75), (75, 135)]
+    items: list[BandMeasurement] = []
+    for lane, (x1, x2) in enumerate(spans, start=1):
+        for band, (top, bottom) in enumerate(((20, 35), (55, 70)), start=1):
+            items.append(
+                BandMeasurement(
+                    lane=lane,
+                    band=band,
+                    x=roi.x + x1,
+                    y=roi.y + top,
+                    width=x2 - x1,
+                    height=bottom - top,
+                    area=(x2 - x1) * (bottom - top),
+                    mean_intensity=100.0,
+                    background=10.0,
+                    integrated_density=1000.0,
+                )
+            )
+    report = check_roi_quality_from_measurements(items, roi)
+    (issue,) = report.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert issue.lanes == (2,)
+    assert issue.bands == ((2, 1), (2, 2))
+
+
+def test_a_single_lane_has_no_pitch_to_compare_against() -> None:
+    report = check_roi_quality_from_measurements(
+        spans_to_boxes(BOXES_ROI, [(20, 30)]), BOXES_ROI
+    )
+    assert report.lane_pitch == 0.0
+    assert report.footprint_frac is None
+    assert not report.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert "泳道分界" not in report.summary()
+
+
+def test_two_lanes_cannot_prove_a_footprint_ever_tightened() -> None:
+    """已知盲区，写下来免得下次当成 bug 修。
+
+    两个泳道时每条足迹只有一侧看得见（另一侧是 ROI 自己的边，而自检拿不到
+    ROI 的左右边）。这一侧贴上了，就没有第二侧能证明"这条足迹本来收得动"，
+    于是分不清"被分界切断"和"整条退回泳道全宽"。实测这种形态占全部塌陷的
+    1.2%（71/5780），换成把 ROI 传进来也救不回——用真实泳道条算，两泳道
+    这一档的准确率只有 0.25，比不报还差。
+    """
+    report = check_roi_quality_from_measurements(
+        spans_to_boxes(BOXES_ROI, [(0, 15), (15, 120)]), BOXES_ROI
+    )
+    assert report.footprint_frac is not None
+    assert report.footprint_frac < 0.5
+    assert not report.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+
+
+def test_an_empty_lane_never_counts_as_a_clipped_footprint() -> None:
+    """没检出条带的泳道，"足迹"是整条泳道条，不是收紧的结果。"""
+    raw = lateral_membrane(slide=57.0)
+    lanes = compute_lane_profiles(
+        raw,
+        LAT_ROI,
+        LAT_SEPARATORS,
+        dark_bands=False,
+        white_level=255.0,
+        split_bands=False,
+    )
+    report = check_roi_quality(lanes)
+    assert report.footprint_frac is None
+    assert not report.of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    assert report.of_kind(ISSUE_EMPTY_LANE)
+
+
+def test_the_lateral_check_changes_no_numbers_either() -> None:
+    lanes = lateral_profiles(lateral_membrane(slide=57.0))
+    before = [(l.x1, l.x2, l.total_density, tuple(l.band_densities)) for l in lanes]
+    assert check_roi_quality(lanes).of_kind(ISSUE_FOOTPRINT_CLIPPED)
+    after = [(l.x1, l.x2, l.total_density, tuple(l.band_densities)) for l in lanes]
+    assert before == after
+
+
+@pytest.mark.parametrize(
+    ("slide", "amplitudes"), [(0.0, LAT_EVEN), (57.0, LAT_AMPLITUDES)]
+)
+def test_both_entry_points_agree_on_the_footprint(
+    slide: float, amplitudes: Sequence[float]
+) -> None:
+    """条带测量表里也带着足迹（框的 x 和宽度），两个入口必须给出同一个结论。"""
+    raw = lateral_membrane(slide=slide, amplitudes=amplitudes)
+    lanes = lateral_profiles(raw)
+    from_profiles = check_roi_quality(lanes)
+    result = quantify_lanes(
+        raw, LAT_ROI, LAT_SEPARATORS, dark_bands=False, white_level=255.0, lanes=lanes
+    )
+    from_boxes = check_roi_quality_from_measurements(result.measurements, LAT_ROI)
+    assert {i.kind for i in from_boxes.issues} == {i.kind for i in from_profiles.issues}
+    assert from_boxes.lane_pitch == pytest.approx(from_profiles.lane_pitch)
+    assert from_boxes.footprint_frac == pytest.approx(from_profiles.footprint_frac)
