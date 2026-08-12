@@ -45,6 +45,7 @@ from .roi_check import (
     check_roi_quality,
     check_roi_quality_from_measurements,
 )
+from .tilt import TiltEstimate, estimate_tilt
 
 __all__ = [
     "BAND_PICK_ALL",
@@ -82,8 +83,10 @@ __all__ = [
     "RoiIssue",
     "RoiQualityReport",
     "RoiRect",
+    "TiltEstimate",
     "analyze_image",
     "compute_lane_profiles",
+    "estimate_tilt",
     "load_blot",
     "measure_box_native",
     "quantify_lanes",

@@ -19,7 +19,7 @@ from wb_analyzer.roi import (
     roi_intensity_profile,
     rotate_image,
     to_gray,
-)  # rotate_image: positive degrees are clockwise
+)  # rotate_image: positive degrees lift the right edge (counter-clockwise on screen)
 from wb_analyzer.analysis import analyze_array
 
 
