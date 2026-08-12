@@ -228,6 +228,29 @@ silently dropped — the lane has no segments at all then, so it falls back to o
 whole-lane record, which the detection limit duly flags.
 """
 
+SEGMENT_SPLIT_SIGMA = 3.0
+"""谷底比较小峰低这么多个 sigma 才算真的凹下去（在平滑剖面上陈述）。
+
+``valley_drop`` 那条 30% 几何判据要求的分辨率比瑞利判据还高，重叠双带在
+几何上就切不开：真实样图上一对 FWHM 8.5–11.3 px、中心间距 11–14 px 的双带
+（双高斯拟合得 d/FWHM = 1.02–1.42，正压在瑞利极限上）谷比只降到
+0.81–0.96，10 个泳道漏掉 8 个。纯把 ``valley_drop`` 放宽到能全部捞到
+（≤0.036）会让合成弱带的假分裂率从 0.2% 涨到 4.8%（更弱的带 1.7% → 20.7%），
+放宽 25 倍以上，所以这里并联一条**统计**判据而不是放松几何判据：谷相对
+较小峰的下探量在噪声尺度上显著就切。
+
+k=3 的依据：同一批泳道的谷深显著度实测 4.6σ（最难的那道）到 23.7σ，最难
+的一道仍有 53% 余量；k=4 也全中但余量只剩 15%，k=6 会重新漏掉 2 条。
+"""
+
+SEGMENT_SPLIT_MAX_RATIO = 0.98
+"""统计判据的相对下限：再显著也得比较小峰低 2%，否则平顶带的微小起伏也会被切。
+
+只挡"统计上显著但物理上没意义"的那一档——强带上一个 0.5% 的起伏在高信噪
+比下轻松超过 3σ。0.98 而不是 0.97：最难的那道实测谷比 0.9645，按 0.97 只
+剩 0.0055 的余量；而 0.97 / 0.98 / 不设上限三档实测的假阳性率完全相同。
+"""
+
 BLANK_LEVEL_QUANTILE = 10.0
 BLANK_LEVEL_Z = 1.2816
 """Where the blank rows sit, from a low quantile pushed back up to the mean.
@@ -494,21 +517,47 @@ def segment_bands(
     min_width: int = 3,
     valley_drop: float = 0.30,
     noise_sigma: float = 0.0,
+    expected_bands: int | None = None,
 ) -> list[tuple[int, int]]:
     """Split a baseline-corrected lane profile into band segments.
 
     Returns half-open (start, stop) index ranges. Runs above the threshold form
-    candidates; runs containing two clearly separated peaks (valley dips at
-    least ``valley_drop`` below the smaller peak) are split. Segment edges are
-    trimmed where the signal falls to ~2% of the local peak.
+    candidates, and a run holding several peaks is cut at the valleys between
+    them. Segment edges are trimmed where the signal falls to ~2% of the local
+    peak.
 
-    The threshold is the larger of a relative part (``min_height_frac`` of the
-    lane's own peak) and an absolute one (:data:`SEGMENT_MIN_SNR` sigmas above
-    the noise, stated on the smoothed profile). Pass ``noise_sigma=0`` — the
-    default — for the purely relative behaviour, which is what the footprint
-    locator wants; anything that reports numbers should pass the real noise, or
-    a blank lane comes back carved into bands that are pure noise.
+    A valley is cut when *either* test fires:
+
+    * **geometric** — it dips at least ``valley_drop`` below the smaller of the
+      two peaks, i.e. the pair is resolved in the classic sense;
+    * **statistical** — the dip is at least :data:`SEGMENT_SPLIT_SIGMA` sigmas
+      deep and still reaches :data:`SEGMENT_SPLIT_MAX_RATIO` of the smaller
+      peak. Overlapping doublets sitting at the Rayleigh limit never satisfy
+      the geometric test — 30% is a *higher* resolution demand than Rayleigh —
+      but their valley is unmistakable against the noise.
+
+    The statistical test needs a real noise scale, so it is off whenever
+    ``noise_sigma`` is 0; without that guard a zero sigma would make every
+    dip "infinitely significant" and any ripple would be cut.
+
+    ``expected_bands`` is the user saying how many bands each lane carries.
+    Given N, the deepest valleys are cut until the lane has N segments and
+    both automatic tests are bypassed entirely — the reliable fallback for a
+    membrane whose doublets no automatic criterion can be expected to resolve.
+    Bands already separated into distinct runs count towards N, and N can only
+    add cuts, never merge: a lane that already shows more than N runs keeps
+    them.
+
+    The run threshold is the larger of a relative part (``min_height_frac`` of
+    the lane's own peak) and an absolute one (:data:`SEGMENT_MIN_SNR` sigmas
+    above the noise, stated on the smoothed profile) and is not affected by
+    ``expected_bands``. Pass ``noise_sigma=0`` — the default — for the purely
+    relative behaviour, which is what the footprint locator wants; anything
+    that reports numbers should pass the real noise, or a blank lane comes back
+    carved into bands that are pure noise.
     """
+    if expected_bands is not None and int(expected_bands) < 1:
+        raise ValueError(f"每泳道条带数必须 ≥ 1（收到 {expected_bands}）")
     n = int(corrected.size)
     if n == 0:
         return []
@@ -517,10 +566,10 @@ def segment_bands(
     peak_value = float(smooth.max())
     if peak_value <= 1e-9:
         return []
+    # Smoothing already divided the per-sample noise by sqrt(2 * radius + 1).
+    sigma_smoothed = float(noise_sigma) / np.sqrt(2 * radius + 1)
     noise_threshold = 0.0
     if noise_sigma > 0.0:
-        # Smoothing already divided the per-sample noise by sqrt(2 * radius + 1).
-        sigma_smoothed = float(noise_sigma) / np.sqrt(2 * radius + 1)
         blank_level = (
             float(np.percentile(smooth, BLANK_LEVEL_QUANTILE)) + BLANK_LEVEL_Z * sigma_smoothed
         )
@@ -539,24 +588,53 @@ def segment_bands(
     if start is not None and n - start >= min_width:
         runs.append((start, n))
 
-    segments: list[tuple[int, int]] = []
+    # One entry per valley between adjacent peaks: (absolute index, valley
+    # height, height of the smaller peak it separates).
+    candidates: list[tuple[int, float, float]] = []
+    run_peaks: list[list[int]] = []
     for run_start, run_stop in runs:
         window = smooth[run_start:run_stop]
         min_dist = max(3, (run_stop - run_start) // 8, n // 60)
         peaks = _local_maxima(window, threshold, min_dist)
+        run_peaks.append(peaks)
+        for left, right in zip(peaks, peaks[1:], strict=False):
+            valley = left + int(np.argmin(window[left : right + 1]))
+            candidates.append(
+                (run_start + valley, float(window[valley]), float(min(window[left], window[right])))
+            )
+
+    if expected_bands is not None:
+        # Rank by how far the valley drops *relative* to the smaller peak, the
+        # same quantity ``valley_drop`` thresholds, so a shallow dip next to a
+        # strong band cannot outrank a real split next to a weak one.
+        needed = int(expected_bands) - len(runs)
+        ranked = sorted(
+            candidates,
+            key=lambda c: (c[2] - c[1]) / c[2] if c[2] > 0.0 else 0.0,
+            reverse=True,
+        )
+        cut_at = {index for index, _, _ in ranked[: max(0, needed)]}
+    else:
+        cut_at = set()
+        for index, value, smaller in candidates:
+            resolved = value <= smaller * (1.0 - valley_drop)
+            significant = (
+                noise_sigma > 0.0
+                and smaller - value >= SEGMENT_SPLIT_SIGMA * sigma_smoothed
+                and value <= smaller * SEGMENT_SPLIT_MAX_RATIO
+            )
+            if resolved or significant:
+                cut_at.add(index)
+
+    segments: list[tuple[int, int]] = []
+    for (run_start, run_stop), peaks in zip(runs, run_peaks, strict=True):
         if len(peaks) <= 1:
             segments.append(
                 _trim_segment(smooth, run_start, run_stop, noise_floor=noise_threshold)
             )
             continue
-        # Split at valleys that dip clearly below both adjacent peaks.
-        cuts: list[int] = []
-        for left, right in zip(peaks, peaks[1:], strict=False):
-            valley = left + int(np.argmin(window[left : right + 1]))
-            smaller = min(window[left], window[right])
-            if window[valley] <= smaller * (1.0 - valley_drop):
-                cuts.append(valley)
-        bounds = [run_start, *[run_start + c for c in cuts], run_stop]
+        cuts = sorted(c for c in cut_at if run_start < c < run_stop)
+        bounds = [run_start, *cuts, run_stop]
         for seg_start, seg_stop in zip(bounds, bounds[1:], strict=False):
             if seg_stop - seg_start >= min_width:
                 segments.append(
@@ -686,6 +764,7 @@ def compute_lane_profiles(
     baseline_mode: str = "rubber",
     split_bands: bool = True,
     tight: bool = True,
+    expected_bands: int | None = None,
 ) -> list[LaneProfile]:
     """Profile, baseline, and band segmentation for every ROI lane.
 
@@ -694,16 +773,27 @@ def compute_lane_profiles(
     积分值；找不到可靠条带的泳道回退全宽。``tight=False`` 保持旧的
     全宽行为。
 
-    Known limitation: the integral still depends on ROI height on real scans,
-    for a reason this function does not address. The rubber band is a *convex*
-    hull, so it cannot follow a gently curved background; the taller the ROI,
-    the further the chord under a band sinks below where the background
-    actually is. Measured on a chemiluminescence blot, the profile peak stayed
-    at 10319 while the baseline under it fell 202 → 92 as the ROI grew from 110
-    to 450 rows, moving a weak lane by 21%. That is a baseline-model problem —
-    a local background anchored just outside each segment would fix it — and it
-    is separate from the clipping bias :func:`_lane_noise` removes. Until then,
-    keep the ROI height consistent when comparing lanes.
+    ``expected_bands`` 是"我这张膜每个泳道有几条带"，交给
+    :func:`segment_bands` 强制切出这么多段（见那里的说明）。它只作用于
+    定量用的分段，不参与足迹定位——足迹只关心哪些行有信号，切不切开
+    是同一批行。
+
+    Known limitation: the rubber band can only be anchored at the two ends of
+    the ROI, so ``roi`` is not just a crop — its top and bottom edges *are* the
+    statement of where the background is. What decides the error is therefore
+    not how tall the ROI is but whether both edges sit on the same flat
+    background as the bands, and it behaves as a **step**, not as a drift with
+    height. Measured on a chemiluminescence blot cut into a narrow strip (only
+    y 336-426 carries membrane, outside it is the camera dark level): while
+    both edges stay on the membrane, height barely matters — 62 to 88 rows all
+    land within 3.6% of the reference. Cross an edge and the chord drops onto
+    the dark level, taking the whole membrane glow into the integral with it:
+    the strongest lane's total inflates by 60% and relative quantification is
+    off by up to 38%. That is a baseline-model problem — a local background
+    anchored just outside each segment would fix it — and it is separate from
+    the clipping bias :func:`_lane_noise` removes. Until then,
+    :func:`wb_analyzer.roi_check.check_roi_quality` diagnoses the ROIs where it
+    bites; see README methodology §5 and §11.
     """
     roi = roi.clipped(raw)
     if roi.width < 3 or roi.height < 3:
@@ -732,7 +822,11 @@ def compute_lane_profiles(
         # Segments are found whether or not the caller wants them reported
         # separately, so split_bands=False sees the same blank rows — and the
         # same correction — as the default path.
-        detected = segment_bands(corrected, noise_sigma=_noise_scale(residual))
+        detected = segment_bands(
+            corrected,
+            noise_sigma=_noise_scale(residual),
+            expected_bands=expected_bands,
+        )
         floor, sigma = _lane_noise(residual, detected)
         # Integrate the residual, not its clipped version. Clipping is what made
         # a blank stretch of lane sum to something positive: it keeps every
@@ -839,6 +933,7 @@ def quantify_lanes(
     baseline_mode: str = "rubber",
     split_bands: bool = True,
     tight: bool = True,
+    expected_bands: int | None = None,
     lanes: list[LaneProfile] | None = None,
 ) -> AnalysisResult:
     """Quantify ROI lanes via baseline-subtracted vertical profiles.
@@ -850,8 +945,8 @@ def quantify_lanes(
 
     ``lanes`` 让已经调用过 :func:`compute_lane_profiles` 的调用方把结果传回来
     复用：要画剖面的界面因此只算一遍，画出来的基线和表里的数字必定同源。
-    传了 ``lanes`` 就意味着 ``baseline_mode`` / ``split_bands`` / ``tight``
-    早已固化在这些剖面里，本函数不再读取它们。
+    传了 ``lanes`` 就意味着 ``baseline_mode`` / ``split_bands`` / ``tight`` /
+    ``expected_bands`` 早已固化在这些剖面里，本函数不再读取它们。
 
     ``tight=True``（默认）把每个泳道的积分与标注框收紧到条带的实际横向
     足迹，泳道内条带两侧的空白不再计入积分；``tight=False`` 保持旧的
@@ -868,6 +963,7 @@ def quantify_lanes(
             baseline_mode=baseline_mode,
             split_bands=split_bands,
             tight=tight,
+            expected_bands=expected_bands,
         )
     measurements: list[BandMeasurement] = []
     for lane in lanes:
