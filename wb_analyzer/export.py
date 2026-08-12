@@ -9,10 +9,26 @@ import cv2
 import numpy as np
 
 from .analysis import AnalysisResult
+from .normalize import ORIGIN_UNKNOWN, BackgroundOrigin, coerce_origin
 from .roi import RoiRect
 
 
-def export_result(result: AnalysisResult, image_path: str | Path, output_dir: str | Path) -> tuple[Path, Path]:
+def export_result(
+    result: AnalysisResult,
+    image_path: str | Path,
+    output_dir: str | Path,
+    *,
+    origin: BackgroundOrigin | str = ORIGIN_UNKNOWN,
+) -> tuple[Path, Path]:
+    """Write the band table and the annotated preview.
+
+    ``origin`` states which background convention measured these numbers
+    (README §9). It is a parameter rather than something read off the result
+    because only the caller knows which path it took — and a file that does not
+    say is a file whose numbers cannot be safely compared with anyone else's a
+    month later.
+    """
+    origin = coerce_origin(origin)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     stem = Path(image_path).stem
@@ -33,11 +49,12 @@ def export_result(result: AnalysisResult, image_path: str | Path, output_dir: st
         "detection_limit",
         "snr",
         "below_detection",
+        "origin",
     ]
     with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(m.as_dict() for m in result.measurements)
+        writer.writerows({**m.as_dict(), "origin": origin} for m in result.measurements)
     encoded, buffer = cv2.imencode(".png", result.annotated_image)
     if not encoded:
         raise OSError("无法生成标注预览图")

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .analysis import AnalysisConfig, analyze_image
 from .export import export_result
+from .normalize import ORIGIN_LOCAL_BACKGROUND
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,7 +43,12 @@ def main(argv: list[str] | None = None) -> None:
         background_mode=args.background,
     )
     result = analyze_image(args.image, config=config)
-    csv_path, preview_path = export_result(result, args.image, args.output)
+    # analyze_image detects on the 8-bit layer and re-measures with the ring
+    # median (quant.remeasure_native), so this whole path is the local
+    # background convention — never the ROI baseline one.
+    csv_path, preview_path = export_result(
+        result, args.image, args.output, origin=ORIGIN_LOCAL_BACKGROUND
+    )
     print(f"检测到 {len(result.measurements)} 个条带")
     if result.saturated_band_count:
         print(f"警告：{result.saturated_band_count} 个条带可能存在曝光饱和")
