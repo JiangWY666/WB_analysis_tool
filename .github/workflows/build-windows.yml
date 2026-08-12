@@ -8,16 +8,54 @@ on:
   pull_request:
     paths:
       - "wb_analyzer/**"
+      - "tests/**"
       - "desktop/**"
-      - "scripts/build_windows.ps1"
+      - "scripts/**"
       - "pyproject.toml"
       - ".github/workflows/build-windows.yml"
 
 permissions:
   contents: read
 
+# Supersede in-flight PR runs; never cancel a main/tag run mid-release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Covers the lowest version promised by requires-python plus current stable.
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package with dev extras
+        run: python -m pip install -e ".[dev]"
+
+      - name: Show resolved dependency versions
+        run: python -m pip list
+
+      - name: Run test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
   build:
+    name: Build Windows package
+    needs: test
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -27,10 +65,98 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Build desktop package
         shell: pwsh
         run: ./scripts/build_windows.ps1
+
+      # Guards the DLL/plugin pruning in desktop/wb-analyzer.spec (_DROP_KEYS).
+      # A bundle that is missing a Qt DLL dies at startup, and because the spec
+      # sets console=False the user would see nothing -- so CI has to launch it.
+      - name: Smoke-test the packaged exe
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $exe = Join-Path (Get-Location) "dist\WB-Analyzer\WB-Analyzer.exe"
+          if (-not (Test-Path $exe)) { throw "SMOKE FAIL: $exe not found" }
+
+          $tmp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+          $outLog = Join-Path $tmp "smoke-stdout.txt"
+          $errLog = Join-Path $tmp "smoke-stderr.txt"
+          $graceSeconds = 20
+
+          Write-Host "==> Launching the packaged exe; it must survive $graceSeconds s"
+          $proc = Start-Process -FilePath $exe -PassThru `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+
+          # Gate 1 -- must not die. WaitForExit(ms) returns $true only when the
+          # process HAS exited inside the window. A healthy build blocks forever in
+          # QApplication.exec(), so any exit here means the bundle is broken:
+          # a pruned-but-needed DLL gives 0xC0000135, a bad Qt plugin makes Qt
+          # qFatal() and abort, an import error gives a non-zero Python exit.
+          $exitedEarly = $proc.WaitForExit($graceSeconds * 1000)
+
+          function Show-Logs {
+            foreach ($pair in @(@("stdout", $outLog), @("stderr", $errLog))) {
+              Write-Host "---- $($pair[0]) ----"
+              if (Test-Path $pair[1]) { Get-Content $pair[1] -ErrorAction SilentlyContinue }
+            }
+          }
+
+          if ($exitedEarly) {
+            $code = try { $proc.ExitCode } catch { $null }
+            $codeText = if ($null -eq $code) { "unavailable" } else { "$code (0x$('{0:X8}' -f $code))" }
+            Show-Logs
+            throw ("SMOKE FAIL: the exe exited within $graceSeconds s, exit code $codeText. " +
+                   "A working build stays in its event loop. 0xC0000135 = a DLL that " +
+                   "desktop/wb-analyzer.spec prunes via _DROP_KEYS is still required.")
+          }
+
+          # Informational only. Process.Modules is truncated by Windows (it reports
+          # a handful of modules for a Qt process that really loaded hundreds), so it
+          # must NOT be used as a gate -- doing so fails healthy builds.
+          try {
+            Write-Host "loaded module sample: $((Get-Process -Id $proc.Id).Modules.Count) entries visible"
+          } catch {
+            Write-Host "loaded module sample: unavailable"
+          }
+
+          Write-Host "==> Still alive after $graceSeconds s; shutting it down to inspect its output"
+          Stop-Process -Id $proc.Id -Force
+          [void]$proc.WaitForExit(10000)
+
+          # Gate 2 -- must not have reported a fatal startup error. Qt can print this
+          # and linger briefly behind a message box, which gate 1 alone would miss.
+          $fatalPatterns = @(
+            "could not find or load the Qt platform plugin",
+            "Failed to load platform plugin",
+            "This application failed to start",
+            "DLL load failed",
+            "ModuleNotFoundError",
+            "ImportError",
+            "Traceback (most recent call last)"
+          )
+          $logText = ""
+          foreach ($f in @($outLog, $errLog)) {
+            if (Test-Path $f) { $logText += (Get-Content $f -Raw -ErrorAction SilentlyContinue) }
+          }
+          $hits = $fatalPatterns | Where-Object { $logText -like "*$_*" }
+          if ($hits) {
+            Show-Logs
+            throw "SMOKE FAIL: the exe reported a fatal startup error: $($hits -join '; ')"
+          }
+
+          if ($logText.Trim()) {
+            Write-Host "::warning::the exe wrote to stdout/stderr during startup:"
+            Show-Logs
+          }
+
+          Write-Host "SMOKE PASS: exe started, stayed alive $graceSeconds s, and reported no fatal error."
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -45,3 +171,33 @@ jobs:
           name: WB-Analyzer-Windows-folder
           path: dist/WB-Analyzer/
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged zip
+        uses: actions/download-artifact@v4
+        with:
+          name: WB-Analyzer-Windows
+          path: release-assets
+
+      - name: Name the asset after the tag
+        run: |
+          set -euo pipefail
+          src="release-assets/WB-Analyzer-Windows.zip"
+          test -f "$src" || { echo "expected $src in the artifact"; ls -R release-assets; exit 1; }
+          mv "$src" "release-assets/WB-Analyzer-${{ github.ref_name }}-windows-x64.zip"
+          ls -l release-assets
+
+      # Release assets download without a GitHub account, unlike Actions artifacts.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/WB-Analyzer-*-windows-x64.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
