@@ -6,12 +6,18 @@ run on the native dynamic range; only the on-screen preview is reduced to
 
 - ``raw``: float32 grayscale in the source value range (quantification layer)
 - ``display_bgr``: 8-bit BGR with auto-contrast for >8-bit sources (view layer)
+
+The reduction from ``raw`` to any 8-bit view is a :class:`DisplayMapping`: two
+numbers (a black point and a white point) plus the rule that produced them. It
+is a value object rather than a private step so that a figure exported from
+this software can state, in a caption, exactly what was done to the pixels.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -147,19 +153,153 @@ def _to_gray_float(array: np.ndarray) -> np.ndarray:
     return 0.114 * b + 0.587 * g + 0.299 * r
 
 
+MAPPING_LINEAR = "linear"
+"""Raw values divided by the sensor full scale — no stretch, nothing clipped."""
+
+MAPPING_AUTO = "auto"
+"""Percentile stretch. What the on-screen preview has always used."""
+
+MAPPING_MANUAL = "manual"
+"""Black and white points chosen by the operator."""
+
+MappingMode = Literal["linear", "auto", "manual"]
+
+MAPPING_LABELS: dict[str, str] = {
+    MAPPING_LINEAR: "线性全量程",
+    MAPPING_AUTO: "自动对比度拉伸",
+    MAPPING_MANUAL: "手动黑白点",
+}
+
+AUTO_LOW_PERCENTILE = 0.05
+AUTO_HIGH_PERCENTILE = 99.85
+"""Percentiles behind :data:`MAPPING_AUTO`.
+
+They are generous on purpose — the preview exists to make faint bands visible
+on a monitor. That is the wrong trade for a figure, which is why
+:data:`MAPPING_LINEAR` and not this is the export default.
+"""
+
+
+@dataclass(frozen=True)
+class DisplayMapping:
+    """The two numbers that turn raw sensor values into displayable ones.
+
+    ``black_point`` maps to output 0 and ``white_point`` to output full scale;
+    everything outside is clipped. Keeping the percentiles alongside lets a
+    caption distinguish "we stretched to the 0.05/99.85 percentiles" from "we
+    typed these two numbers in", which are different claims.
+    """
+
+    mode: MappingMode
+    black_point: float
+    white_point: float
+    white_level: float
+    low_percentile: float | None = None
+    high_percentile: float | None = None
+
+    @property
+    def label(self) -> str:
+        return MAPPING_LABELS.get(self.mode, self.mode)
+
+    @property
+    def is_lossless(self) -> bool:
+        """True when the mapping spans the full sensor range and clips nothing."""
+        return self.black_point <= 0.0 and self.white_point >= self.white_level
+
+
+def _percentile_bounds(raw: np.ndarray, low: float, high: float) -> tuple[float, float]:
+    finite = raw[np.isfinite(raw)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    lo = float(np.percentile(finite, low))
+    hi = float(np.percentile(finite, high))
+    if hi - lo < 1e-9:
+        hi = lo + 1.0
+    return lo, hi
+
+
+def resolve_display_mapping(
+    raw: np.ndarray,
+    white_level: float,
+    *,
+    mode: MappingMode = MAPPING_LINEAR,
+    black_point: float | None = None,
+    white_point: float | None = None,
+    low_percentile: float = AUTO_LOW_PERCENTILE,
+    high_percentile: float = AUTO_HIGH_PERCENTILE,
+) -> DisplayMapping:
+    """Turn a mapping *choice* into the concrete black/white points it implies.
+
+    Resolving up front (rather than inside the pixel loop) is what makes the
+    numbers reportable: the caller gets the same object that produced the
+    pixels and can write it into a caption.
+    """
+    white_level = float(white_level)
+    if not np.isfinite(white_level) or white_level <= 0:
+        raise ValueError(f"白电平必须为有限正数，收到 {white_level}")
+    if mode == MAPPING_LINEAR:
+        return DisplayMapping(MAPPING_LINEAR, 0.0, white_level, white_level)
+    if mode == MAPPING_AUTO:
+        lo, hi = _percentile_bounds(raw, low_percentile, high_percentile)
+        return DisplayMapping(
+            MAPPING_AUTO, lo, hi, white_level, low_percentile, high_percentile
+        )
+    if mode == MAPPING_MANUAL:
+        if black_point is None or white_point is None:
+            raise ValueError("手动映射需要同时给出黑点和白点")
+        lo, hi = float(black_point), float(white_point)
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            raise ValueError("黑点和白点必须是有限数值")
+        if hi - lo < 1e-9:
+            raise ValueError(f"白点必须大于黑点，收到 黑点={lo} 白点={hi}")
+        return DisplayMapping(MAPPING_MANUAL, lo, hi, white_level)
+    raise ValueError(
+        f"未知的灰度映射方式：{mode!r}（可选 {MAPPING_LINEAR} / {MAPPING_AUTO} / {MAPPING_MANUAL}）"
+    )
+
+
+def apply_display_mapping(
+    raw: np.ndarray, mapping: DisplayMapping, *, dtype: type = np.uint8
+) -> np.ndarray:
+    """Render ``raw`` through ``mapping`` into a uint8 or uint16 gray image."""
+    if dtype not in (np.uint8, np.uint16):
+        raise ValueError("展示图只支持 8 位或 16 位输出")
+    out_max = 255.0 if dtype is np.uint8 else 65535.0
+    span = mapping.white_point - mapping.black_point
+    values = np.nan_to_num(
+        raw.astype(np.float32),
+        nan=mapping.black_point,
+        posinf=mapping.white_point,
+        neginf=mapping.black_point,
+    )
+    scaled = (values - mapping.black_point) / span
+    return np.clip(scaled * out_max + 0.5, 0, out_max).astype(dtype)
+
+
+def clipping_fractions(rendered: np.ndarray) -> tuple[float, float]:
+    """Fraction of rendered pixels sitting at pure black and at pure white.
+
+    Measured on the output rather than against the mapping window, because
+    rounding collapses onto the extremes too — and by far the larger effect.
+    On a real 16-bit blot the 0.05/99.85 percentile stretch pushed 41.8% of
+    all pixels onto 255 while formally excluding only 0.15% from its window.
+    Pixels sharing an extreme value can no longer be told apart, whichever way
+    they got there, so that is the number worth reporting.
+    """
+    if rendered.size == 0:
+        return 0.0, 0.0
+    top = 255 if rendered.dtype == np.uint8 else 65535
+    return float(np.mean(rendered == 0)), float(np.mean(rendered == top))
+
+
 def display_gray_from_raw(raw: np.ndarray, white_level: float) -> np.ndarray:
     """8-bit preview. 8-bit sources pass through; deeper sources auto-contrast."""
     if white_level <= 255.0:
         return np.clip(raw, 0, 255).astype(np.uint8)
-    finite = raw[np.isfinite(raw)]
-    if finite.size == 0:
+    if not np.isfinite(raw).any():
         return np.zeros(raw.shape, dtype=np.uint8)
-    lo = float(np.percentile(finite, 0.05))
-    hi = float(np.percentile(finite, 99.85))
-    if hi - lo < 1e-9:
-        hi = lo + 1.0
-    scaled = (raw.astype(np.float32) - lo) / (hi - lo)
-    return np.clip(scaled * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    mapping = resolve_display_mapping(raw, white_level, mode=MAPPING_AUTO)
+    return apply_display_mapping(raw, mapping, dtype=np.uint8)
 
 
 def blot_from_array(
@@ -286,8 +426,27 @@ def _border_value(image: np.ndarray) -> float:
     return float(np.median(border))
 
 
-def rotate_blot(blot: BlotImage, angle_deg: float) -> BlotImage:
-    """Rotate both layers, filling corners with the estimated background tone."""
+ROTATE_FAST = cv2.INTER_LINEAR
+"""Bilinear: what interactive straightening uses, and the quantification default."""
+
+ROTATE_SHARP = cv2.INTER_LANCZOS4
+"""Lanczos-4: keeps ~95% of the above-half-Nyquist spectrum where bilinear keeps ~63%.
+
+Worth the ~4x resampling cost when the output is a printed figure, but it
+overshoots at edges, so :func:`rotate_blot` clamps the result back into the
+source value range.
+"""
+
+
+def rotate_blot(
+    blot: BlotImage, angle_deg: float, *, interpolation: int = ROTATE_FAST
+) -> BlotImage:
+    """Rotate both layers, filling corners with the estimated background tone.
+
+    ``interpolation`` defaults to :data:`ROTATE_FAST` so that quantification is
+    unaffected; pass :data:`ROTATE_SHARP` when the rotated copy is headed for a
+    figure rather than for measurement.
+    """
     if abs(angle_deg) < 1e-6:
         return replace(blot, raw=blot.raw.copy(), display_bgr=blot.display_bgr.copy())
     matrix, new_w, new_h = _rotation_params(blot.raw.shape[:2], angle_deg)
@@ -296,16 +455,24 @@ def rotate_blot(blot: BlotImage, angle_deg: float) -> BlotImage:
         blot.raw,
         matrix,
         (new_w, new_h),
-        flags=cv2.INTER_LINEAR,
+        flags=interpolation,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=raw_fill,
     )
+    # Sharper kernels ring: Lanczos-4 on a real blot overshot to -8237 and
+    # 73421 out of a 0..65535 source. Negative "intensity" is not a number any
+    # downstream code should have to defend against, and the clamp is a no-op
+    # for the bilinear default, whose output is a convex combination of inputs.
+    if blot.raw.size:
+        low = min(float(np.min(blot.raw)), raw_fill)
+        high = max(float(np.max(blot.raw)), raw_fill)
+        raw = np.clip(raw, low, high)
     disp_fill = _border_value(blot.display_bgr)
     display_bgr = cv2.warpAffine(
         blot.display_bgr,
         matrix,
         (new_w, new_h),
-        flags=cv2.INTER_LINEAR,
+        flags=interpolation,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(disp_fill, disp_fill, disp_fill),
     )
