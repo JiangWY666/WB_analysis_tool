@@ -45,8 +45,30 @@ class BandMeasurement:
     integrated_density: float
     saturated_fraction: float = 0.0
 
+    detection_limit: float = 0.0
+    """3σ 检出限，与 ``integrated_density`` 同单位。
+
+    条带的积分低于这个值时，它与「什么都没有」在统计上无法区分。0 是哨兵值，
+    表示这条测量的噪声无法估计（噪声为零的合成图，或没有可用空白区的路径），
+    此时不作检出限判定。
+    """
+
+    snr: float = 0.0
+    """信噪比 = ``integrated_density`` / 积分窗口上的噪声幅度。
+
+    与 :attr:`detection_limit` 同源，因此 ``snr < 3`` 与 :attr:`below_detection`
+    等价；单独给出是为了让用户看到「差多远」而不只是「过没过」。
+    """
+
+    @property
+    def below_detection(self) -> bool:
+        """积分没有越过 3σ 检出限——这个数值不能当成真实信号来用。"""
+        return self.detection_limit > 0.0 and self.integrated_density < self.detection_limit
+
     def as_dict(self) -> dict[str, int | float]:
-        return asdict(self)
+        data: dict[str, int | float] = asdict(self)
+        data["below_detection"] = int(self.below_detection)
+        return data
 
 
 @dataclass(frozen=True)
@@ -107,13 +129,20 @@ def _auto_kernel_size(gray: np.ndarray) -> int:
 
 
 def _local_background(gray: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
+    """Median of a ring around the band box.
+
+    The band region is masked with NaN rather than 0: a ``> 0`` filter would
+    also throw away genuinely black background, which on a dark-background
+    chemiluminescence frame leaves only the bright specks behind and pushes
+    the background estimate far too high.
+    """
     pad_x = max(2, (x2 - x1) // 4)
     pad_y = max(2, (y2 - y1) // 2)
     left, top = max(0, x1 - pad_x), max(0, y1 - pad_y)
     right, bottom = min(gray.shape[1], x2 + pad_x), min(gray.shape[0], y2 + pad_y)
-    ring = gray[top:bottom, left:right].copy()
-    ring[y1 - top : y2 - top, x1 - left : x2 - left] = 0
-    values = ring[ring > 0]
+    ring = gray[top:bottom, left:right].astype(np.float64)
+    ring[y1 - top : y2 - top, x1 - left : x2 - left] = np.nan
+    values = ring[~np.isnan(ring)]
     return float(np.median(values)) if values.size else float(np.median(gray))
 
 
@@ -244,10 +273,17 @@ def rebuild_result(
 
 
 def _smooth_1d(values: np.ndarray, radius: int) -> np.ndarray:
+    """Moving average with edge padding.
+
+    Zero padding (``mode="same"`` without a pad) attenuates the first and last
+    ``radius`` samples by up to 50%, which hides bands sitting against the
+    edge of a crop from the projection detector.
+    """
     radius = max(1, int(radius))
     kernel = np.ones(radius * 2 + 1, dtype=float)
     kernel /= kernel.sum()
-    return np.convolve(values.astype(float), kernel, mode="same")
+    padded = np.pad(np.asarray(values, dtype=float), radius, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
 
 
 def _content_bbox(gray: np.ndarray, dark_bands: bool) -> tuple[int, int, int, int]:
@@ -571,6 +607,12 @@ def analyze_array(image: np.ndarray, config: AnalysisConfig | None = None) -> An
     cfg = (config or AnalysisConfig()).normalized()
     if image is None or image.size == 0:
         raise ValueError("图片为空，无法分析")
+    if image.dtype != np.uint8:
+        raise ValueError(
+            f"analyze_array 只接受 8 位图像（收到 {image.dtype}）。"
+            "原生位深图片请用 imageio.load_blot() 读取后传入 BlotImage.display_bgr，"
+            "再用 quant.remeasure_native() 在原始位深上复测——analyze_image() 已按这个流程实现。"
+        )
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
     if min(gray.shape) < 20:
         raise ValueError("图片尺寸过小（宽和高至少为 20 像素）")
@@ -612,7 +654,25 @@ def analyze_array(image: np.ndarray, config: AnalysisConfig | None = None) -> An
 
 
 def analyze_image(path: str | Path, config: AnalysisConfig | None = None) -> AnalysisResult:
-    """Read and analyze an image while supporting non-ASCII Windows paths."""
-    from .roi import load_bgr
+    """Read and analyze an image at its native bit depth.
 
-    return analyze_array(load_bgr(path), config=config)
+    Band *detection* runs on the 8-bit display layer (CLAHE, Otsu and the
+    morphology below all require uint8), but every reported number is then
+    re-measured on the untouched ``raw`` plane. This is the same two-stage
+    pipeline the GUI uses; going through ``cv2.IMREAD_COLOR`` instead would
+    collapse a 16-bit exposure to 256 grey levels before anything is measured.
+    """
+    from .imageio import load_blot
+    from .quant import remeasure_native
+
+    blot = load_blot(path)
+    result = analyze_array(blot.display_bgr, config=config)
+    if not result.measurements:
+        return result
+    return remeasure_native(
+        result.measurements,
+        blot.raw,
+        dark_bands=result.dark_bands,
+        white_level=blot.white_level,
+        display_gray=blot.display_gray,
+    )

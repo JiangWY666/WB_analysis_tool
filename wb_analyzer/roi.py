@@ -1,4 +1,4 @@
-"""ROI lane quantification, rotation helpers, and intensity profiles."""
+"""ROI geometry, lane separator placement, rotation helpers, and intensity profiles."""
 
 from __future__ import annotations
 
@@ -7,14 +7,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .analysis import (
-    AnalysisConfig,
-    AnalysisResult,
-    BandMeasurement,
-    BackgroundMode,
-    _resolve_dark_bands,
-    annotate_measurements,
-)
+from .analysis import BackgroundMode, _resolve_dark_bands
 
 
 @dataclass(frozen=True)
@@ -69,9 +62,19 @@ def angle_to_horizontal(x0: float, y0: float, x1: float, y1: float) -> float:
     return float(np.degrees(np.arctan2(y1 - y0, x1 - x0)))
 
 
-def angle_to_vertical(x0: float, y0: float, x1: float, y1: float) -> float:
-    """Return the segment tilt in degrees relative to vertical (image coords)."""
-    return float(np.degrees(np.arctan2(y1 - y0, x1 - x0)) - 90.0)
+MAX_STRAIGHTEN_ANGLE = 45.0
+"""How far the fine-rotation control may straighten a blot, in degrees.
+
+Straightening resamples the image, so every degree costs a little sharpness;
+past 45° the interpolation blur starts to matter more than the tilt it removes,
+and a blot that far off is better fixed with a 90° quarter turn first. The
+single source of truth for both the core geometry helpers and the GUI spin box.
+"""
+
+
+def clamp_straighten_angle(angle_deg: float) -> float:
+    """Clamp a straightening angle to ±:data:`MAX_STRAIGHTEN_ANGLE`."""
+    return float(np.clip(float(angle_deg), -MAX_STRAIGHTEN_ANGLE, MAX_STRAIGHTEN_ANGLE))
 
 
 def normalize_angle(angle_deg: float) -> float:
@@ -134,10 +137,17 @@ def default_separators(roi: RoiRect, lane_count: int) -> list[float]:
 
 
 def _smooth_profile(values: np.ndarray, radius: int = 4) -> np.ndarray:
+    """Moving average with edge padding.
+
+    Zero padding would drop the first and last ``radius`` samples toward zero,
+    creating fake valleys at the ROI edges that separator placement and the
+    autocorrelation lane-count estimate would both take seriously.
+    """
     radius = max(1, int(radius))
     kernel = np.ones(radius * 2 + 1, dtype=float)
     kernel /= kernel.sum()
-    return np.convolve(values.astype(float), kernel, mode="same")
+    padded = np.pad(np.asarray(values, dtype=float), radius, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
 
 
 def find_profile_peaks(
@@ -388,100 +398,6 @@ def lane_boundaries(roi: RoiRect, separators: list[float]) -> list[tuple[int, in
     return bounds
 
 
-def quantify_lane_section(
-    gray: np.ndarray,
-    x1: int,
-    y1: int,
-    x2: int,
-    y2: int,
-    *,
-    dark_bands: bool,
-    lane: int,
-    saturate_level: int = 250,
-) -> BandMeasurement:
-    """Quantify one full-height lane strip using per-lane P25 background."""
-    h, w = gray.shape[:2]
-    x1 = int(np.clip(x1, 0, max(0, w - 1)))
-    y1 = int(np.clip(y1, 0, max(0, h - 1)))
-    x2 = int(np.clip(x2, x1 + 1, w))
-    y2 = int(np.clip(y2, y1 + 1, h))
-    section = gray[y1:y2, x1:x2]
-    signal = (255.0 - section.astype(float)) if dark_bands else section.astype(float)
-    background = float(np.percentile(signal, 25))
-    threshold = background + 0.2 * float(signal.std())
-    mask = signal >= threshold
-    corrected = np.maximum(signal - background, 0.0)
-    integrated = float(corrected[mask].sum()) if mask.any() else 0.0
-    if dark_bands:
-        saturated_fraction = float(np.mean(section <= (255 - saturate_level)))
-        display_bg = 255.0 - background
-    else:
-        saturated_fraction = float(np.mean(section >= saturate_level))
-        display_bg = background
-    return BandMeasurement(
-        lane=lane,
-        band=1,
-        x=x1,
-        y=y1,
-        width=x2 - x1,
-        height=y2 - y1,
-        area=int(section.size),
-        mean_intensity=round(float(section.mean()), 3),
-        background=round(float(display_bg), 3),
-        integrated_density=round(integrated, 3),
-        saturated_fraction=round(saturated_fraction, 4),
-    )
-
-
-def quantify_roi_lanes(
-    gray: np.ndarray,
-    roi: RoiRect,
-    separators: list[float],
-    *,
-    background_mode: BackgroundMode = "auto",
-    saturate_level: int = 250,
-) -> AnalysisResult:
-    roi = roi.clipped(gray)
-    if roi.width < 3 or roi.height < 3:
-        raise ValueError("ROI 过小，无法定量")
-    dark_bands = _resolve_dark_bands(gray, background_mode)
-    measurements = [
-        quantify_lane_section(
-            gray,
-            x1,
-            roi.y,
-            x2,
-            roi.y + roi.height,
-            dark_bands=dark_bands,
-            lane=index,
-            saturate_level=saturate_level,
-        )
-        for index, (x1, x2) in enumerate(lane_boundaries(roi, separators), start=1)
-    ]
-    annotated = annotate_measurements(gray, measurements)
-    # Draw separators on top for ROI QC.
-    for sep in separators:
-        x = int(round(sep))
-        if roi.x < x < roi.x + roi.width:
-            cv2.line(annotated, (x, roi.y), (x, roi.y + roi.height - 1), (255, 180, 0), 1, cv2.LINE_AA)
-    cv2.rectangle(
-        annotated,
-        (roi.x, roi.y),
-        (roi.x + roi.width - 1, roi.y + roi.height - 1),
-        (0, 220, 255),
-        1,
-        cv2.LINE_AA,
-    )
-    saturated = sum(1 for m in measurements if m.saturated_fraction >= 0.05)
-    return AnalysisResult(
-        measurements=measurements,
-        annotated_image=annotated,
-        dark_bands=dark_bands,
-        saturated_band_count=saturated,
-        gray_image=gray.copy(),
-    )
-
-
 def roi_intensity_profile(
     gray: np.ndarray,
     roi: RoiRect,
@@ -494,15 +410,3 @@ def roi_intensity_profile(
     dark_bands = _resolve_dark_bands(gray, background_mode)
     signal = (255.0 - crop.astype(float)) if dark_bands else crop.astype(float)
     return signal.mean(axis=0), dark_bands
-
-
-def analyze_rotated_image(
-    path,
-    *,
-    angle_deg: float = 0.0,
-    config: AnalysisConfig | None = None,
-) -> AnalysisResult:
-    from .analysis import analyze_array
-
-    image = rotate_image(load_bgr(path), angle_deg)
-    return analyze_array(image, config=config)

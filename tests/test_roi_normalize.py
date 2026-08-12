@@ -3,14 +3,19 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from wb_analyzer.normalize import AnalysisSession, QuantEntry, export_normalized_csv, lane_intensities_from_measurements
+from wb_analyzer.normalize import (
+    AnalysisSession,
+    QuantEntry,
+    export_normalized_csv,
+    lane_series_from_measurements,
+)
 from wb_analyzer.export import export_figure
+from wb_analyzer.quant import quantify_lanes
 from wb_analyzer.roi import (
     RoiRect,
     angle_to_horizontal,
     default_separators,
     normalize_angle,
-    quantify_roi_lanes,
     roi_intensity_profile,
     rotate_image,
     to_gray,
@@ -42,8 +47,8 @@ def test_roi_lane_quantification_and_profile() -> None:
     roi = RoiRect(20, 40, 280, 70)
     seps = default_separators(roi, 4)
     assert len(seps) == 3
-    result = quantify_roi_lanes(gray, roi, seps, background_mode="dark_bands")
-    assert len(result.measurements) == 4
+    result = quantify_lanes(gray, roi, seps, dark_bands=True)
+    assert sorted({m.lane for m in result.measurements}) == [1, 2, 3, 4]
     assert all(m.integrated_density > 0 for m in result.measurements)
     profile, dark = roi_intensity_profile(gray, roi, background_mode="dark_bands")
     assert dark
@@ -90,9 +95,9 @@ def test_auto_detect_lane_aggregation_for_normalize() -> None:
         cv2.rectangle(image, (x, 45), (x + 42, 57), 45, -1)
         cv2.rectangle(image, (x, 112), (x + 42, 127), 75, -1)
     result = analyze_array(image)
-    intensities, _, _ = lane_intensities_from_measurements(result.measurements)
-    assert len(intensities) == 3
-    assert all(v > 0 for v in intensities)
+    series = lane_series_from_measurements(result.measurements)
+    assert series.lanes == [1, 2, 3]
+    assert all(v > 0 for v in series.intensities)
 
 
 def test_to_gray_accepts_gray_and_bgr() -> None:

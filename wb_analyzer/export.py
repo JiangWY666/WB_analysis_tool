@@ -30,6 +30,9 @@ def export_result(result: AnalysisResult, image_path: str | Path, output_dir: st
         "background",
         "integrated_density",
         "saturated_fraction",
+        "detection_limit",
+        "snr",
+        "below_detection",
     ]
     with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)

@@ -13,6 +13,8 @@ from wb_analyzer.imageio import (
     rotate_blot,
     rotation_matrix,
 )
+from wb_analyzer.quant import compute_lane_profiles
+from wb_analyzer.roi import MAX_STRAIGHTEN_ANGLE, RoiRect
 
 
 def test_load_blot_preserves_16bit(tmp_path: Path) -> None:
@@ -103,3 +105,60 @@ def test_remap_rotation_tracks_rotated_pixel() -> None:
     assert len(ys) > 0
     assert abs(float(np.mean(xs)) - mapped[0]) < 2.0
     assert abs(float(np.mean(ys)) - mapped[1]) < 2.0
+
+
+def test_rotation_chain_holds_at_the_widened_limit() -> None:
+    # 微调上限从 ±30° 放宽到 ±45°，新可达的角度上旋转链路必须同样自洽：
+    # 往返映射要回到原点，rotation_matrix 与 remap_rotation 要描述同一次旋转。
+    shape_hw = (700, 500)
+    points = np.array([[10.0, 10.0], [499.0, 0.0], [250.0, 350.0], [0.0, 699.0]])
+    for angle in (MAX_STRAIGHTEN_ANGLE - 5.0, MAX_STRAIGHTEN_ANGLE):
+        back = remap_rotation(remap_rotation(points, shape_hw, 0.0, angle), shape_hw, angle, 0.0)
+        assert np.allclose(back, points, atol=1e-6), angle
+        matrix = rotation_matrix(shape_hw, angle)
+        homogeneous = np.hstack([points, np.ones((len(points), 1))])
+        assert np.allclose(
+            (matrix @ homogeneous.T).T,
+            remap_rotation(points, shape_hw, 0.0, angle),
+            atol=1e-6,
+        ), angle
+
+
+def test_straightening_a_crooked_blot_preserves_the_ratio() -> None:
+    """把 40° 的歪片旋正，两条带的积分比值不能被插值改掉。
+
+    这是放宽上限后才够得着的角度，也是用户真正的用法：歪着扫进来，用标尺旋正。
+    正片先转 -40° 造出歪片，再转 +40° 转回来，两次插值都吃到。
+    """
+    height, width = 700, 500
+    centers = [(150.0, 350.0), (350.0, 350.0)]
+    yy, xx = np.arange(height, dtype=float), np.arange(width, dtype=float)
+    raw = np.full((height, width), 60000.0)
+    for (cx, cy), depth in zip(centers, (40000.0, 20000.0), strict=True):
+        raw -= depth * (
+            np.exp(-0.5 * ((yy - cy) / 9.0) ** 2)[:, None]
+            * np.exp(-0.5 * ((xx - cx) / 12.0) ** 2)[None, :]
+        )
+    blot = blot_from_array(np.clip(raw, 0, 65535).astype(np.uint16))
+
+    def ratio(target, points) -> float:
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        roi = RoiRect(int(min(xs) - 90), int(min(ys) - 60),
+                      int(max(xs) - min(xs)) + 180, int(max(ys) - min(ys)) + 120)
+        lanes = compute_lane_profiles(target.raw, roi, [float(np.mean(xs))],
+                                      dark_bands=True, white_level=target.white_level)
+        first, second = (sum(lane.band_densities) for lane in lanes)
+        return first / second
+
+    angle = MAX_STRAIGHTEN_ANGLE - 5.0
+    crooked = rotate_blot(blot, -angle)
+    crooked_centers = remap_rotation(np.array(centers), (height, width), 0.0, -angle)
+    fixed = rotate_blot(crooked, angle)
+    fixed_centers = remap_rotation(crooked_centers, crooked.raw.shape[:2], 0.0, angle)
+
+    reference = ratio(blot, centers)
+    straightened = ratio(fixed, [tuple(p) for p in fixed_centers])
+    assert abs(straightened - reference) / reference < 0.01, (
+        f"旋正 {angle}° 后比值从 {reference:.4f} 变成 {straightened:.4f}"
+    )

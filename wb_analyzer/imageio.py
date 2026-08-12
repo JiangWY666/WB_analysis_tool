@@ -28,9 +28,17 @@ class BlotImage:
     """uint8 BGR used for preview and coarse auto-detection."""
 
     white_level: float
-    """Maximum representable value of the source (255.0, 65535.0, ...)."""
+    """Full-scale value of the *sensor*, not of the storage container.
+
+    Many imagers write 10/12/14-bit readings into a 16-bit TIFF, so the
+    container maximum (65535) would badly overstate the real range and break
+    both saturation detection and the band-polarity heuristic. See
+    :func:`_infer_white_level`.
+    """
 
     bit_depth: int
+    """Storage depth of the source container (8 / 16 / 32)."""
+
     path: Path | None = None
 
     @property
@@ -46,29 +54,84 @@ class BlotImage:
         return int(self.raw.shape[1])
 
 
+SENSOR_FULL_SCALES: tuple[float, ...] = (255.0, 1023.0, 4095.0, 16383.0, 65535.0)
+"""Full-scale values of the sensor depths found in practice (8/10/12/14/16-bit)."""
+
+
+def _snap_full_scale(peak: float) -> float:
+    """Smallest standard sensor full scale that still contains ``peak``.
+
+    Snapping (rather than using ``peak`` itself) is what keeps quantification
+    of a genuine 16-bit image bit-for-bit identical no matter how bright it
+    happens to be, while a 12-bit reading stored in a uint16 container is
+    correctly recognised as 0..4095.
+    """
+    for level in SENSOR_FULL_SCALES:
+        if peak <= level:
+            return level
+    return max(float(peak), 1.0)
+
+
 def _infer_white_level(array: np.ndarray) -> tuple[float, int]:
-    """Return (white_level, bit_depth) for a numpy image array."""
+    """Return (white_level, bit_depth) for a numpy image array.
+
+    ``white_level`` is the *sensor* full scale inferred from the data, not the
+    container maximum: a 12-bit exposure written into a 16-bit TIFF yields
+    4095.0, while any image that actually reaches beyond 16383 yields 65535.0.
+    ``bit_depth`` stays the storage depth of the container.
+    """
+    peak = float(array.max()) if array.size else 0.0
     if array.dtype == np.uint8:
         return 255.0, 8
     if array.dtype == np.uint16:
-        return 65535.0, 16
-    if array.dtype in (np.int32, np.uint32, np.int64):
-        peak = float(array.max()) if array.size else 0.0
-        if peak <= 255.0:
-            return 255.0, 8
-        if peak <= 65535.0:
-            return 65535.0, 16
-        return max(peak, 1.0), 32
-    # Float sources: honor the observed range.
+        return _snap_full_scale(peak), 16
+    if np.issubdtype(array.dtype, np.integer):
+        return _snap_full_scale(peak), 8 if peak <= 255.0 else 32
+    # Float sources: 0..1 normalised data is a common convention worth keeping.
     finite = array[np.isfinite(array)]
     peak = float(finite.max()) if finite.size else 1.0
     if peak <= 1.0:
         return 1.0, 32
-    if peak <= 255.0:
-        return 255.0, 32
-    if peak <= 65535.0:
-        return 65535.0, 32
-    return peak, 32
+    return _snap_full_scale(peak), 32
+
+
+def _tiff_full_scale(path: Path) -> float | None:
+    """``SMaxSampleValue`` from a TIFF header, when the writer recorded it.
+
+    This is the only authoritative statement of the sensor range a file can
+    carry; everything else has to be inferred from the pixels.
+    """
+    if path.suffix.lower() not in (".tif", ".tiff"):
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(path) as pil_image:
+            tags = getattr(pil_image, "tag_v2", None)
+            if tags is None:
+                return None
+            value = tags.get(341)  # SMaxSampleValue
+    except Exception:  # noqa: BLE001 - a missing or broken tag must never block loading
+        return None
+    if value is None:
+        return None
+    if isinstance(value, (tuple, list)):
+        value = max(value) if value else None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def require_finite(array: np.ndarray, what: str) -> None:
+    """Reject NaN/Inf up front so they can never reach a CSV cell."""
+    if array.dtype.kind not in "fc":
+        return
+    if not bool(np.isfinite(array).all()):
+        raise ValueError(
+            f"{what}包含 NaN 或 Inf，无法定量。请先修复图像（例如用 0 或邻域值填充无效像素）。"
+        )
 
 
 def _to_gray_float(array: np.ndarray) -> np.ndarray:
@@ -99,11 +162,29 @@ def display_gray_from_raw(raw: np.ndarray, white_level: float) -> np.ndarray:
     return np.clip(scaled * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def blot_from_array(array: np.ndarray, *, path: Path | None = None) -> BlotImage:
-    """Build a BlotImage from an already-decoded numpy image."""
+def blot_from_array(
+    array: np.ndarray,
+    *,
+    path: Path | None = None,
+    white_level: float | None = None,
+) -> BlotImage:
+    """Build a BlotImage from an already-decoded numpy image.
+
+    ``white_level`` overrides the inferred sensor full scale; pass it when the
+    container advertises the real range (e.g. a TIFF ``SMaxSampleValue`` tag).
+    """
     if array is None or array.size == 0:
         raise ValueError("图片为空，无法读取")
-    white_level, bit_depth = _infer_white_level(array)
+    require_finite(array, "图片")
+    inferred, bit_depth = _infer_white_level(array)
+    if white_level is None:
+        white_level = inferred
+    else:
+        white_level = float(white_level)
+        if white_level <= 0:
+            raise ValueError(f"白电平必须为正数，收到 {white_level}")
+        # Never let a bogus tag clip real data away.
+        white_level = max(white_level, float(array.max()) if array.size else 0.0)
     raw = _to_gray_float(array)
     if array.ndim == 3 and array.dtype == np.uint8:
         display_bgr = array[:, :, :3].copy()
@@ -150,7 +231,7 @@ def load_blot(path: str | Path) -> BlotImage:
 
     if array is None:
         raise ValueError(f"不支持或已损坏的图片：{path}")
-    return blot_from_array(array, path=path)
+    return blot_from_array(array, path=path, white_level=_tiff_full_scale(path))
 
 
 def saturation_fraction(
@@ -160,8 +241,13 @@ def saturation_fraction(
     white_level: float,
     margin: float = 0.005,
 ) -> float:
-    """Fraction of pixels clipped at the signal end of the dynamic range."""
-    if raw.size == 0:
+    """Fraction of pixels clipped at the signal end of the dynamic range.
+
+    ``white_level`` must be the *sensor* full scale (see
+    :func:`_infer_white_level`); passing a container maximum such as 65535 for
+    12-bit data would silently report 0% for a fully clipped band.
+    """
+    if raw.size == 0 or not np.isfinite(white_level) or white_level <= 0:
         return 0.0
     if dark_bands:
         return float(np.mean(raw <= white_level * margin))

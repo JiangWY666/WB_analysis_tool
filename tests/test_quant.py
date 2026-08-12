@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pytest
 
@@ -130,6 +129,23 @@ def test_quantify_lanes_returns_analysis_result() -> None:
     assert result.annotated_image.shape[:2] == blot.raw.shape[:2]
     assert result.annotated_image.ndim == 3
     assert all(m.saturated_fraction < 0.05 for m in result.measurements)
+
+
+def test_quantify_lanes_reuses_supplied_profiles_verbatim() -> None:
+    """``lanes=`` 只省掉重复计算，不许让任何一个数字动一位。"""
+    blot = blot_from_array(synthetic_blot16([20000.0, 10000.0, 4000.0]))
+    roi = RoiRect(10, 40, blot.width - 20, 170)
+    separators = [105.0, 200.0]
+    options = {"dark_bands": True, "white_level": blot.white_level}
+    fresh = quantify_lanes(blot.raw, roi, separators, display_gray=blot.display_gray, **options)
+    lanes = compute_lane_profiles(blot.raw, roi, separators, **options)
+    reused = quantify_lanes(
+        blot.raw, roi, separators, display_gray=blot.display_gray, lanes=lanes, **options
+    )
+    assert len(fresh.measurements) == 3
+    assert reused.measurements == fresh.measurements
+    assert reused.saturated_band_count == fresh.saturated_band_count
+    assert np.array_equal(reused.annotated_image, fresh.annotated_image)
 
 
 def test_quantify_lanes_empty_lane_falls_back_to_whole_lane() -> None:

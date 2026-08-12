@@ -80,10 +80,13 @@ def test_weak_band_not_killed_by_tightening() -> None:
     assert lane.x1 <= 100 <= lane.x2  # 足迹覆盖弱带中心
     assert lane.x2 - lane.x1 < 80  # 确实收紧了（不是整条 160px）
     assert lane.total_density > 0
-    # 与紧贴条带的窄 ROI 一致（弱带信噪比低，噪声地板占比大，容差放宽）。
+    # 与紧贴条带的窄 ROI 一致。原本这里放到 15%，理由写的是"弱带噪声地板占比
+    # 大"——但两边收紧后的足迹都是 ~35px，噪声偏置在相除时基本抵消，这个容差
+    # 从来没被用到过：10 个噪声种子实测最差 3.25%（扣噪声地板后 2.93%），本用
+    # 例的种子是 2.91%。收到 5%，让它真的能拦住东西。
     narrow = RoiRect(80, 20, 40, 160)
     dens_narrow = total_density(blot, narrow, [])
-    assert abs(lane.total_density - dens_narrow) / dens_narrow < 0.15
+    assert abs(lane.total_density - dens_narrow) / dens_narrow < 0.05
 
 
 def test_empty_lane_falls_back_full_width_and_near_zero() -> None:

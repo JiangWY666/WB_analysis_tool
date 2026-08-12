@@ -9,19 +9,20 @@ data; the 8-bit display layer is only used for annotation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 
 from .analysis import AnalysisResult, BandMeasurement, renumber_measurements
-from .imageio import saturation_fraction
+from .imageio import require_finite, saturation_fraction
 from .roi import RoiRect, lane_boundaries
 
 ROI_COLOR = (255, 229, 0)  # cyan-ish (BGR)
 SEPARATOR_COLOR = (0, 180, 255)  # orange (BGR)
 BAND_COLOR = (60, 60, 255)  # red (BGR)
 BAND_SATURATED_COLOR = (0, 140, 255)  # orange warning (BGR)
+BAND_WEAK_COLOR = (200, 160, 90)  # steel blue: below the detection limit (BGR)
 
 SEGMENT_EDGE_FRAC = 0.02
 """Band segment edges are trimmed where the signal falls to ~2% of the peak."""
@@ -54,10 +55,24 @@ class LaneProfile:
     """Relative [start, end) y ranges, one per band."""
 
     total_density: float
-    """sum(max(profile - baseline, 0)) over the whole lane."""
+    """Whole-lane integral: ``sum(profile - baseline - noise_floor)``, clamped at 0."""
 
     band_densities: list[float]
-    """Integral of each segment, aligned with ``segments``."""
+    """Integral of each segment, aligned with ``segments``, same correction."""
+
+    noise_floor: float = 0.0
+    """How far the baseline sits below the true background, per sample.
+
+    Measured as the mean of ``profile - baseline`` over the rows with no detected
+    band, and subtracted from every sample that goes into an integral. Without
+    it the integral grows with ROI height on its own; see :func:`_lane_noise`.
+    """
+
+    noise_sigma: float = 0.0
+    """Per-sample noise of the baseline residual, in profile units."""
+
+    band_detection_limits: list[float] = field(default_factory=list)
+    """3σ detection limit of each segment, aligned with ``band_densities``."""
 
 
 def _smooth(values: np.ndarray, radius: int) -> np.ndarray:
@@ -69,59 +84,341 @@ def _smooth(values: np.ndarray, radius: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid")
 
 
+def _median_filter(values: np.ndarray, size: int) -> np.ndarray:
+    """Sliding-window median with edge padding.
+
+    Gives each sample the level its neighbourhood would have without it, which
+    is how narrow spikes (dust, scratches, hot pixels) are spotted: a median of
+    width ``size`` ignores anything narrower than ``size // 2``, so the gap
+    between a sample and this curve is exactly the spike's depth.
+    """
+    values = np.asarray(values, dtype=float)
+    size = max(1, int(size)) | 1
+    if size <= 1 or values.size < 3:
+        return values.copy()
+    size = min(size, values.size if values.size % 2 else values.size - 1)
+    radius = size // 2
+    padded = np.pad(values, radius, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, size)
+    return np.median(windows, axis=-1)
+
+
+TAIL_ASYMMETRY = 1.5
+"""One distribution tail must be this much longer than the other to call polarity."""
+
+
 def resolve_dark_bands_native(
     raw: np.ndarray, white_level: float, mode: str = "auto"
 ) -> bool:
-    """Decide band polarity on native-depth data (scaled 8-bit heuristics)."""
+    """Decide band polarity on native-depth data.
+
+    The primary test is scale-free: bands live in one tail of the intensity
+    distribution, so whichever tail is clearly longer tells us which way round
+    the blot is. This works regardless of how much of the storage container
+    the sensor actually filled. Only a frame with no usable contrast (both
+    tails equal, e.g. a blank field) falls back to comparing the border tone
+    against ``white_level``.
+    """
     if mode == "dark_bands":
         return True
     if mode == "light_bands":
         return False
+    median = float(np.median(raw))
+    low = float(np.percentile(raw, 0.5))
+    high = float(np.percentile(raw, 99.5))
+    dark_tail = median - low
+    light_tail = high - median
+    if dark_tail > light_tail * TAIL_ASYMMETRY:
+        return True
+    if light_tail > dark_tail * TAIL_ASYMMETRY:
+        return False
+    # Featureless frame: nothing to do but read the absolute border tone.
     border = np.concatenate((raw[0], raw[-1], raw[:, 0], raw[:, -1]))
     border_med = float(np.median(border))
     if border_med >= white_level * (140.0 / 255.0):
         return True
     if border_med <= white_level * (115.0 / 255.0):
         return False
-    return float(np.mean(raw)) >= white_level / 2.0
+    return bool(float(np.mean(raw)) >= white_level / 2.0)
 
 
-def rubber_band_baseline(profile: np.ndarray) -> np.ndarray:
-    """Lower convex hull baseline (rubber band stretched under the profile)."""
+BASELINE_DESPIKE_FRAC = 20
+"""Neighbourhood width for outlier detection, as a fraction 1/N of the profile.
+
+Sets how wide an artifact can be and still be rejected: roughly half the
+window. At 1/20 of a 400-sample profile that is a ~9 pixel scratch, comfortably
+below band scale, and every clean-profile result is unchanged by it.
+"""
+
+BASELINE_DESPIKE_MAX = 31
+"""Upper bound on that neighbourhood width, in samples."""
+
+
+BASELINE_DESPIKE_SIGMA = 6.0
+"""How far below its neighbourhood a sample must fall to be called an outlier."""
+
+BASELINE_DESPIKE_RANGE = 0.05
+"""...and how much of the profile's own band amplitude the dip must also span."""
+
+
+def _noise_scale(profile: np.ndarray) -> float:
+    """Per-sample noise of a profile, from the MAD of successive differences.
+
+    Measuring the noise this way is immune to the profile's own shape (a band
+    is smooth, so it barely contributes to neighbour-to-neighbour steps) and,
+    unlike a MAD taken across the whole profile, it does not collapse to zero
+    on a near-blank lane whose values are constant over half its length. That
+    collapse is what would otherwise let ordinary quantisation noise be
+    mistaken for scratches, swinging the residual integral of an empty lane by
+    tens of percent.
+    """
+    if profile.size < 3:
+        return 0.0
+    steps = np.abs(np.diff(profile))
+    return 1.4826 * float(np.median(steps)) / np.sqrt(2.0)
+
+
+LOD_SIGMA = 3.0
+"""How many noise sigmas an integral must clear to count as a real band."""
+
+NOISE_BAND_MARGIN = 0.5
+"""Blank rows start half a segment height away from each band.
+
+``segment_bands`` cuts at 4% of the peak, so the rows just outside a segment
+still carry the band's vertical tails. Counting those as "blank" would read the
+tails as noise and over-estimate the floor.
+"""
+
+MIN_NOISE_SAMPLES = 12
+"""Fewer blank rows than this and the floor is left at zero rather than guessed."""
+
+FLOOR_SIGMA_CAP = 3.0
+"""Hard ceiling on the noise floor, in sigmas.
+
+Whatever the baseline does, noise alone cannot leave more than a few sigma per
+sample behind. Anything above that in the "blank" rows is signal the segmenter
+missed — a band's vertical tail, a smear — and subtracting it would be eating
+real data. Capping also makes the noise-free case exact: sigma is 0 there, so
+the floor is 0 and every number comes out bit-for-bit as before.
+
+The cap does bind on real scans, where neighbouring rows are correlated and the
+successive-difference sigma therefore reads low: on a chemiluminescence blot the
+blank rows sat 14-53 units above the baseline while 3 sigma was 8-9, so only
+part of the offset came off. That errs towards leaving the numbers alone, which
+is the right way to be wrong here — and on those images the offset is not the
+dominant ROI-height effect anyway (see :func:`compute_lane_profiles`).
+"""
+
+SEGMENT_MIN_SNR = 4.0
+"""How far above the noise a smoothed peak must rise to be cut out as a band.
+
+Without an absolute floor, ``segment_bands`` thresholds at 4% of whatever the
+tallest thing in the lane happens to be — which on an empty lane is a noise
+spike. It obligingly carved a blank lane into ten "bands", each one a positive
+excursion selected precisely because it was positive. Those fake bands then hid
+the blank rows the noise floor is measured on, so the correction switched off
+exactly where it was needed most, and the lane total kept growing with the ROI.
+
+The threshold is stated on the smoothed profile, where the noise is already
+down by ``sqrt(2 * radius + 1)``. Four sigma there sits comfortably above the
+largest excursion a few hundred smoothed samples produce, and still an order of
+magnitude below any band worth reporting: a peak this small integrates to
+several times its own detection limit. Real bands that do fall under it are not
+silently dropped — the lane has no segments at all then, so it falls back to one
+whole-lane record, which the detection limit duly flags.
+"""
+
+BLANK_LEVEL_QUANTILE = 10.0
+BLANK_LEVEL_Z = 1.2816
+"""Where the blank rows sit, from a low quantile pushed back up to the mean.
+
+The threshold has to be measured *from the blank level*, not from zero: clipping
+at zero already lifts an empty profile to roughly 0.9 sigma, so "4 sigma above
+nothing" is barely 2 sigma above where the noise actually lives, and noise walks
+straight through it. The blank level cannot be the mean or the median either —
+bands are part of both. A low quantile is untouched as long as bands cover under
+90% of the lane; adding back the standard normal's 10% z-score turns it into the
+mean of the blank population it came from.
+"""
+
+
+def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Contiguous [start, stop) runs of True."""
+    indices = np.flatnonzero(mask)
+    if indices.size == 0:
+        return []
+    splits = np.flatnonzero(np.diff(indices) > 1) + 1
+    return [(int(g[0]), int(g[-1]) + 1) for g in np.split(indices, splits)]
+
+
+def _blank_rows(n: int, segments: list[tuple[int, int]]) -> np.ndarray:
+    """Mask of the rows that carry no detected band, nor its tails.
+
+    The margin is not negotiable when it leaves too little to measure. A ROI
+    cropped tight around a band has no blank lane at all, and the rows just
+    outside the segment are the band's own tails: on a 60-row ROI around a
+    strong band they read tens of sigma above background, and taking them for
+    noise would have the correction eat 5% of the band. The caller sees an
+    almost-empty mask and declines to correct — which costs little, because a
+    hull anchored that close to the peak has no room to sink far below the
+    background in the first place.
+    """
+    blank = np.ones(n, dtype=bool)
+    for start, stop in segments:
+        margin = max(2, int(round((stop - start) * NOISE_BAND_MARGIN)))
+        blank[max(0, start - margin) : min(n, stop + margin)] = False
+    return blank
+
+
+def _lane_noise(residual: np.ndarray, segments: list[tuple[int, int]]) -> tuple[float, float]:
+    """Baseline offset and noise scale of one lane, measured on its blank rows.
+
+    The rubber band is a *lower* envelope: it settles below the mean of the
+    background, and the longer the profile, the further below it can reach. So
+    ``profile - baseline`` averages to some positive ``d`` on an empty stretch
+    of lane instead of to zero, and every integral picks up ``d`` per sample —
+    an error proportional to ROI height and lane width, with nothing to do with
+    how much protein is on the membrane. On real data a weak lane read 15-20%
+    higher when the user merely dragged the ROI taller.
+
+    ``d`` is measured, not modelled: the mean of the residual over the rows
+    where no band was detected, so whatever the baseline actually did under this
+    profile is what gets subtracted back off. Note this is the mean of the
+    *unclipped* residual. The clipped ``max(residual, 0)`` averages higher —
+    around 0.9σ against 0.35σ here — because it keeps every upward fluctuation
+    and drops every downward one, and that rectification is not present inside a
+    band, where the signal keeps the sum well clear of zero. Subtracting the
+    clipped mean from a band would over-correct it by a factor of two or three;
+    the integrals avoid the rectification instead of paying for it (see
+    :func:`compute_lane_profiles`).
+
+    ``sigma`` is the random part, from the MAD of successive differences inside
+    each blank run (immune to slow drift, and it does not collapse on a
+    near-constant blank lane).
+
+    Returns ``(floor, sigma)`` per sample. ``floor`` is 0.0 when the bands leave
+    too little blank lane to measure: not correcting is safer than correcting by
+    a number invented from a handful of samples. It is clamped to non-negative
+    and capped at :data:`FLOOR_SIGMA_CAP` sigmas, so anything the segmenter
+    missed can distort the estimate only so far — and the noise-free case, where
+    sigma is 0, comes out at exactly 0.
+    """
+    n = int(residual.size)
+    blank = _blank_rows(n, segments)
+    runs = [(s, e) for s, e in _true_runs(blank) if e - s >= 3]
+    if int(blank.sum()) < MIN_NOISE_SAMPLES or not runs:
+        return 0.0, _noise_scale(residual)
+    steps = np.concatenate([np.abs(np.diff(residual[s:e])) for s, e in runs])
+    sigma = 1.4826 * float(np.median(steps)) / np.sqrt(2.0)
+    offset = float(np.clip(residual[blank].mean(), 0.0, FLOOR_SIGMA_CAP * sigma))
+    return offset, sigma
+
+
+def detection_limit(sigma: float, samples: int) -> float:
+    """3σ limit for an integral over ``samples`` independent samples.
+
+    Per-sample noise adds in quadrature along the integration window, so a taller
+    band tolerates proportionally less signal per row before it stops being
+    distinguishable from an empty lane.
+    """
+    if sigma <= 0.0 or samples <= 0:
+        return 0.0
+    return LOD_SIGMA * float(sigma) * float(np.sqrt(samples))
+
+
+def _downward_outliers(profile: np.ndarray, radius: int) -> np.ndarray:
+    """Mask of samples that dip implausibly far below their neighbourhood.
+
+    Detection runs on the *raw* profile, because the moving average that
+    follows widens a 3-sample scratch into a 2*radius+1 sample trough that no
+    same-width median could reject any more. The mask is then dilated by
+    ``radius`` so the smeared shoulders of the spike are disqualified too.
+
+    Both tests must fire: the dip has to be significant against the profile's
+    own noise *and* deep enough to matter against the band amplitude it would
+    distort. Requiring both is what keeps a clean profile completely untouched
+    — the baseline of a blot with no scratches comes out bit-for-bit as before,
+    and a near-blank lane, where the integral is a small residual that a tiny
+    baseline shift would swing wildly, is left alone.
+    """
     n = int(profile.size)
-    if n == 0:
-        return np.zeros(0, dtype=float)
-    if n < 3:
-        return profile.astype(float).copy()
-    smooth = _smooth(profile, max(1, n // 100))
+    if n < 5:
+        return np.zeros(n, dtype=bool)
+    width = min(max(3, n // BASELINE_DESPIKE_FRAC), BASELINE_DESPIKE_MAX)
+    depth = _median_filter(profile, width) - profile
+    sigma = _noise_scale(profile)
+    amplitude = float(np.max(profile) - np.median(profile))
+    floor = max(BASELINE_DESPIKE_SIGMA * sigma, BASELINE_DESPIKE_RANGE * amplitude)
+    if floor <= 0.0:
+        return np.zeros(n, dtype=bool)
+    mask = depth > floor
+    if not mask.any():
+        return mask
+    kernel = np.ones(2 * max(1, int(radius)) + 1)
+    return np.convolve(mask.astype(float), kernel, mode="same") > 0.0
+
+
+def _lower_hull(values: np.ndarray, candidates: np.ndarray) -> list[int]:
+    """Indices of the lower convex hull over ``candidates`` (already sorted)."""
     hull: list[int] = []
-    for i in range(n):
+    for index in candidates:
+        i = int(index)
         while len(hull) >= 2:
             i0, i1 = hull[-2], hull[-1]
             # Keep only points forming a convex (upward-opening) lower chain.
-            cross = (i1 - i0) * (smooth[i] - smooth[i0]) - (i - i0) * (smooth[i1] - smooth[i0])
+            cross = (i1 - i0) * (values[i] - values[i0]) - (i - i0) * (values[i1] - values[i0])
             if cross <= 0:
                 hull.pop()
             else:
                 break
         hull.append(i)
+    return hull
+
+
+def rubber_band_baseline(profile: np.ndarray) -> np.ndarray:
+    """Lower convex hull baseline (rubber band stretched under the profile).
+
+    A convex hull needs only one bad sample to drag the whole chord beneath
+    the real background — a 3-pixel scratch across a lane was enough to more
+    than triple the integrated density of a band nowhere near it. Samples that
+    dip implausibly far below their neighbourhood are therefore barred from
+    anchoring the hull; everything else, including the entire clean case, is
+    the plain rubber band as before.
+    """
+    n = int(profile.size)
+    if n == 0:
+        return np.zeros(0, dtype=float)
+    if n < 3:
+        return profile.astype(float).copy()
+    radius = max(1, n // 100)
+    smooth = _smooth(profile, radius)
+    candidates = np.flatnonzero(~_downward_outliers(profile, radius))
+    if candidates.size < 2:
+        candidates = np.arange(n)
+    hull = _lower_hull(smooth, candidates)
     return np.interp(np.arange(n), hull, smooth[hull])
 
 
 def valley_baseline(profile: np.ndarray) -> np.ndarray:
-    """Valley-to-valley linear baseline (local minima joined by straight lines)."""
+    """Valley-to-valley linear baseline (local minima joined by straight lines).
+
+    Local minima are just as easy to fake with a scratch as hull vertices are,
+    so the same outlier veto applies.
+    """
     n = int(profile.size)
     if n == 0:
         return np.zeros(0, dtype=float)
     if n < 5:
         return np.full(n, float(np.min(profile)))
-    smooth = _smooth(profile, max(1, n // 100))
+    radius = max(1, n // 100)
+    smooth = _smooth(profile, radius)
+    outliers = _downward_outliers(profile, radius)
     win = max(3, n // 40)
     anchors: list[int] = [0]
     index = win
     while index < n - win:
         neighborhood = smooth[index - win : index + win + 1]
-        if smooth[index] <= float(neighborhood.min()) + 1e-12:
+        if not outliers[index] and smooth[index] <= float(neighborhood.min()) + 1e-12:
             anchors.append(index)
             index += win
             continue
@@ -168,13 +465,22 @@ def _local_maxima(values: np.ndarray, min_height: float, min_distance: int) -> l
 
 
 def _trim_segment(
-    smooth: np.ndarray, start: int, stop: int, edge_frac: float = SEGMENT_EDGE_FRAC
+    smooth: np.ndarray,
+    start: int,
+    stop: int,
+    edge_frac: float = SEGMENT_EDGE_FRAC,
+    noise_floor: float = 0.0,
 ) -> tuple[int, int]:
-    """Shrink a segment to where the signal exceeds ``edge_frac`` of its peak."""
+    """Shrink a segment to where the signal exceeds ``edge_frac`` of its peak.
+
+    ``noise_floor`` is an absolute lower bound on that cut: 2% of a faint peak
+    can land inside the noise, which would stretch the segment out along a
+    random walk and drag the integration window with it.
+    """
     window = smooth[start:stop]
     if window.size == 0:
         return start, stop
-    floor = float(window.max()) * edge_frac
+    floor = max(float(window.max()) * edge_frac, float(noise_floor))
     above = np.flatnonzero(window > floor)
     if above.size == 0:
         return start, stop
@@ -187,22 +493,39 @@ def segment_bands(
     min_height_frac: float = 0.04,
     min_width: int = 3,
     valley_drop: float = 0.30,
+    noise_sigma: float = 0.0,
 ) -> list[tuple[int, int]]:
     """Split a baseline-corrected lane profile into band segments.
 
-    Returns half-open (start, stop) index ranges. Runs above a small relative
-    threshold form candidates; runs containing two clearly separated peaks
-    (valley dips at least ``valley_drop`` below the smaller peak) are split.
-    Segment edges are trimmed where the signal falls to ~2% of the local peak.
+    Returns half-open (start, stop) index ranges. Runs above the threshold form
+    candidates; runs containing two clearly separated peaks (valley dips at
+    least ``valley_drop`` below the smaller peak) are split. Segment edges are
+    trimmed where the signal falls to ~2% of the local peak.
+
+    The threshold is the larger of a relative part (``min_height_frac`` of the
+    lane's own peak) and an absolute one (:data:`SEGMENT_MIN_SNR` sigmas above
+    the noise, stated on the smoothed profile). Pass ``noise_sigma=0`` — the
+    default — for the purely relative behaviour, which is what the footprint
+    locator wants; anything that reports numbers should pass the real noise, or
+    a blank lane comes back carved into bands that are pure noise.
     """
     n = int(corrected.size)
     if n == 0:
         return []
-    smooth = _smooth(corrected, max(1, n // 120))
+    radius = max(1, n // 120)
+    smooth = _smooth(corrected, radius)
     peak_value = float(smooth.max())
     if peak_value <= 1e-9:
         return []
-    threshold = peak_value * float(min_height_frac)
+    noise_threshold = 0.0
+    if noise_sigma > 0.0:
+        # Smoothing already divided the per-sample noise by sqrt(2 * radius + 1).
+        sigma_smoothed = float(noise_sigma) / np.sqrt(2 * radius + 1)
+        blank_level = (
+            float(np.percentile(smooth, BLANK_LEVEL_QUANTILE)) + BLANK_LEVEL_Z * sigma_smoothed
+        )
+        noise_threshold = blank_level + SEGMENT_MIN_SNR * sigma_smoothed
+    threshold = max(peak_value * float(min_height_frac), noise_threshold)
     mask = smooth > threshold
     runs: list[tuple[int, int]] = []
     start: int | None = None
@@ -222,7 +545,9 @@ def segment_bands(
         min_dist = max(3, (run_stop - run_start) // 8, n // 60)
         peaks = _local_maxima(window, threshold, min_dist)
         if len(peaks) <= 1:
-            segments.append(_trim_segment(smooth, run_start, run_stop))
+            segments.append(
+                _trim_segment(smooth, run_start, run_stop, noise_floor=noise_threshold)
+            )
             continue
         # Split at valleys that dip clearly below both adjacent peaks.
         cuts: list[int] = []
@@ -234,7 +559,9 @@ def segment_bands(
         bounds = [run_start, *[run_start + c for c in cuts], run_stop]
         for seg_start, seg_stop in zip(bounds, bounds[1:], strict=False):
             if seg_stop - seg_start >= min_width:
-                segments.append(_trim_segment(smooth, seg_start, seg_stop))
+                segments.append(
+                    _trim_segment(smooth, seg_start, seg_stop, noise_floor=noise_threshold)
+                )
     return [(s, e) for s, e in segments if e - s >= min_width]
 
 
@@ -244,23 +571,22 @@ TIGHT_EDGE_FRAC = 0.08
 TIGHT_MIN_WIDTH = 5
 """收紧后条带足迹的最小宽度（像素）。"""
 
+TIGHT_ROW_COVERAGE = 0.7
+"""条带行占 ROI 高度超过这个比例时，说明没有空白可排除，列剖面仍用全部行。"""
 
-def _tight_band_span(
-    signal: np.ndarray,
+
+def _column_span(
+    column: np.ndarray,
     *,
     edge_frac: float = TIGHT_EDGE_FRAC,
-    min_width: int = TIGHT_MIN_WIDTH,
 ) -> tuple[int, int] | None:
-    """泳道条内条带的实际横向足迹 [x1, x2)（相对本条），不可靠时返回 None。
+    """列剖面上单个条带的横向足迹 [x1, x2)，峰高不显著时返回 None。
 
-    以泳道条列剖面（每列信号均值）的最强列为锚，向两侧扩展到信号跌破
-    ``floor + edge_frac × 峰高`` 为止。峰高相对本条列噪声不显著（无可靠
-    条带，例如空白泳道）时返回 None，调用方回退全宽，保持旧行为。
+    以最强列为锚，向两侧扩展到信号跌破 ``floor + edge_frac × 峰高`` 为止。
     """
-    width = int(signal.shape[1])
-    if width <= min_width:
+    width = int(column.size)
+    if width < 2:
         return None
-    column = signal.mean(axis=0)
     smooth = _smooth(column, max(1, width // 40))
     floor = float(np.percentile(smooth, 5))
     peak = int(np.argmax(smooth))
@@ -276,7 +602,34 @@ def _tight_band_span(
     right = peak
     while right < width - 1 and smooth[right + 1] > threshold:
         right += 1
-    x1, x2 = left, right + 1
+    return left, right + 1
+
+
+def _tight_band_span(
+    signal: np.ndarray,
+    segments: list[tuple[int, int]] | None = None,
+    *,
+    edge_frac: float = TIGHT_EDGE_FRAC,
+    min_width: int = TIGHT_MIN_WIDTH,
+) -> tuple[int, int] | None:
+    """泳道条内条带的实际横向足迹 [x1, x2)（相对本条），不可靠时返回 None。
+
+    ``segments`` 是先在全宽纵向剖面上分出的条带 y 区间。列剖面只在这些
+    **条带行**（各段上下各留半个段高的余量）上统计，纯空白行不参与定位：
+    ROI 画得比条带高很多时，空白行原本会把列剖面的对比度稀释掉，弱带因此
+    被判为"不可靠"而退回全宽积分。
+
+    找不到可靠条带峰（空白/平坦泳道）时返回 None，调用方回退全宽。
+    """
+    width = int(signal.shape[1])
+    if width <= min_width:
+        return None
+
+    column = _band_row_mean(signal, segments)
+    span = _column_span(column, edge_frac=edge_frac)
+    if span is None:
+        return None
+    x1, x2 = span
     if x2 - x1 >= width - 2:
         return None  # 已接近全宽，收紧无意义
     if x2 - x1 < min_width:
@@ -284,6 +637,43 @@ def _tight_band_span(
         x1 = max(0, x1 - pad)
         x2 = min(width, x2 + pad)
     return x1, x2
+
+
+def _band_row_mean(
+    signal: np.ndarray, segments: list[tuple[int, int]] | None
+) -> np.ndarray:
+    """Column profile averaged over the band rows only (all rows if unknown)."""
+    height = int(signal.shape[0])
+    if not segments:
+        return signal.mean(axis=0)
+    rows = np.zeros(height, dtype=bool)
+    for start, stop in segments:
+        if stop - start < 2:
+            continue
+        # The segment is cut at 4% of the peak, so its immediate surroundings
+        # still carry the band's vertical tails; keeping half a band height on
+        # each side stops the footprint tightening past the edge_frac contract.
+        margin = max(2, (stop - start) // 2)
+        rows[max(0, start - margin) : min(height, stop + margin)] = True
+    covered = int(rows.sum())
+    if covered < 2 or covered > height * TIGHT_ROW_COVERAGE:
+        # Bands already fill the ROI: there is no blank to exclude, and
+        # trimming the little that is left would only shift a footprint that
+        # was never diluted in the first place.
+        return signal.mean(axis=0)
+    return signal[rows].mean(axis=0)
+
+
+def _vertical_segments(signal: np.ndarray, baseline_mode: str) -> list[tuple[int, int]]:
+    """全宽纵向剖面上的条带 y 区间，用于给 tight 足迹定位。"""
+    profile = signal.sum(axis=1)
+    corrected = np.maximum(profile - _baseline_for(profile, baseline_mode), 0.0)
+    return segment_bands(corrected)
+
+
+def _tight_span_for_strip(signal: np.ndarray, baseline_mode: str) -> tuple[int, int] | None:
+    """Locate the band footprint of one lane strip, aiming with its band rows."""
+    return _tight_band_span(signal, _vertical_segments(signal, baseline_mode))
 
 
 def compute_lane_profiles(
@@ -303,30 +693,64 @@ def compute_lane_profiles(
     纵向剖面、基线与积分只在该足迹内进行——条带两侧的空白不再稀释
     积分值；找不到可靠条带的泳道回退全宽。``tight=False`` 保持旧的
     全宽行为。
+
+    Known limitation: the integral still depends on ROI height on real scans,
+    for a reason this function does not address. The rubber band is a *convex*
+    hull, so it cannot follow a gently curved background; the taller the ROI,
+    the further the chord under a band sinks below where the background
+    actually is. Measured on a chemiluminescence blot, the profile peak stayed
+    at 10319 while the baseline under it fell 202 → 92 as the ROI grew from 110
+    to 450 rows, moving a weak lane by 21%. That is a baseline-model problem —
+    a local background anchored just outside each segment would fix it — and it
+    is separate from the clipping bias :func:`_lane_noise` removes. Until then,
+    keep the ROI height consistent when comparing lanes.
     """
     roi = roi.clipped(raw)
     if roi.width < 3 or roi.height < 3:
         raise ValueError("ROI 过小，无法定量")
     y1, y2 = roi.y, roi.y + roi.height
+    require_finite(raw[y1:y2, roi.x : roi.x + roi.width], "ROI 区域")
     lanes: list[LaneProfile] = []
     for lane_index, (x1, x2) in enumerate(lane_boundaries(roi, separators), start=1):
         strip = raw[y1:y2, x1:x2].astype(np.float64)
         signal = (white_level - strip) if dark_bands else strip
         if tight:
-            span = _tight_band_span(signal)
+            # Aim the footprint using the band rows only, so blank rows above
+            # and below cannot dilute the contrast the footprint relies on.
+            span = _tight_span_for_strip(signal, baseline_mode)
             if span is not None:
                 x1, x2 = x1 + span[0], x1 + span[1]
                 signal = signal[:, span[0] : span[1]]
         profile = signal.sum(axis=1)
         baseline = _baseline_for(profile, baseline_mode)
-        corrected = np.maximum(profile - baseline, 0.0)
-        total = float(corrected.sum())
-        segments = segment_bands(corrected) if split_bands else [(0, int(profile.size))]
+        residual = profile - baseline
+        corrected = np.maximum(residual, 0.0)
+        # Segmentation needs the noise scale to reject spikes, and the noise
+        # floor needs the segments to know which rows are blank. The successive
+        # difference MAD breaks the circle: it barely notices a band's smooth
+        # shape, so it is a usable seed before anything has been segmented.
+        # Segments are found whether or not the caller wants them reported
+        # separately, so split_bands=False sees the same blank rows — and the
+        # same correction — as the default path.
+        detected = segment_bands(corrected, noise_sigma=_noise_scale(residual))
+        floor, sigma = _lane_noise(residual, detected)
+        # Integrate the residual, not its clipped version. Clipping is what made
+        # a blank stretch of lane sum to something positive: it keeps every
+        # upward fluctuation and discards every downward one. On the raw
+        # residual the fluctuations cancel, so once the measured baseline offset
+        # is taken out the window integrates to zero on empty lane and to the
+        # band alone under a band — at any ROI height. ``corrected`` stays as it
+        # is for segmentation and for the profile plot, which need a curve that
+        # sits on zero.
+        adjusted = residual - floor
+        total = max(0.0, float(adjusted.sum()))
+        segments = detected if split_bands else [(0, int(profile.size))]
         if not segments:
             # No detectable peak: fall back to one whole-lane record so the
             # lane still lines up across proteins during normalization.
             segments = [(0, int(profile.size))]
-        densities = [float(corrected[s:e].sum()) for s, e in segments]
+        densities = [max(0.0, float(adjusted[s:e].sum())) for s, e in segments]
+        limits = [detection_limit(sigma, e - s) for s, e in segments]
         lanes.append(
             LaneProfile(
                 lane=lane_index,
@@ -338,6 +762,9 @@ def compute_lane_profiles(
                 segments=segments,
                 total_density=total,
                 band_densities=densities,
+                noise_floor=floor,
+                noise_sigma=sigma,
+                band_detection_limits=limits,
             )
         )
     return lanes
@@ -376,7 +803,10 @@ def annotate_on_display(
             if roi.x < x < roi.x + roi.width:
                 cv2.line(annotated, (x, roi.y), (x, roi.y + roi.height - 1), SEPARATOR_COLOR, 1, cv2.LINE_AA)
     for item in measurements:
-        color = BAND_COLOR if item.saturated_fraction < 0.05 else BAND_SATURATED_COLOR
+        if item.below_detection:
+            color = BAND_WEAK_COLOR
+        else:
+            color = BAND_COLOR if item.saturated_fraction < 0.05 else BAND_SATURATED_COLOR
         cv2.rectangle(
             annotated,
             (item.x, item.y),
@@ -409,6 +839,7 @@ def quantify_lanes(
     baseline_mode: str = "rubber",
     split_bands: bool = True,
     tight: bool = True,
+    lanes: list[LaneProfile] | None = None,
 ) -> AnalysisResult:
     """Quantify ROI lanes via baseline-subtracted vertical profiles.
 
@@ -417,30 +848,38 @@ def quantify_lanes(
     whole-lane record when no peak is found). Use
     :func:`compute_lane_profiles` for the plottable profiles and totals.
 
+    ``lanes`` 让已经调用过 :func:`compute_lane_profiles` 的调用方把结果传回来
+    复用：要画剖面的界面因此只算一遍，画出来的基线和表里的数字必定同源。
+    传了 ``lanes`` 就意味着 ``baseline_mode`` / ``split_bands`` / ``tight``
+    早已固化在这些剖面里，本函数不再读取它们。
+
     ``tight=True``（默认）把每个泳道的积分与标注框收紧到条带的实际横向
     足迹，泳道内条带两侧的空白不再计入积分；``tight=False`` 保持旧的
     全宽行为。
     """
     roi = roi.clipped(raw)
-    lanes = compute_lane_profiles(
-        raw,
-        roi,
-        separators,
-        dark_bands=dark_bands,
-        white_level=white_level,
-        baseline_mode=baseline_mode,
-        split_bands=split_bands,
-        tight=tight,
-    )
+    if lanes is None:
+        lanes = compute_lane_profiles(
+            raw,
+            roi,
+            separators,
+            dark_bands=dark_bands,
+            white_level=white_level,
+            baseline_mode=baseline_mode,
+            split_bands=split_bands,
+            tight=tight,
+        )
     measurements: list[BandMeasurement] = []
     for lane in lanes:
         width = lane.x2 - lane.x1
-        for band_index, ((seg_start, seg_stop), density) in enumerate(
-            zip(lane.segments, lane.band_densities, strict=True), start=1
+        for band_index, ((seg_start, seg_stop), density, limit) in enumerate(
+            zip(lane.segments, lane.band_densities, lane.band_detection_limits, strict=True),
+            start=1,
         ):
             box_raw = raw[lane.y0 + seg_start : lane.y0 + seg_stop, lane.x1 : lane.x2]
             baseline_per_pixel = float(lane.baseline[seg_start:seg_stop].mean()) / max(width, 1)
             display_bg = (white_level - baseline_per_pixel) if dark_bands else baseline_per_pixel
+            snr = (density / limit * LOD_SIGMA) if limit > 0.0 else 0.0
             measurements.append(
                 BandMeasurement(
                     lane=lane.lane,
@@ -457,6 +896,8 @@ def quantify_lanes(
                         saturation_fraction(box_raw, dark_bands=dark_bands, white_level=white_level),
                         4,
                     ),
+                    detection_limit=round(limit, 3),
+                    snr=round(snr, 3),
                 )
             )
 
@@ -486,8 +927,19 @@ def roi_column_profile(
     return signal.mean(axis=0)
 
 
-def _local_background_native(raw: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
-    """Median of a surrounding ring, computed on native-depth data."""
+CLIPPED_HALF_NORMAL_MEAN = 1.0 / np.sqrt(2.0 * np.pi)
+"""E[max(x, 0)] / sigma for zero-mean Gaussian noise, i.e. 0.3989."""
+
+
+def _local_background_native(
+    raw: np.ndarray, x1: int, y1: int, x2: int, y2: int
+) -> tuple[float, float]:
+    """Median and noise scale of the ring around a box, on native-depth data.
+
+    Returns ``(median, sigma)``. The sigma is a MAD so that a neighbouring band
+    bleeding into the ring inflates it only mildly — and inflating it is the
+    safe direction, since it raises the detection limit rather than lowering it.
+    """
     pad_x = max(2, (x2 - x1) // 4)
     pad_y = max(2, (y2 - y1) // 2)
     left, top = max(0, x1 - pad_x), max(0, y1 - pad_y)
@@ -495,7 +947,11 @@ def _local_background_native(raw: np.ndarray, x1: int, y1: int, x2: int, y2: int
     ring = raw[top:bottom, left:right].astype(np.float64).copy()
     ring[y1 - top : y2 - top, x1 - left : x2 - left] = np.nan
     values = ring[~np.isnan(ring)]
-    return float(np.median(values)) if values.size else float(np.median(raw))
+    if not values.size:
+        values = raw.astype(np.float64).ravel()
+    median = float(np.median(values))
+    sigma = 1.4826 * float(np.median(np.abs(values - median)))
+    return median, sigma
 
 
 def measure_box_native(
@@ -517,11 +973,19 @@ def measure_box_native(
     x2 = int(np.clip(x1 + max(1, w), x1 + 1, img_w))
     y2 = int(np.clip(y1 + max(1, h), y1 + 1, img_h))
     box = raw[y1:y2, x1:x2].astype(np.float64)
-    local_bg = _local_background_native(raw, x1, y1, x2, y2)
+    require_finite(box, "条带区域")
+    local_bg, sigma = _local_background_native(raw, x1, y1, x2, y2)
     if dark_bands:
-        integrated = float(np.maximum(local_bg - box, 0.0).sum())
+        raw_integral = float(np.maximum(local_bg - box, 0.0).sum())
     else:
-        integrated = float(np.maximum(box - local_bg, 0.0).sum())
+        raw_integral = float(np.maximum(box - local_bg, 0.0).sum())
+    # Same clipping bias as the lane profiles, one level simpler: the ring
+    # median sits at the centre of the noise rather than under it, so the
+    # residue left by max(..., 0) is the textbook 0.399σ per pixel and does not
+    # have to be measured. Without this the integral grows with the box the
+    # user drew, not with the protein inside it.
+    integrated = max(0.0, raw_integral - CLIPPED_HALF_NORMAL_MEAN * sigma * box.size)
+    limit = detection_limit(sigma, int(box.size))
     return BandMeasurement(
         lane=lane,
         band=band,
@@ -536,6 +1000,8 @@ def measure_box_native(
         saturated_fraction=round(
             saturation_fraction(box, dark_bands=dark_bands, white_level=white_level), 4
         ),
+        detection_limit=round(limit, 3),
+        snr=round(integrated / limit * LOD_SIGMA, 3) if limit > 0.0 else 0.0,
     )
 
 
