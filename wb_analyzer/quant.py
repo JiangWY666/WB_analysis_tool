@@ -657,16 +657,24 @@ def _column_span(
     column: np.ndarray,
     *,
     edge_frac: float = TIGHT_EDGE_FRAC,
+    background: float | None = None,
 ) -> tuple[int, int] | None:
     """列剖面上单个条带的横向足迹 [x1, x2)，峰高不显著时返回 None。
 
     以最强列为锚，向两侧扩展到信号跌破 ``floor + edge_frac × 峰高`` 为止。
+
+    ``background`` 是从条带行之外量出来的背景电平（见
+    :func:`_strip_background`）。给了就与列剖面 5 分位数取更低者当 ``floor``；
+    两个估计都偏高时都会把足迹往里收，取小的那个才不会漏带，而估偏低只会
+    让足迹变宽（宽到接近全宽就整体回退全宽，即旧行为）。
     """
     width = int(column.size)
     if width < 2:
         return None
     smooth = _smooth(column, max(1, width // 40))
     floor = float(np.percentile(smooth, 5))
+    if background is not None:
+        floor = min(floor, float(background))
     peak = int(np.argmax(smooth))
     height = float(smooth[peak]) - floor
     residual = column - smooth
@@ -683,6 +691,35 @@ def _column_span(
     return left, right + 1
 
 
+def _strip_background(
+    signal: np.ndarray, segments: list[tuple[int, int]] | None
+) -> float | None:
+    """泳道条的背景电平，量在条带段之外的行上；行数不够时返回 None。
+
+    背景必须从**没有条带的行**上量，不能从"泳道里最暗的那几列"上量。列剖面
+    的 5 分位数隐含假设"泳道至少 5% 的列是空白"——条带把泳道占满时这个假设
+    直接不成立，5 分位数落到条带自己的平台上，之后 ``edge_frac`` 的相对切
+    点就从一个高于弱带的电平起算，整条弱带被判在阈值以下切掉。真实样图上
+    这就是一条 250 px 宽的泳道只收到右边 86 px、积分少掉 48% 的原因，而且
+    ROI 左边缘挪 3 px 就能在"正确"和"漏一条带"之间跳变。
+
+    条带段之外的行对**每一列**都是背景，与条带在横向占了多宽无关，所以这个
+    估计不会随泳道被占满而失效。段边缘（``segment_bands`` 切在峰高 2~4%
+    处）外侧还残着条带的纵向拖尾，这里用中位数而不是均值：拖尾只影响紧挨
+    段边的少数几行，中位数不为所动，也就不必再留一圈会把空白行吃光的余量
+    ——真实样图上条带段占了 ROI 高度的 80%，留半个段高的余量后一行不剩。
+    """
+    if not segments:
+        return None
+    height = int(signal.shape[0])
+    blank = np.ones(height, dtype=bool)
+    for start, stop in segments:
+        blank[max(0, int(start)) : min(height, int(stop))] = False
+    if int(blank.sum()) < MIN_NOISE_SAMPLES:
+        return None
+    return float(np.median(signal[blank]))
+
+
 def _tight_band_span(
     signal: np.ndarray,
     segments: list[tuple[int, int]] | None = None,
@@ -692,10 +729,11 @@ def _tight_band_span(
 ) -> tuple[int, int] | None:
     """泳道条内条带的实际横向足迹 [x1, x2)（相对本条），不可靠时返回 None。
 
-    ``segments`` 是先在全宽纵向剖面上分出的条带 y 区间。列剖面只在这些
-    **条带行**（各段上下各留半个段高的余量）上统计，纯空白行不参与定位：
-    ROI 画得比条带高很多时，空白行原本会把列剖面的对比度稀释掉，弱带因此
-    被判为"不可靠"而退回全宽积分。
+    ``segments`` 是先在全宽纵向剖面上分出的条带 y 区间，有两个用处：列剖面
+    只在这些**条带行**（各段上下各留半个段高的余量）上统计，纯空白行不参与
+    定位——ROI 画得比条带高很多时，空白行原本会把列剖面的对比度稀释掉，弱带
+    因此被判为"不可靠"而退回全宽积分；剩下的行则用来量背景电平，见
+    :func:`_strip_background`。
 
     找不到可靠条带峰（空白/平坦泳道）时返回 None，调用方回退全宽。
     """
@@ -704,7 +742,9 @@ def _tight_band_span(
         return None
 
     column = _band_row_mean(signal, segments)
-    span = _column_span(column, edge_frac=edge_frac)
+    span = _column_span(
+        column, edge_frac=edge_frac, background=_strip_background(signal, segments)
+    )
     if span is None:
         return None
     x1, x2 = span
