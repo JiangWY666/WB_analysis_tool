@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -36,9 +37,21 @@ pytest.importorskip("PySide6")
 pytest.importorskip("pyqtgraph")
 
 from PySide6.QtCore import QEvent, QPointF, QSettings, Qt  # noqa: E402
-from PySide6.QtGui import QKeyEvent, QMouseEvent  # noqa: E402
+from PySide6.QtGui import (  # noqa: E402
+    QFontDatabase,
+    QFontMetrics,
+    QKeyEvent,
+    QKeySequence,
+    QMouseEvent,
+)
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QDockWidget,
+    QLabel,
+    QMessageBox,
+    QToolBar,
+)
 
 from wb_analyzer.imageio import blot_from_array  # noqa: E402
 from wb_analyzer.roi import MAX_STRAIGHTEN_ANGLE, RoiRect, lane_boundaries  # noqa: E402
@@ -46,11 +59,13 @@ from wb_analyzer.ui import canvas as canvas_mod  # noqa: E402
 from wb_analyzer.ui import errorlog, workers  # noqa: E402
 from wb_analyzer.ui import main_window as mw  # noqa: E402
 from wb_analyzer.ui import normalize_panel as nzp  # noqa: E402
+from wb_analyzer.ui import prefs as prefs_mod  # noqa: E402
 from wb_analyzer.ui import profile_panel as pp  # noqa: E402
 from wb_analyzer.ui import results_panel as rp  # noqa: E402
 from wb_analyzer.ui.canvas import Tool  # noqa: E402
 from wb_analyzer.ui.main_window import MainWindow  # noqa: E402
 from wb_analyzer.ui.tablefmt import format_number  # noqa: E402
+from wb_analyzer.ui.widgets import ElidedLabel  # noqa: E402
 
 ROI_BOX = (15, 60, -30, 130)  # x, y, 宽度相对图宽的收进量, 高
 
@@ -92,7 +107,26 @@ def noisy_raw(depths: list[float], *, noise: float, seed: int = 4) -> np.ndarray
     return np.clip(raw, 0, 65535).astype(np.uint16)
 
 
-def make_window(qt_app) -> MainWindow:
+LEAKY_LAYOUT_KEYS = ("win/geometry", mw.LAYOUT_STATE_KEY)
+
+
+def forget_layout() -> None:
+    """清掉持久化的窗口几何与停靠布局。
+
+    每次 close(window) 都会把这两个键写回 QSettings，而 qt_app 是 session 级的
+    fixture——不清的话下一条用例继承的是"上一条关掉时那个窗口"的布局，于是在文件
+    前面插一条用例就可能改变后面某条的成败。这一类顺序依赖的抖动全从这两个键来。
+    """
+    settings = QSettings("WBAnalyzer", "WBAnalyzer")
+    for key in LEAKY_LAYOUT_KEYS:
+        settings.remove(key)
+    settings.sync()
+
+
+def make_window(qt_app, *, keep_layout: bool = False) -> MainWindow:
+    # keep_layout 只给"本来就是在测布局持久化"的那几条用例用
+    if not keep_layout:
+        forget_layout()
     window = MainWindow()
     window.lane_spin.setValue(0)
     window.band_spin.setValue(0)  # 同样会被 QSettings 记住，逐项复位
@@ -101,6 +135,9 @@ def make_window(qt_app) -> MainWindow:
     window.snap_check.setChecked(True)
     window._snap_enabled = True
     window.canvas.set_snap_enabled(True)
+    # 界面偏好也是持久化的，而字号一改整个会话的度量都变（QApplication.setFont
+    # 是进程级的）。每个窗口开局先归零，上一条用例改过什么都影响不到这一条。
+    window.apply_ui_prefs(prefs_mod.DEFAULTS, persist=False)
     return window
 
 
@@ -1890,42 +1927,177 @@ def test_profile_double_click_no_longer_resets_the_left_view(qt_app):
     close(window)
 
 
+def synthetic_font_metrics() -> bool:
+    """当前环境的字体度量是不是合成出来的（字体库为空）。
+
+    这台离屏环境里 QFontDatabase.families() 返回空列表，于是所有字体请求都退到
+    "每字符恰好 12 px"的合成度量（``L9`` 量出 24.00 px 这种整数就是指纹），比真
+    实字体宽约 35%，而且随字号变化并不单调。指定字体是没用的——库是空的。
+
+    所以凡是依赖**绝对**像素宽的断言都不可信；下面测的一律是**相对**关系（"这两
+    个矩形不重叠"），判据和渲染读的是同一个外接矩形，环境怎么样都成立。
+    """
+    return not QFontDatabase.families()
+
+
+def size_profile_plot(panel, width: int, app) -> None:
+    """把剖面左图定到指定宽度，并断言真的定住了。
+
+    只有对 ``_col_plot`` 本身设宽度才有效：离屏下 window.resize() 根本不往子控件
+    传（实测窗口 1200 → 2800，剖面控件纹丝不动地停在 519 px，viewbox 恒为
+    446.9），补 processEvents / layout().activate() / resizeDocks / 直接拖 splitter
+    全都无效。前置条件断言是必需的——少了它，"标签神秘重叠"要查半小时才发现是
+    "测试根本没拿到它要求的布局"。
+    """
+    panel._col_plot.setMinimumWidth(width)
+    panel._col_plot.setMaximumWidth(width)
+    app.processEvents()
+    render(panel, app)
+    assert panel._col_plot.width() >= width - 1, (
+        f"前置条件：左图至少要 {width} px 宽，实际只有 {panel._col_plot.width()} px"
+    )
+
+
+def assert_lane_labels_are_readable(panel, note: str) -> None:
+    """泳道标签的契约：要么清晰不重叠、要么已降级/整批隐藏，绝不显示一部分。"""
+    total = len(panel._labels)
+    stride = panel.lane_label_stride()
+    shown = [i for i, label in enumerate(panel._labels) if label.isVisible()]
+    expected = list(range(0, total, stride)) if stride > 0 else []
+    assert shown == expected, (
+        f"{note}：显示出来的不是「每 {stride} 道一个」这一整批（{shown} vs {expected}）；"
+        "只显示恰好塞得下的那几个是不许的，用户没法预期哪几个会留下"
+    )
+    assert panel.lane_labels_packed() == (stride == 1), f"{note}：档位自述和实际不符"
+    rects = panel.lane_label_rects()
+    assert len(rects) == len(shown)
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            assert not rects[i].intersects(rects[j]), (
+                f"{note}：{shown[i] + 1} 号和 {shown[j] + 1} 号标签叠在一起"
+                f"（{lane_label_state(panel)}；"
+                f"合成字体度量={synthetic_font_metrics()}）"
+            )
+
+
+def lane_label_state(panel) -> str:
+    return (
+        f"整批铺开={panel.lane_labels_packed()} 紧凑文案={panel.lane_labels_compact()} "
+        f"间隔={panel.lane_label_stride()} 可见={len(panel.lane_label_rects())}/"
+        f"{len(panel._labels)}"
+    )
+
+
 def test_profile_legend_never_covers_lane_labels(qt_app):
-    """图例挪出坐标区：9 / 12 / 16 泳道都不许盖住任何 L# 分区标签。"""
+    """图例挪出坐标区，且泳道标签在 9 / 12 / 16 泳道 × 9 / 11 / 14 pt 下都可读。
+
+    断言的是**契约**而不是"碰巧不重叠"：``_rebuild_regions`` 以前给每道放一个
+    ``pg.TextItem`` 就完事，不压缩、不隔一个、不隐藏，"不重叠"只是图够宽时的巧
+    合——12 泳道差 4.2 px、16 泳道差 12.7 px，而字号设置一调大就更差。现在测的
+    是「不重叠 或 已降级」，与图宽、字号都无关。
+    """
     for lanes in (9, 12, 16):
-        window = make_window(qt_app)
-        load_array(
-            window, synthetic_raw([20000.0 - 700.0 * i for i in range(lanes)])
-        )
-        window.resize(1500, 950)
-        window.show()
-        qt_app.processEvents()
-        set_roi_and_quantify(window)
-        panel = window.profile_panel
-        render(panel, qt_app)
+        for point_size in (9.0, 11.0, 14.0):
+            window = make_window(qt_app)
+            load_array(
+                window, synthetic_raw([20000.0 - 700.0 * i for i in range(lanes)])
+            )
+            with with_font(window, point_size):
+                window.resize(1500, 950)
+                window.show()
+                qt_app.processEvents()
+                set_roi_and_quantify(window)
+                panel = window.profile_panel
+                render(panel, qt_app)
+                assert len(panel._labels) == lanes, "前置条件：每个泳道一个分区标签"
+                for plot in (panel._col_plot, panel._lane_plot):
+                    assert plot.getPlotItem().legend is None, (
+                        "坐标区里不该再有压住标签的图例"
+                    )
 
-        for plot in (panel._col_plot, panel._lane_plot):
-            assert plot.getPlotItem().legend is None, "坐标区里不该再有压住标签的图例"
-        assert len(panel._labels) == lanes, "前置条件：每个泳道一个分区标签"
-
-        view_rect = panel._col_plot.getPlotItem().getViewBox().sceneBoundingRect()
-        rects = [item.mapRectToScene(item.boundingRect()) for item in panel._labels]
-        for index, rect in enumerate(rects):
-            assert view_rect.contains(rect.center()), f"L{index + 1} 跑出了绘图区"
-        for i in range(len(rects)):
-            for j in range(i + 1, len(rects)):
-                assert not rects[i].intersects(rects[j]), (
-                    f"{lanes} 泳道时 L{i + 1} 和 L{j + 1} 叠在一起"
+                # 从宽到窄各评一次：宽的时候不许过度降级，窄的时候不许重叠
+                size_profile_plot(panel, 1500, qt_app)
+                note = f"{lanes} 泳道 {point_size:g}pt 宽 1500 px"
+                assert panel.lane_labels_packed(), (
+                    f"{note}：这么宽还降级就是判据太保守了（{lane_label_state(panel)}）"
                 )
+                assert_lane_labels_are_readable(panel, note)
+                view_rect = (
+                    panel._col_plot.getPlotItem().getViewBox().sceneBoundingRect()
+                )
+                for rect in panel.lane_label_rects():
+                    assert view_rect.contains(rect.center()), f"{note}：标签跑出绘图区"
 
-        texts = {
-            label.text()
-            for strip in panel.findChildren(pp.LegendStrip)
-            for label in strip.findChildren(QLabel)
-        }
-        for wanted in ("列平均信号", "泳道信号", "扣除用基线", "积分区间（条带）"):
-            assert any(wanted in text for text in texts), f"图例丢了「{wanted}」"
-        close(window)
+                for width in (900, 560):
+                    size_profile_plot(panel, width, qt_app)
+                    assert_lane_labels_are_readable(
+                        panel, f"{lanes} 泳道 {point_size:g}pt 宽 {width} px"
+                    )
+
+                texts = {
+                    label.text()
+                    for strip in panel.findChildren(pp.LegendStrip)
+                    for label in strip.findChildren(QLabel)
+                }
+                for wanted in ("列平均信号", "泳道信号", "扣除用基线", "积分区间（条带）"):
+                    assert any(wanted in text for text in texts), f"图例丢了「{wanted}」"
+                close(window)
+
+
+def test_profile_lane_labels_degrade_one_step_at_a_time(qt_app):
+    """越窄降得越狠，而且每一档都读得出来：完整 → 纯数字 → 隔几道 → 整批隐藏。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0 - 600.0 * i for i in range(16)]))
+    window.resize(1500, 950)
+    window.show()
+    qt_app.processEvents()
+    set_roi_and_quantify(window)
+    panel = window.profile_panel
+    render(panel, qt_app)
+
+    size_profile_plot(panel, 1600, qt_app)
+    assert panel.lane_labels_packed() and not panel.lane_labels_compact(), (
+        f"够宽时就该是完整的 L# 文案（{lane_label_state(panel)}）"
+    )
+    assert panel._labels[0].textItem.toPlainText() == "L1"
+
+    seen = []
+    for width in (1600, 900, 560, 320):
+        size_profile_plot(panel, width, qt_app)
+        assert_lane_labels_are_readable(panel, f"16 泳道宽 {width} px")
+        seen.append((panel.lane_labels_compact(), panel.lane_label_stride()))
+    compacts = [c for c, _ in seen]
+    strides = [s for _, s in seen]
+    assert compacts[-1], f"窄到 320 px 还留着 L 前缀就是没降级：{seen}"
+    assert panel._labels[0].textItem.toPlainText() == "1", "紧凑文案该只剩数字"
+    assert strides == sorted(strides), f"间隔只该越窄越大，实际 {seen}"
+    assert strides[-1] > 1, f"320 px 塞 16 道还每道都标必然重叠：{seen}"
+    close(window)
+
+
+def test_profile_lane_labels_hide_as_a_batch_when_nothing_fits(qt_app):
+    """连最稀的间隔都摆不开时整批隐藏，不留"能塞下的那几个"。
+
+    真实布局下走不到这一档（pyqtgraph 给绘图区留了最小宽度），所以直接把"每像素
+    多少数据单位"压到极限来验这根兜底。
+    """
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0 - 700.0 * i for i in range(12)]))
+    window.resize(1400, 900)
+    window.show()
+    qt_app.processEvents()
+    set_roi_and_quantify(window)
+    panel = window.profile_panel
+    render(panel, qt_app)
+    assert panel.lane_label_rects(), "前置条件：正常宽度下标签是看得见的"
+
+    panel._view_px_per_unit = lambda: 1e-4  # 一个泳道只剩不到 1 px
+    panel._relayout_lane_labels()
+    render(panel, qt_app)
+    assert panel.lane_label_stride() == 0, "摆不开就该整批隐藏"
+    assert panel.lane_label_rects() == [], "整批隐藏就是一个都不留"
+    assert not panel.lane_labels_packed()
+    close(window)
 
 
 # ------------------------------------------------------------------ U10 溯源接线
@@ -2530,10 +2702,16 @@ def test_severity_is_visible_at_a_glance(qt_app):
     assert "挪至少" in bar.detail_text() and "px" in bar.detail_text()
     render(bar, qt_app)
 
+    # 展开与收起互为反面，且都画得出来（展开态是另一条绘制路径）
+    before = bar.is_expanded()
     bar._toggle_detail()
     qt_app.processEvents()
-    assert bar.is_expanded()
-    render(bar, qt_app)  # 展开态是另一条绘制路径，得单独渲染
+    assert bar.is_expanded() is not before
+    render(bar, qt_app)
+    bar._toggle_detail()
+    qt_app.processEvents()
+    assert bar.is_expanded() is before
+    render(bar, qt_app)
     close(window)
 
 
@@ -2618,24 +2796,40 @@ def test_the_shortfall_hint_still_covers_for_a_missing_self_check(qt_app):
     close(window)
 
 
+def collapse_bar(bar, app) -> None:
+    if bar.is_expanded():
+        bar._toggle_detail()
+    app.processEvents()
+
+
+def expand_bar(bar, app) -> None:
+    if not bar.is_expanded():
+        bar._toggle_detail()
+    app.processEvents()
+
+
 def test_the_bar_never_eats_the_canvas(qt_app):
-    """诊断条不能挡住工作区：窄窗、展开长文，高度都得有上限。"""
+    """诊断条不能挡住工作区：窄窗、展开长文，高度都得有上限。
+
+    折叠态的上限卡得比以前紧（90 → 46 px）：摘要现在是单行省略，再多的诊断也
+    只占一行；以前它 wordWrap，三条诊断能撑到三行压在画布上。
+    """
     window = clipped_roi_window(qt_app)
     bar = window.diagnostics
     for width in (900, 1200, 1700):
         window.resize(width, 800)
         window.show()
         qt_app.processEvents()
+        collapse_bar(bar, qt_app)
+        render(bar, qt_app)
         collapsed = bar.height()
-        assert collapsed <= 90, f"{width} px 宽时折叠态就占了 {collapsed} px"
-        bar._toggle_detail()
-        qt_app.processEvents()
+        assert collapsed <= 46, f"{width} px 宽时折叠态就占了 {collapsed} px"
+        expand_bar(bar, qt_app)
         render(bar, qt_app)
         expanded = bar.height()
         assert expanded <= 300, f"{width} px 宽时展开占了 {expanded} px，详情该自己滚"
         assert window.canvas.height() > expanded, "画布得比诊断条高"
-        bar._toggle_detail()
-        qt_app.processEvents()
+        collapse_bar(bar, qt_app)
     close(window)
 
 
@@ -3325,4 +3519,1108 @@ def test_gappy_lane_numbers_never_mismap_the_separator(qt_app):
     assert window._separators_between(()) == []
     assert window._separators_between((3, 4)) == [], "只有 2 条线，第 4 道不存在"
     assert window._separators_between((7, 8)) == []
+    close(window)
+
+
+# ------------------------------------------------------------------ U15 界面密度与可控性
+#
+# 用户的原话是这一节的纲：「没有人想在分析时看大段的文字」，外加「结果表太窄看
+# 不到数值」「面板拖出去就回不来」「想调字体和框线宽度」。四件事共一个判据——
+# 默认极简、要看时能展开、任何东西都不许"看不见也回不来"。
+#
+# 这一节几乎全是绘制与布局，离屏断言不触发 paintEvent，所以每条都 render() 一次：
+# 不渲染就测不到"算得出来但画不出来"。
+
+
+DEFAULT_RESULT_COLUMNS = ["lane", "band", "density", "saturated", "snr"]
+
+
+def adjust_scroll(window: MainWindow):
+    return window._adjust_tab
+
+
+def widget_fully_inside(widget, container) -> bool:
+    """widget 有没有整个落在 container 的视口里（右半截被推出去就是 False）。"""
+    top_left = widget.mapTo(container, widget.rect().topLeft())
+    return (
+        top_left.x() >= 0
+        and top_left.x() + widget.width() <= container.width() + 1
+    )
+
+
+def with_font(window: MainWindow, point_size: float):
+    """临时改字号；用完必须还原——QApplication.setFont 是进程级的。"""
+
+    class _Scope:
+        def __enter__(self):
+            window.apply_ui_prefs(
+                replace(window.ui_prefs(), font_pt=point_size), persist=False
+            )
+            QApplication.instance().processEvents()
+            return window
+
+        def __exit__(self, *_exc):
+            window.apply_ui_prefs(prefs_mod.DEFAULTS, persist=False)
+            QApplication.instance().processEvents()
+            return False
+
+    return _Scope()
+
+
+# ---------------------------------------------------------------- 一、结果表只留要紧的列
+
+
+def test_results_table_shows_only_the_core_columns_by_default(qt_app):
+    """默认只显示泳道 / 条带 / 积分灰度 / 饱和 % / S/N，其余收进设置。
+
+    锁定的三列是这张表的骨架（哪一条带 + 产出本身），位置坐标与基线中间量都是
+    "核对时才看"的东西。列少了之后表格必须真的放得下——横向滚动条一条都不许有，
+    否则这次改动等于白做。
+    """
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))
+    set_roi_and_quantify(window)
+    panel = window.results_panel
+    window._tabs.setCurrentWidget(panel)
+    qt_app.processEvents()
+    render(panel, qt_app)
+
+    assert panel.table.columnCount() == len(rp.HEADERS), "藏起来 ≠ 删掉，列还在"
+    assert panel.visible_columns() == DEFAULT_RESULT_COLUMNS
+    for key in ("x", "y", "w", "h", "background", "mean"):
+        assert panel.table.isColumnHidden(rp.COLUMN_INDEX[key]), f"{key} 默认不该占位置"
+    # 用户点名的那一列，怎么都不能少
+    assert not panel.table.isColumnHidden(rp.COLUMN_INDEX["density"])
+
+    assert panel.table.horizontalScrollBar().maximum() == 0, (
+        "默认列数下结果表仍然要横向滚动，说明列还是太多或者列宽没跟着收"
+    )
+    close(window)
+
+
+def test_the_result_values_stay_readable_at_every_font_size(qt_app):
+    """9 / 11 / 14 pt、16 行数据：结果表一次都不许横向滚动。
+
+    用户的原话是"看不到所有的数值"。砍列只解决了默认字号那一档，字号调大之后
+    同样的 5 列还是会超出停靠区——所以停靠区的最小宽度要跟着表格真正需要的宽度
+    走，宁可占掉画布几十像素。
+    """
+    window = make_window(qt_app)
+    window.resize(1500, 950)
+    window.show()
+    load_array(
+        window,
+        synthetic_raw(
+            [20000.0, 17000.0, 15000.0, 13000.0, 11000.0, 9000.0, 7000.0, 5000.0],
+            centers=(104.0, 136.0),
+        ),
+    )
+    set_roi_and_quantify(window)
+    panel = window.results_panel
+    window._tabs.setCurrentWidget(panel)
+    assert panel.table.rowCount() >= 8, "行要够多，才会冒出竖直滚动条挤掉横向空间"
+
+    for point_size in (9.0, 11.0, 14.0):
+        with with_font(window, point_size):
+            window.resize(1500, 950)
+            qt_app.processEvents()
+            render(panel, qt_app)
+            header = panel.table.horizontalHeader()
+            # 几个像素的余量：离屏后端与原生后端在滚动范围上差 1～2 px，那不是
+            # "看不到数值"。真正要保证的是下面那条——重要的列没有被压窄。
+            assert panel.table.horizontalScrollBar().maximum() <= 4, (
+                f"{point_size} pt 下结果表又要横向滚动了"
+            )
+            for key in ("lane", "band", "density"):
+                index = rp.COLUMN_INDEX[key]
+                assert header.sectionSize(index) >= header.sectionSizeHint(index), (
+                    f"{point_size} pt 下「{rp.HEADERS[index]}」被压到放不下内容"
+                )
+    close(window)
+
+
+def test_turning_on_every_column_does_not_swallow_the_canvas(qt_app):
+    """12 列全勾上是用户自己的选择：这时让表格滚动，别把画布吞了。"""
+    window = make_window(qt_app)
+    window.resize(1500, 950)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))
+    set_roi_and_quantify(window)
+    canvas_before = window.canvas.width()
+
+    window.apply_ui_prefs(
+        replace(window.ui_prefs(), result_columns=tuple(rp.OPTIONAL_COLUMNS)),
+        persist=False,
+    )
+    qt_app.processEvents()
+    assert len(window.results_panel.visible_columns()) >= 11
+    assert window._tabs.minimumWidth() <= mw.CONTROL_DOCK_MAX_PX
+    assert window.canvas.width() > canvas_before * 0.6, "画布被面板吃掉太多了"
+    window.apply_ui_prefs(prefs_mod.DEFAULTS, persist=False)
+    close(window)
+
+
+def test_locked_columns_cannot_be_switched_off(qt_app):
+    """把可选列全勾掉，骨架三列还得在——空表比宽表更没用。"""
+    panel = rp.ResultsPanel()
+    panel.set_optional_columns([])
+    assert panel.visible_columns() == list(rp.LOCKED_COLUMNS)
+    panel.set_optional_columns(["x", "mean", "不存在的列"])
+    assert panel.visible_columns() == ["lane", "band", "x", "density", "mean"]
+    panel.deleteLater()
+
+
+def test_hidden_columns_still_copy_out_in_full(qt_app):
+    """显示是显示、导出是导出：复制 TSV 永远带全 12 列。
+
+    否则用户在设置里勾掉一列，粘进 Excel 的数据会跟着少——那是"看不全"变成
+    "导不全"，比原来的问题严重得多。
+    """
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 16000.0]))
+    set_roi_and_quantify(window)
+    panel = window.results_panel
+    assert "x" not in panel.visible_columns(), "前置条件：X 列是藏起来的"
+
+    panel.table.selectAll()
+    panel.copy_selected()
+    lines = QApplication.clipboard().text().splitlines()
+    assert lines[0].split("\t") == rp.HEADERS
+    assert all(len(line.split("\t")) == len(rp.HEADERS) for line in lines[1:])
+    close(window)
+
+
+def test_usage_column_shows_up_only_when_it_says_something(qt_app):
+    """「计入」整列都写着"计入"时没有信息量，就别占那一列。"""
+    window = doublet_window(qt_app)
+    assert "usage" not in window.results_panel.visible_columns()
+
+    window.normalize_panel.set_band_pick("top")
+    qt_app.processEvents()
+    assert "usage" in window.results_panel.visible_columns(), (
+        "有条带没被采用时这一列是判读结果的前提，必须自己冒出来"
+    )
+
+    window.normalize_panel.set_band_pick("all")
+    qt_app.processEvents()
+    assert "usage" not in window.results_panel.visible_columns()
+    close(window)
+
+
+def test_column_choice_survives_a_restart(qt_app):
+    """列的显示状态要持久化，否则每次开软件都得重勾一遍。"""
+    window = make_window(qt_app)
+    window.apply_ui_prefs(
+        replace(window.ui_prefs(), result_columns=("x", "y", "background")),
+        persist=True,
+    )
+    assert window.results_panel.visible_columns() == [
+        "lane", "band", "x", "y", "density", "background",
+    ]
+    close(window)
+
+    reopened = MainWindow()
+    try:
+        assert reopened.ui_prefs().result_columns == ("background", "x", "y")
+        assert reopened.results_panel.visible_columns() == [
+            "lane", "band", "x", "y", "density", "background",
+        ]
+    finally:
+        reopened.apply_ui_prefs(prefs_mod.DEFAULTS, persist=True)
+        close(reopened)
+
+
+def test_adjust_tab_never_needs_a_horizontal_scrollbar(qt_app):
+    """「调整」页在默认停靠宽度下不许横向滚动，多档字号都不许。
+
+    这条盯的是用户直接抱怨的现象：横向滚动条一出现，「归零」按钮和 ROI 数值框
+    的右半截就被推到视口外。根源是「ROI 位置尺寸」那行四个数值框排成一排，单行
+    最小 488 px 而视口只有 400 出头。
+    """
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    qt_app.processEvents()
+    scroll = adjust_scroll(window)
+    for point_size in (9.0, 9.5, 11.0, 14.0):
+        with with_font(window, point_size):
+            window.resize(1400, 900)
+            qt_app.processEvents()
+            render(scroll, qt_app)
+            assert scroll.horizontalScrollBar().maximum() == 0, (
+                f"{point_size} pt 下「调整」页仍要横向滚动"
+            )
+            content = scroll.widget()
+            assert content.width() <= scroll.viewport().width() + 1
+            for key, spin in window.roi_spins.items():
+                assert widget_fully_inside(spin, content), (
+                    f"{point_size} pt 下 ROI「{key}」框被推出了视口"
+                )
+    close(window)
+
+
+def test_roi_fields_are_two_by_two(qt_app):
+    """四个 ROI 数值框排成 2×2：一排四个是横向滚动条的根源。"""
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    qt_app.processEvents()
+    rows = {spin.mapTo(window, spin.rect().topLeft()).y() for spin in window.roi_spins.values()}
+    assert len(rows) == 2, f"ROI 数值框占了 {len(rows)} 行，应当是 2×2"
+    for spin in window.roi_spins.values():
+        assert spin.maximumWidth() >= 10000, "宽度不许写死，否则字号一调就装不下数字"
+    close(window)
+
+
+# ---------------------------------------------------------------- 二、面板关掉之后回得来
+
+
+def test_view_menu_can_bring_every_panel_back(qt_app):
+    """每个停靠面板在「视图 → 面板」里都有一个可勾选的开关。
+
+    这是"关掉之后找不到怎么加回来"的正解：入口必须在菜单里，而且要能看出哪一项
+    对应哪个面板。
+    """
+    window = make_window(qt_app)
+    window.show()
+    qt_app.processEvents()
+    titles = {action.text() for action in window.panels_menu.actions()}
+    for dock in (window._control_dock, window._profile_dock):
+        assert dock.windowTitle() in titles, f"「{dock.windowTitle()}」在视图菜单里没有开关"
+
+        dock.close()
+        qt_app.processEvents()
+        assert not dock.isVisible()
+        action = next(
+            a for a in window.panels_menu.actions() if a.text() == dock.windowTitle()
+        )
+        assert action.isCheckable() and not action.isChecked()
+        action.trigger()
+        qt_app.processEvents()
+        assert dock.isVisible(), "菜单项勾回来就该把面板放回去"
+        assert window.dockWidgetArea(dock) != Qt.DockWidgetArea.NoDockWidgetArea
+    assert window.act_reset_layout in window.panels_menu.actions()
+    close(window)
+
+
+def test_floating_panel_can_be_docked_again(qt_app):
+    """浮出去还得能拖回来：允许区域与特性都不许收紧。
+
+    Qt 默认就支持双击标题栏归位，但只要有人给 setAllowedAreas / setFeatures 收
+    过一刀就会失效，而失效之后用户唯一的出路就是关掉面板——正是这次的投诉。
+    """
+    window = make_window(qt_app)
+    window.show()
+    qt_app.processEvents()
+    for dock, area in window._dock_defaults():
+        assert dock.allowedAreas() == Qt.DockWidgetArea.AllDockWidgetAreas
+        features = dock.features()
+        assert features & QDockWidget.DockWidgetFeature.DockWidgetMovable
+        assert features & QDockWidget.DockWidgetFeature.DockWidgetFloatable
+
+        dock.setFloating(True)
+        qt_app.processEvents()
+        assert dock.isFloating()
+        # 双击标题栏走的就是这一句（QDockWidget::_q_toggleTopLevel）
+        dock.setFloating(False)
+        qt_app.processEvents()
+        assert not dock.isFloating()
+        assert window.dockWidgetArea(dock) == area, "拖回去要回到原来那一边"
+    close(window)
+
+
+def test_reset_layout_recovers_a_thoroughly_broken_layout(qt_app):
+    """把布局搞乱到最坏：面板浮出去、挪到别的边、还关掉一个，一键全回来。"""
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    qt_app.processEvents()
+
+    window.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, window._profile_dock)
+    window._profile_dock.setFloating(True)
+    window._control_dock.close()
+    qt_app.processEvents()
+    assert not window._control_dock.isVisible()
+
+    window.act_reset_layout.trigger()
+    qt_app.processEvents()
+    render(window, qt_app)
+
+    for dock, area in window._dock_defaults():
+        assert dock.isVisible(), f"重置之后「{dock.windowTitle()}」还是看不见"
+        assert not dock.isFloating()
+        assert window.dockWidgetArea(dock) == area
+    assert "重置布局" in window._hint_label.text()
+    close(window)
+
+
+def test_reset_layout_also_forgets_the_bad_layout(qt_app):
+    """重置必须连持久化的那份一起清掉，否则下次启动坏布局又回来了。"""
+    window = make_window(qt_app)
+    window.show()
+    qt_app.processEvents()
+    settings = QSettings("WBAnalyzer", "WBAnalyzer")
+    settings.setValue(mw.LAYOUT_STATE_KEY, window.saveState(mw.LAYOUT_VERSION))
+    settings.sync()
+    assert settings.value(mw.LAYOUT_STATE_KEY) is not None
+
+    window.act_reset_layout.trigger()
+    qt_app.processEvents()
+    assert QSettings("WBAnalyzer", "WBAnalyzer").value(mw.LAYOUT_STATE_KEY) is None, (
+        "重置只管当前这一次的话，用户存下的坏布局会永远坏着"
+    )
+    close(window)
+
+
+def test_unreadable_layout_state_falls_back_to_the_default(qt_app):
+    """版本对不上 / 读不出来的布局状态，退回默认布局而不是崩掉或空窗。"""
+    donor = make_window(qt_app)
+    stale = donor.saveState()  # 0.4.0 那份是无版本号存的，新版本认不出来
+    close(donor)
+    settings = QSettings("WBAnalyzer", "WBAnalyzer")
+    settings.setValue(mw.LAYOUT_STATE_KEY, stale)
+    settings.sync()
+
+    window = make_window(qt_app, keep_layout=True)
+    window.show()
+    qt_app.processEvents()
+    for dock, area in window._dock_defaults():
+        assert dock.isVisible()
+        assert window.dockWidgetArea(dock) == area
+    render(window, qt_app)
+    close(window)
+
+
+def test_layout_round_trips_through_settings(qt_app):
+    """版本对得上时照常恢复：上次关掉的面板下次仍然关着，重置能救回来。"""
+    settings = QSettings("WBAnalyzer", "WBAnalyzer")
+    window = make_window(qt_app)
+    window.show()
+    window._profile_dock.close()
+    qt_app.processEvents()
+    close(window)
+    assert settings.value(mw.LAYOUT_STATE_KEY) is not None
+
+    reopened = make_window(qt_app, keep_layout=True)
+    reopened.show()
+    qt_app.processEvents()
+    assert not reopened._profile_dock.isVisible(), "关掉的面板下次启动仍是关着的"
+    reopened.act_reset_layout.trigger()
+    qt_app.processEvents()
+    assert reopened._profile_dock.isVisible()
+    close(reopened)
+
+
+def test_one_test_cannot_hand_its_layout_to_the_next(qt_app):
+    """用例之间不许通过 QSettings 传递布局。
+
+    这是上一条的反面，测的是测试自己：close(window) 每次都会把 win/geometry 与
+    dock_state 写回 QSettings，而 qt_app 是 session 级的。不隔离的话，在文件前面
+    插一条用例就能改变后面某条的成败——"时红时绿"的一整类抖动都从这儿来。
+    """
+    donor = make_window(qt_app)
+    donor.show()
+    donor._profile_dock.close()
+    donor.resize(1100, 700)
+    qt_app.processEvents()
+    close(donor)
+    settings = QSettings("WBAnalyzer", "WBAnalyzer")
+    assert settings.value(mw.LAYOUT_STATE_KEY) is not None, "前置条件：坏布局真被存下了"
+
+    forget_layout()
+    for key in LEAKY_LAYOUT_KEYS:
+        assert QSettings("WBAnalyzer", "WBAnalyzer").value(key) is None, f"{key} 没清掉"
+
+    window = make_window(qt_app)
+    window.show()
+    qt_app.processEvents()
+    assert window._profile_dock.isVisible(), (
+        "make_window 该清掉持久化布局，上一条用例关掉的面板不能带到这一条"
+    )
+    close(window)
+
+
+# ---------------------------------------------------------------- 三、默认极简、严重不折叠
+
+
+def test_the_summary_line_stays_one_line(qt_app):
+    """摘要永远一行：放不下就省略号，全文进 tooltip。
+
+    以前它是 wordWrap 的，标题一多就折成一段话压在画布上——这正是用户说的"没
+    有人想在分析时看大段的文字"。
+    """
+    window = clipped_roi_window(qt_app)
+    window.resize(900, 800)
+    window.show()
+    qt_app.processEvents()
+    label = window.diagnostics._text
+    render(window.diagnostics, qt_app)
+
+    assert isinstance(label, ElidedLabel)
+    assert not label.wordWrap()
+    assert label.toolTip() == label.text(), "省略之后全文必须还能悬停看到"
+    metrics = QFontMetrics(label.font())
+    assert label.height() <= metrics.height() * 2, "摘要占了不止一行"
+    # 窄窗下确实会被截断，但截断的是显示、不是内容
+    window.resize(640, 800)
+    qt_app.processEvents()
+    render(window.diagnostics, qt_app)
+    assert label.text() == window.diagnostics.summary()
+    close(window)
+
+
+def test_severe_diagnostics_are_never_folded_away(qt_app):
+    """「严重」默认就展开，「警告」默认折叠——可以选择不看，不能看不见。"""
+    window = clipped_roi_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    bar = window.diagnostics
+    assert bar.severity() == "error", "前置条件：这个 ROI 该被判成严重"
+    assert bar.wants_detail(), "严重级不许默认折叠"
+    assert bar.is_expanded()
+    render(bar, qt_app)
+
+    # 用户仍然可以收起来
+    bar._toggle_detail()
+    qt_app.processEvents()
+    assert not bar.is_expanded()
+
+    # 但换一批诊断（这里是换个 ROI）之后，严重级要重新展开
+    quantify_box(window, 15, 60, window._blot.width - 30, 130)
+    assert window.diagnostics.severity() is None, "干净 ROI 该通过"
+    quantify_box(window, 15, 108, window._blot.width - 30, 82)
+    assert bar.severity() == "error"
+    assert bar.is_expanded(), "收起过一次警告，之后来的严重问题就再也不展开了？"
+    close(window)
+
+
+def test_a_warning_stays_folded(qt_app):
+    """只有警告时保持折叠：一行摘要够用了，展开与否交给用户。"""
+    window = doublet_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    set_band_count(window, 3)  # 只有两条带，第三刀没谷可切
+    window._roi_report = None  # 让界面兜底的那条 warning 单独在场
+    window._refresh_diagnostics()
+    qt_app.processEvents()
+
+    bar = window.diagnostics
+    assert bar.severity() == "warning", f"前置条件没成立：{bar.entries()}"
+    assert not bar.wants_detail(), "警告不该默认摊开"
+    assert not bar.is_expanded()
+    render(bar, qt_app)
+
+    bar._toggle_detail()
+    qt_app.processEvents()
+    assert bar.is_expanded(), "想看的时候点一下就得展开"
+    render(bar, qt_app)
+    close(window)
+
+
+def test_cross_origin_is_promoted_to_the_diagnostics_bar(qt_app):
+    """跨口径以前只写在“归一化”页——那一页关着的时候用户就漏掉了。
+
+    它的含义是"这一组的比值算不出来"，属于 error，必须出现在画布上方那条统一
+    诊断里，而且默认展开。归一化页那行只留一句判词。
+    """
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    add_history(window, "loading_control", "Actin", "G1")
+    window._run_auto(synchronous=True)
+    assert settle(window)
+    add_history(window, "target", "PAD4", "G1")
+    qt_app.processEvents()
+
+    bar = window.diagnostics
+    entry = next(e for e in bar.entries() if "口径" in e.title)
+    assert entry.severity == "error"
+    assert "G1" in entry.title
+    assert bar.is_expanded(), "严重级不许折叠"
+    assert "拒绝" in entry.detail or "拒绝" in bar.detail_text()
+    render(bar, qt_app)
+
+    # 归一化页那行不再复述整段成因，但判词与分组名还在
+    hint = window.normalize_panel._result_hint
+    assert "拒绝" in hint.text() and "G1" in hint.text()
+    assert not hint.wordWrap(), "这行提示不许自动折行去挤结果表"
+    close(window)
+
+
+def test_the_detail_does_not_repeat_the_summary(qt_app):
+    """展开详情时，摘要那句不许紧挨着再出现一遍。
+
+    严重级默认展开之后这个重复格外扎眼：第一行"严重｜条带贴着 ROI 上边"，
+    紧接着第二行"⛔ 严重·条带贴着 ROI 上边"，同一句话连着写两遍。
+    """
+    window = clipped_roi_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    bar = window.diagnostics
+    assert bar.is_expanded()
+    render(bar, qt_app)
+    title = bar.entries()[0].title
+    assert title in bar.summary()
+    assert title not in bar._detail.text(), "详情里又把摘要那句抄了一遍"
+    # 但别的条目还得有自己的标题，否则几段正文会糊成一片
+    window.normalize_panel.set_band_pick("top")
+    qt_app.processEvents()
+    others = [e for e in bar.entries() if e.title not in bar.summary()]
+    for entry in others:
+        assert entry.title in bar._detail.text(), "第二条以后的标题不能省"
+    close(window)
+
+
+def test_the_status_bar_reports_state_not_instructions(qt_app):
+    """状态栏说这次算出了什么，不复述操作说明。
+
+    以前每次定量完都缀上"剖面图上双击可加分隔线…点选条带 Delete 可删除"，
+    而剖面图标题里逐字写着同一句——同一屏上两遍，还每次都念。
+    """
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))
+    set_roi_and_quantify(window)
+    text = window._hint_label.text()
+    assert "ROI 定量完成" in text
+    assert "双击" not in text and "Delete" not in text, f"状态栏又开始念操作说明：{text}"
+    assert isinstance(window._hint_label, ElidedLabel), "状态栏太长时要省略而不是硬切"
+    close(window)
+
+
+def test_the_profile_panel_says_each_thing_once(qt_app):
+    """剖面面板里"怎么加 / 怎么删"只说一次（图标题），图例只标颜色。"""
+    window = make_window(qt_app)
+    window.show()
+    panel = window.profile_panel
+    qt_app.processEvents()
+    texts = [
+        label.text()
+        for label in panel.findChildren(QLabel)
+        if label.text()
+    ]
+    assert sum(1 for t in texts if "双击" in t) == 0, (
+        f"剖面图标题之外还有一份操作说明：{texts}"
+    )
+    assert "双击加分隔线" in pp.COLUMN_TITLE, "说明本身不能丢，它在图标题里"
+    close(window)
+
+
+def test_the_profile_panel_grows_with_the_font(qt_app):
+    """字号调大后剖面面板要跟着长高，否则坐标轴刻度会叠在一起。"""
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    base = window.profile_panel.minimumHeight()
+    with with_font(window, 14.0):
+        render(window.profile_panel, qt_app)
+        assert window.profile_panel.minimumHeight() > base, (
+            "面板不长高的话，14 pt 的刻度会挤成一团"
+        )
+    assert window.profile_panel.minimumHeight() == base, "回到默认要精确复原"
+    close(window)
+
+
+def test_the_adjust_page_moved_its_prose_into_tooltips(qt_app):
+    """「调整」页不再常驻整段说明，但那些话一句都没丢——都在 tooltip 里。"""
+    window = make_window(qt_app)
+    window.show()
+    qt_app.processEvents()
+    content = adjust_scroll(window).widget()
+
+    prose = [
+        label
+        for label in content.findChildren(QLabel)
+        if label.wordWrap() and len(label.text()) > 40
+    ]
+    assert not prose, f"「调整」页还留着常驻长文：{[p.text()[:20] for p in prose]}"
+
+    assert "±" in window.rotation_spin.toolTip()
+    assert "方向键" in window.roi_spins["x"].toolTip()
+    assert "深色条带" in window.bg_combo.toolTip()
+    assert "膜边" in window.tilt_button.toolTip()
+    close(window)
+
+
+# ---------------------------------------------------------------- 四、设置栏
+
+
+def test_font_size_setting_reaches_every_kind_of_text(qt_app):
+    """9 / 11 / 14 pt 各走一遍：普通控件、表格、画布标签、剖面图标题全跟着变。
+
+    画布标签与 pyqtgraph 的字号是另外两套（QGraphicsItem 与内嵌 CSS），不显式
+    推一遍就会出现"表格变大了、图里纹丝不动"。
+    """
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))
+    set_roi_and_quantify(window)
+
+    seen = {}
+    for point_size in (9.0, 11.0, 14.0):
+        with with_font(window, point_size):
+            render(window, qt_app)
+            seen[point_size] = (
+                window.results_panel.table.font().pointSizeF(),
+                window.canvas._label_font().pointSizeF(),
+                window.profile_panel._title_size(),
+                window.diagnostics._text.font().pointSizeF(),
+            )
+    sizes = [seen[p] for p in (9.0, 11.0, 14.0)]
+    for index, what in enumerate(("结果表", "画布标签", "剖面图标题", "诊断条")):
+        values = [s[index] for s in sizes]
+        assert values[0] != values[1] != values[2], f"{what}的字号没跟着变：{values}"
+
+    # 回到默认要精确复原，不能一路往上漂
+    assert window.ui_prefs().font_pt == prefs_mod.DEFAULT_FONT_PT
+    assert window.canvas.annotation_scales()[3] == pytest.approx(1.0)
+    assert window.results_panel.table.font().pointSizeF() == pytest.approx(
+        seen[9.0][0] * prefs_mod.DEFAULT_FONT_PT / 9.0
+    ), "来回调几次之后字号漂了"
+
+    # 开着的对话框也要跟着走（说明书正是要看清字的地方）
+    window.act_help.trigger()
+    qt_app.processEvents()
+    help_box = window._help_box
+    assert help_box is not None
+    base_pt = help_box.font().pointSizeF()
+    with with_font(window, 14.0):
+        assert help_box.font().pointSizeF() == pytest.approx(
+            base_pt * 14.0 / prefs_mod.DEFAULT_FONT_PT
+        ), "说明书窗口没跟着字号走"
+    assert help_box.font().pointSizeF() == pytest.approx(base_pt)
+    help_box.hide()
+    close(window)
+
+
+def test_bigger_font_does_not_smear_the_band_labels(qt_app):
+    """字号调大之后，标签的"三级降级 + 错行避让"还得成立。
+
+    放大等于把同一批标签塞进更小的空间，降级链本来就是为这个设计的——要么排得
+    开、要么退成泳道号、要么整批隐藏，就是不许糊成一团。
+    """
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))
+    set_roi_and_quantify(window)
+    canvas = window.canvas
+    for point_size in (9.0, 11.0, 14.0):
+        with with_font(window, point_size):
+            for scale in (0.5, 1.0, 2.0):
+                zoom_to(canvas, scale)
+                render(canvas, qt_app)
+                assert not label_overlaps(canvas), (
+                    f"{point_size} pt / {scale:.0%} 下标签互相压住了"
+                )
+                rects = canvas.band_label_rects()
+                assert len(rects) in (0, len(window._result.measurements)), (
+                    f"{point_size} pt / {scale:.0%} 下只画了一部分标签"
+                )
+                left = canvas.mapFromScene(QPointF(0.0, 0.0)).x()
+                right = canvas.mapFromScene(QPointF(float(canvas._image_w), 0.0)).x()
+                for rect in rects:
+                    assert rect.left() >= left - 1 and rect.right() <= right + 1, (
+                        f"{point_size} pt 下标签探出了图像边界"
+                    )
+    close(window)
+
+
+def line_widths(window: MainWindow) -> dict:
+    canvas = window.canvas
+    plain = [b for b in canvas._band_items if not b.isSelected() and b.is_adopted()]
+    selected = [b for b in canvas._band_items if b.isSelected()]
+    assert plain and selected, "这条用例要同时看到一个选中框和一个普通框"
+    return {
+        "roi": canvas._roi_item.pen().widthF(),
+        "band": plain[0].pen().widthF(),
+        "band_selected": selected[0].pen().widthF(),
+    }
+
+
+def test_line_width_setting_keeps_every_distinction(qt_app):
+    """1× / 2× 各测一遍：线宽跟着变，靠"更粗"表达的区分一个都不许失效。
+
+    画布上颜色（红 / 橙 / 钢蓝）和形状（角标 / 斜纹 / 虚线）已经排满了，"更粗"
+    是仅剩的通道——被自检点名的分隔线、选中的条带框都靠它。所以线宽只能做成
+    倍数：做成绝对像素，用户把基础线宽调到 5，被点名那条就再也看不出来了。
+    """
+    window = cut_separator_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    qt_app.processEvents()
+    assert window.canvas.flagged_separators() == [0], "前置条件：第 0 条线被点名"
+    window.canvas._band_items[0].setSelected(True)
+    qt_app.processEvents()
+
+    measured = {}
+    for scale in (1.0, 2.0):
+        window.apply_ui_prefs(
+            replace(
+                window.ui_prefs(),
+                roi_line=scale,
+                band_line=scale,
+                separator_line=scale,
+            ),
+            persist=False,
+        )
+        qt_app.processEvents()
+        render(window.canvas, qt_app)
+        flagged = separator_pen(window, 0)
+        plain = separator_pen(window, 1)
+        widths = line_widths(window)
+        measured[scale] = (widths, flagged.widthF(), plain.widthF())
+
+        assert flagged.widthF() > plain.widthF(), (
+            f"{scale}× 下被点名的分隔线不再比别的粗，区分没了"
+        )
+        assert flagged.color() == canvas_mod.SEPARATOR_FLAG_COLOR
+        assert plain.color() == canvas_mod.SEPARATOR_COLOR
+        assert widths["band_selected"] > widths["band"], (
+            f"{scale}× 下选中的条带框不再比别的粗"
+        )
+
+    for key in ("roi", "band", "band_selected"):
+        assert measured[2.0][0][key] == pytest.approx(measured[1.0][0][key] * 2.0), (
+            f"{key} 没有按倍数缩放"
+        )
+    assert measured[2.0][1] == pytest.approx(measured[1.0][1] * 2.0)
+
+    window.apply_ui_prefs(prefs_mod.DEFAULTS, persist=False)
+    close(window)
+
+
+def test_unused_and_flagged_survive_a_thicker_pen(qt_app):
+    """线宽调大之后，虚线（未采用）与角标（被点名）这两个通道还在。"""
+    window = clipped_roi_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    window.normalize_panel.set_band_pick("top")
+    window.apply_ui_prefs(
+        replace(window.ui_prefs(), band_line=2.5, separator_line=2.5), persist=False
+    )
+    qt_app.processEvents()
+    render(window.canvas, qt_app)
+
+    dashed = [b for b in window.canvas._band_items if not b.is_adopted()]
+    assert all(b.pen().style() == Qt.PenStyle.DashLine for b in dashed)
+    for index in window.canvas.flagged_bands():
+        box = next(b for b in window.canvas._band_items if b.index == index)
+        assert box.flag is not None and box.flag._color == box._base, (
+            "角标仍然用条带框自己的颜色，没有冒出第五种颜色"
+        )
+    window.apply_ui_prefs(prefs_mod.DEFAULTS, persist=False)
+    close(window)
+
+
+def test_settings_dialog_applies_live_and_restores_defaults(qt_app):
+    """设置对话框：改一下就生效，「恢复默认」一键退回出厂值。"""
+    window = make_window(qt_app)
+    window.show()
+    window.act_settings.trigger()
+    qt_app.processEvents()
+    dialog = window._settings_dialog
+    assert dialog is not None and dialog.isVisible()
+    render(dialog, qt_app)
+
+    dialog._font_spin.setValue(13.0)
+    dialog._line_spins["separator_line"].setValue(2.0)
+    dialog._column_checks["x"].setChecked(True)
+    qt_app.processEvents()
+    assert window.ui_prefs().font_pt == pytest.approx(13.0)
+    assert window.ui_prefs().separator_line == pytest.approx(2.0)
+    assert "x" in window.results_panel.visible_columns()
+    render(window, qt_app)
+
+    dialog.restore_defaults()
+    qt_app.processEvents()
+    assert window.ui_prefs() == prefs_mod.DEFAULTS
+    assert window.results_panel.visible_columns() == DEFAULT_RESULT_COLUMNS
+    assert window.canvas.annotation_scales() == (1.0, 1.0, 1.0, 1.0)
+    render(window, qt_app)
+    close(window)
+
+
+def test_prefs_round_trip_through_qsettings(qt_app):
+    """全部设置项都要持久化，包括"一列可选列都不勾"这种空值。"""
+    settings = QSettings("WBAnalyzer", "WBAnalyzer")
+    wanted = prefs_mod.UiPrefs(
+        font_pt=12.5,
+        roi_line=1.5,
+        band_line=0.75,
+        separator_line=2.25,
+        result_columns=(),
+    )
+    prefs_mod.save(wanted, settings)
+    settings.sync()
+    assert prefs_mod.load(settings) == wanted, (
+        "空列表经 INI 往返会变成 None，那样“一列都不勾”会被当成“没设置过”"
+    )
+
+    prefs_mod.save(prefs_mod.DEFAULTS, settings)
+    settings.sync()
+    assert prefs_mod.load(settings) == prefs_mod.DEFAULTS
+
+
+def test_prefs_are_clamped_not_trusted(qt_app):
+    """设置文件是可以手改的：越界与垃圾值一律夹回来，不能让界面崩掉。"""
+    settings = QSettings("WBAnalyzer", "WBAnalyzer")
+    settings.setValue(prefs_mod.KEY_FONT_PT, 999.0)
+    settings.setValue(prefs_mod.KEY_ROI_LINE, "abc")
+    settings.setValue(prefs_mod.KEY_SEPARATOR_LINE, -3.0)
+    settings.setValue(prefs_mod.KEY_RESULT_COLUMNS, "x,不存在的列")
+    settings.sync()
+    loaded = prefs_mod.load(settings)
+    assert loaded.font_pt == prefs_mod.MAX_FONT_PT
+    assert loaded.roi_line == prefs_mod.DEFAULT_LINE_SCALE
+    assert loaded.separator_line == prefs_mod.MIN_LINE_SCALE
+    assert loaded.result_columns == ("x",)
+
+    prefs_mod.save(prefs_mod.DEFAULTS, settings)
+    settings.sync()
+
+
+# ---------------------------------------------------------------- 五、关闭当前图片
+
+
+class auto_answer:  # noqa: N801 - 当上下文管理器用，名字按动作读
+    """把挽留对话框自动答掉，并记下问了几次。
+
+    离屏下 QMessageBox.question 照样是模态的：不接住它，用例会挂到超时。挽留的
+    文案与触发条件另有用例专门盯。
+    """
+
+    def __init__(self, answer=QMessageBox.StandardButton.Yes) -> None:
+        self.answer = answer
+        self.asked = 0
+
+    def __enter__(self):
+        self._original = QMessageBox.question
+
+        def ask(*_args, **_kwargs):
+            self.asked += 1
+            return self.answer
+
+        QMessageBox.question = ask
+        return self
+
+    def __exit__(self, *_exc):
+        QMessageBox.question = self._original
+        return False
+
+
+def document_is_empty(window: MainWindow) -> list[str]:
+    """还有哪些"上一张图的痕迹"没清掉。空列表 = 干净的空状态。"""
+    leftovers: list[str] = []
+    if any(
+        blot is not None
+        for blot in (window._blot, window._blot_original, window._blot_loaded)
+    ):
+        leftovers.append("三层图像里还留着东西")
+    if window.canvas.has_image():
+        leftovers.append("画布上还有图")
+    if window._roi is not None or window._separators:
+        leftovers.append("ROI / 分隔线还在")
+    if window.canvas._band_items:
+        leftovers.append("画布上还有条带框")
+    if window._result is not None or window.results_panel.table.rowCount():
+        leftovers.append("结果还在")
+    if window.profile_panel._profile is not None or window.profile_panel._labels:
+        leftovers.append("剖面还在")
+    if window._undo or window._redo:
+        leftovers.append("撤销栈没清")
+    if window.diagnostics.isVisible():
+        leftovers.append("诊断条还挂着")
+    if window.windowTitle() != mw.APP_TITLE:
+        leftovers.append(f"标题还是「{window.windowTitle()}」")
+    if window._column_profile is not None:
+        leftovers.append("横向剖面数据还在")
+    return leftovers
+
+
+def test_the_close_action_sits_where_people_look_for_it(qt_app):
+    """文件菜单 + 主工具栏都有入口，Ctrl+W，没有图时禁用。"""
+    window = make_window(qt_app)
+    assert window.act_close.shortcut() == QKeySequence("Ctrl+W")
+    assert window.act_close in window.file_menu.actions(), "文件菜单里要有"
+    toolbar = window.findChild(QToolBar, "mainToolbar")
+    actions = toolbar.actions()
+    assert window.act_close in actions, "工具栏上要有直观的关闭入口，藏进菜单等于没有"
+    assert actions.index(window.act_close) == actions.index(window.act_open) + 1, (
+        "就该紧挨着“打开”——那是用户找它的第一个地方"
+    )
+    assert not window.act_close.isEnabled(), "没有图时不该能点"
+
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    window._update_action_states()
+    assert window.act_close.isEnabled()
+    close(window)
+
+
+def test_closing_the_image_empties_the_document_but_not_the_history(qt_app):
+    """关闭 = 复位到空状态；归一化历史一行都不许少。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    window.setWindowTitle(f"{mw.APP_TITLE} — actin.tif")
+    set_roi_and_quantify(window)
+    add_history(window, "loading_control", "Actin")
+    assert len(window._session.entries) == 1, "前置条件：历史里有一条内参"
+    assert window._result is not None and window.results_panel.table.rowCount()
+
+    with auto_answer() as dialog:  # 挽留另有用例专门测，这里只看复位干不干净
+        window.act_close.trigger()
+        qt_app.processEvents()
+    assert dialog.asked == 1, "有没导出的结果，关之前得问一句"
+    assert document_is_empty(window) == []
+    assert len(window._session.entries) == 1, (
+        "关图丢历史的话，内参和目标分开拍在两张膜上的跨膜归一化根本做不成"
+    )
+    assert window.normalize_panel.history_table.rowCount() == 1
+    assert "归一化历史保留" in window._hint_label.text()
+    close(window)
+
+
+def test_the_empty_state_is_a_state_you_can_sit_in(qt_app):
+    """关掉之后界面照常待着：面板空、要图的动作禁用、渲染不报错。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    window.resize(1300, 880)
+    window.show()
+    qt_app.processEvents()
+    with auto_answer():
+        assert window._close_document() is True
+
+    render(window, qt_app)
+    render(window.profile_panel, qt_app)
+    render(window.results_panel, qt_app)
+    render(window.canvas, qt_app)
+    for action in (
+        window.act_close,
+        window.act_quant,
+        window.act_auto,
+        window.act_export_data,
+        window.act_export_figure,
+        window.act_fit,
+        window.act_100,
+        window.act_zoom_roi,
+        window.act_delete,
+        window.act_undo,
+        window.act_rot_left,
+    ):
+        assert not action.isEnabled(), f"没有图时「{action.text()}」不该还能点"
+    assert window.act_open.isEnabled(), "总得能再开一张"
+    assert not window.act_close.isEnabled()
+    # 空状态下再关一次：什么都不该发生，更不许抛异常
+    with auto_answer() as dialog:
+        assert window._close_document() is False
+    assert dialog.asked == 0, "本来就没有图，没什么可挽留的"
+    assert "没有打开的图片" in window._hint_label.text()
+    assert document_is_empty(window) == []
+    close(window)
+
+
+def test_the_cross_membrane_workflow_survives_closing(qt_app):
+    """用户的真实流程：开 A 膜 → 加为内参 → 关掉 → 开 B 膜 → 加目标 → 出比值。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    add_history(window, "loading_control", "Actin")
+    window._results_dirty = False
+    assert window._close_document() is True
+
+    load_array(window, synthetic_raw([18000.0, 9000.0, 4500.0]))
+    set_roi_and_quantify(window)
+    add_history(window, "target", "CITH3")
+    assert [e.name for e in window._session.entries] == ["Actin", "CITH3"]
+    assert window.normalize_panel.result_table.rowCount() == 3, (
+        "两张膜的记录必须能配上对，否则跨膜归一化白做"
+    )
+    assert [result_cell(window, row, 1) for row in range(3)] == ["1", "2", "3"]
+    ratios = [result_cell(window, row, 4) for row in range(3)]  # 归一化列
+    assert all(float(text.replace(",", "")) > 0 for text in ratios), (
+        f"跨膜归一化没算出比值：{ratios}"
+    )
+    render(window.normalize_panel, qt_app)
+    close(window)
+
+
+def test_closing_says_what_gets_lost_worst_first(qt_app, monkeypatch):
+    """挽留：先说"没加入归一化历史"，再说"没导出"。答"否"就一点都不动。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    total = len(window._result.measurements)
+    asked: list[tuple[str, str]] = []
+    answer = {"value": QMessageBox.StandardButton.No}
+
+    def ask(_parent, title, text, *_a, **_k):
+        asked.append((title, text))
+        return answer["value"]
+
+    monkeypatch.setattr(QMessageBox, "question", ask)
+    assert window._close_document() is False
+    assert window._blot is not None, "被挽留后图必须还在"
+    assert window._result is not None
+    assert len(asked) == 1
+    title, text = asked[0]
+    assert title == "关闭当前图片"
+    assert f"这张膜的 {total} 个条带还没加入归一化历史" in text
+    assert "尚未导出" in text
+    assert text.index("归一化历史") < text.index("尚未导出"), (
+        "跨膜流程里“没加入历史”比“没导出”损失大，得排在前面"
+    )
+    assert "确定要关闭这张图片吗？" in text
+
+    answer["value"] = QMessageBox.StandardButton.Yes
+    assert window._close_document() is True
+    assert len(asked) == 2
+    assert document_is_empty(window) == []
+    close(window)
+
+
+def test_closing_stops_nagging_once_the_bands_are_safe(qt_app, monkeypatch):
+    """加入历史又导出过了，就没什么可挽留的——不许每次关图都弹一次。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    add_history(window, "loading_control", "Actin")
+    assert window._unhistoried_band_count() == 0, "加过历史就不该再算作会丢的东西"
+
+    window._results_dirty = False  # 等价于"已经导出过"
+    asked: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda _p, title, *_a, **_k: asked.append(title)
+        or QMessageBox.StandardButton.Yes,
+    )
+    assert window._close_document() is True
+    assert asked == [], "没有任何损失时弹窗只是噪音"
+    assert document_is_empty(window) == []
+    close(window)
+
+
+def test_reopening_after_a_close_does_not_inherit_the_old_document(qt_app):
+    """复位是给多文档复用的：关掉再开，旧图的 ROI / 结果 / 撤销栈都不许跟过来。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    before = window._doc_version
+    stale_token = fake_inflight_job(window, mw.JOB_QUANTIFY)
+    with auto_answer():
+        assert window._close_document() is True
+    assert window._doc_version > before, "文档版本得往前走，旧任务的回调才认得出过期"
+    assert not window._job_is_current(stale_token), "关图后旧任务的令牌必须失效"
+
+    load_array(window, synthetic_raw([9000.0, 6000.0]))
+    assert window._roi is None and not window._undo
+    set_roi_and_quantify(window)
+    assert {lane for lane, _band, _value in bands(window)} == {1, 2}
     close(window)

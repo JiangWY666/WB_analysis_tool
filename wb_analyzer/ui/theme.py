@@ -356,14 +356,26 @@ QCheckBox:disabled, QRadioButton:disabled {{
     color: {TEXT_DISABLED};
 }}
 
+/* 关闭 / 浮动按钮以前被 `titlebar-close-icon: none` 抹成了透明——按钮还在、
+   还能点，只是看不见。用户"不小心把面板拖出去又关掉"多半就是这么来的。
+   现在交回 Qt 画标准图标，并给足够大的命中区与悬停反馈。 */
 QDockWidget {{
     color: {TEXT};
-    titlebar-close-icon: none;
 }}
 QDockWidget::title {{
     background: {BG_PANEL};
     padding: 5px 10px;
     border-bottom: 1px solid {BG_BASE};
+}}
+QDockWidget::close-button, QDockWidget::float-button {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 0;
+}}
+QDockWidget::close-button:hover, QDockWidget::float-button:hover {{
+    background: {BG_RAISED};
+    border-color: {BORDER_LIGHT};
 }}
 
 QMenuBar {{
@@ -454,11 +466,16 @@ QLabel#dimHint {{
 """
 
 
-def app_font() -> QFont:
-    """带回退族的界面字体：雅黑缺失时不至于掉成方框。"""
+def app_font(point_size: float | None = None) -> QFont:
+    """带回退族的界面字体：雅黑缺失时不至于掉成方框。
+
+    ``point_size`` 给了就用它（界面设置里的"字体大小"），否则用主题默认值。
+    """
     font = QFont(FONT_FAMILIES[0])
     font.setFamilies(list(FONT_FAMILIES))
-    font.setPointSizeF(FONT_POINT_SIZE)
+    font.setPointSizeF(
+        FONT_POINT_SIZE if point_size is None else max(1.0, float(point_size))
+    )
     return font
 
 

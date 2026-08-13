@@ -8,6 +8,17 @@
 
 放在画布上方而不是结果表里，是因为 ROI 自检要在用户**改 ROI 的时候**看得见，
 而那时候他多半停在"调整"页。横条只占一行，展开详情才长高，不遮挡画布。
+
+信息分三层，默认只露第一层：
+
+1. **一行摘要**——最严重那条的标题，加上"另有 N 项"。这一行**永不折行**，放不
+   下就省略号，全文进 tooltip。以前它是 wordWrap 的，三条诊断就能把横条撑成
+   一段话压在画布上。
+2. **详情**（点「详情」展开）——每条的标题 + 全文。``warning`` / ``info`` 默认
+   折叠：那是"看一眼摘要就知道要不要展开"的东西。
+3. ``error`` 是例外，**默认就展开**。它的含义是"这组数字不能用"，不是"注意
+   一下"；把它折进一个要点开的按钮里，等于赌用户会去点。用户仍可以随手收起，
+   也可以「我知道了」整条忽略——可以选择不看，不能看不见。
 """
 
 from __future__ import annotations
@@ -26,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import theme
+from .widgets import ElidedLabel
 
 SEVERITY_ERROR = "error"
 SEVERITY_WARNING = "warning"
@@ -44,6 +56,14 @@ DISMISS_TEXT = "我知道了"
 RESTORE_TEXT = "重新查看"
 DETAIL_SHOW = "详情 ▾"
 DETAIL_HIDE = "收起 ▴"
+
+# 详情区最多吃掉多少高度，再长就自己滚——诊断条不能把画布挤没了。
+# 两个值：用户**主动**点开时给足（他就是来读的）；``error`` 自动展开时只给一
+# 眼的量。核心层的判词常常是整段，实测用户那批膜上自动展开一次就占掉窗口高度
+# 的四分之一——那正是"分析时不想看大段文字"说的东西。前几行恰好是"该怎么办"
+# （"把 ROI 上边往上挪至少 10 px"），够用了，剩下的滚一下就有。
+DETAIL_MAX_H = 190
+DETAIL_PEEK_H = 96
 
 
 @dataclass(frozen=True)
@@ -78,17 +98,17 @@ class DiagnosticsBar(QFrame):
         self._severity: str | None = None
         self._key: object = None
         self._dismissed_key: object = None
-        self._expanded = False
+        # None = 跟随严重度（error 展开、其余折叠）；True / False = 用户就这批
+        # 诊断做过的显式选择，换一批诊断就作废
+        self._expanded: bool | None = None
         self._styled = ""  # 现在挂着哪个色的 QSS；重设样式表会连累整棵子树重算
 
         self._icon = QLabel()
         self._icon.setObjectName("diagIcon")
         self._chip = QLabel()
         self._chip.setObjectName("diagChip")
-        self._text = QLabel()
-        self._text.setWordWrap(True)
+        self._text = ElidedLabel()
         self._text.setObjectName("diagText")
-        self._text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         self._detail_button = QPushButton(DETAIL_SHOW)
         self._detail_button.setFlat(True)
@@ -120,8 +140,7 @@ class DiagnosticsBar(QFrame):
         self._scroll.setWidget(self._detail)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        # 详情最多吃掉这么高，再长就自己滚——诊断条不能把画布挤没了
-        self._scroll.setMaximumHeight(190)
+        self._scroll.setMaximumHeight(DETAIL_PEEK_H)
         self._scroll.setVisible(False)
 
         layout = QVBoxLayout(self)
@@ -150,6 +169,10 @@ class DiagnosticsBar(QFrame):
             else None
         )
         self._summary = summary or self._auto_summary()
+        if self._key != key:
+            # 换了一批诊断：用户上一次的展开 / 收起选择跟着作废，回到"按严重度
+            # 决定"。否则收起过一次警告详情，之后来的严重问题就再也不自动展开了。
+            self._expanded = None
         self._key = key
         if self._dismissed_key is not None and self._dismissed_key != key:
             self._dismissed_key = None  # 指纹变了，提示自己回来
@@ -161,7 +184,7 @@ class DiagnosticsBar(QFrame):
         self._summary = ""
         self._key = None
         self._dismissed_key = None
-        self._expanded = False
+        self._expanded = None
         self._refresh()
 
     # ------------------------------------------------------------------ 查询（测试与主窗口用）
@@ -187,8 +210,14 @@ class DiagnosticsBar(QFrame):
             return False
         return self._dismissed_key is not None and self._dismissed_key == self._key
 
+    def wants_detail(self) -> bool:
+        """这批诊断该不该展开详情——用户没表过态时按严重度决定。"""
+        if self._expanded is not None:
+            return self._expanded
+        return self._severity == SEVERITY_ERROR
+
     def is_expanded(self) -> bool:
-        return self._expanded and self._scroll.isVisibleTo(self)
+        return self.wants_detail() and self._scroll.isVisibleTo(self)
 
     def dismiss(self) -> None:
         self._on_dismiss_clicked()
@@ -200,27 +229,31 @@ class DiagnosticsBar(QFrame):
             self._dismissed_key = None
         else:
             self._dismissed_key = self._key
-            self._expanded = False
+        # 无论忽略还是重新查看，都回到"按严重度决定"：重新查看一条严重诊断时
+        # 该再展开一次，而不是沿用忽略之前那一下的收起状态
+        self._expanded = None
         self._refresh()
         self.dismissedChanged.emit(self.is_dismissed())
 
     def _toggle_detail(self) -> None:
-        self._expanded = not self._expanded
+        self._expanded = not self.wants_detail()
         self._refresh()
 
     # ------------------------------------------------------------------ 呈现
 
     def _auto_summary(self) -> str:
+        """一行摘要：最严重那条的标题 + 还有几条。全文在详情里。
+
+        以前这里把所有标题用「；」串成一句，三条诊断就是一段话——横条 wordWrap
+        之后长到三行压住画布，而用户在"分析"，没人要读这个。
+        """
         if not self._entries:
             return ""
         actionable = [e for e in self._entries if e.severity != SEVERITY_INFO]
         shown = actionable or list(self._entries)
-        label = LABELS[self._severity or SEVERITY_INFO]
-        return (
-            f"{self._prefix}{label}（{len(shown)} 项）："
-            + "；".join(e.title for e in shown)
-            + "。"
-        )
+        head = f"{self._prefix}：{shown[0].title}" if self._prefix else shown[0].title
+        rest = len(shown) - 1
+        return head + (f"（另有 {rest} 项）" if rest else "")
 
     def _refresh(self) -> None:
         if not self._summary and not self._entries:
@@ -265,21 +298,31 @@ class DiagnosticsBar(QFrame):
             self._text.setText(self._summary)
             self._detail_button.setVisible(True)
             self._dismiss_button.setVisible(True)
-        self._detail_button.setText(DETAIL_HIDE if self._expanded else DETAIL_SHOW)
+        expanded = self.wants_detail()
+        self._detail_button.setText(DETAIL_HIDE if expanded else DETAIL_SHOW)
         self._detail.setText(self._detail_html())
-        self._scroll.setVisible(self._expanded and bool(self._entries))
+        self._scroll.setMaximumHeight(
+            DETAIL_MAX_H if self._expanded else DETAIL_PEEK_H
+        )
+        self._scroll.setVisible(expanded and bool(self._entries))
 
     def _detail_html(self) -> str:
         rows = []
         for entry in self._entries:
             tint = COLORS.get(entry.severity, theme.TEXT_DIM)
-            title = html.escape(entry.title)
             detail = html.escape(entry.detail).replace("\n", "<br>")
+            head = ""
+            # 摘要那行已经把最严重那条的标题写出来了，详情里再写一遍就是同一句
+            # 话紧挨着出现两次——只在还有别的条目时才需要标题来分段
+            if entry.title not in self._summary:
+                head = (
+                    f'<span style="color:{tint};font-weight:600;">'
+                    f"{ICONS.get(entry.severity, '')} "
+                    f"{LABELS.get(entry.severity, '')}·{html.escape(entry.title)}"
+                    f"</span><br>"
+                )
             rows.append(
-                f'<p style="margin:0 0 8px 0;">'
-                f'<span style="color:{tint};font-weight:600;">'
-                f"{ICONS.get(entry.severity, '')} {LABELS.get(entry.severity, '')}·{title}"
-                f"</span><br>"
+                f'<p style="margin:0 0 8px 0;">{head}'
                 f'<span style="color:{theme.TEXT_DIM};">{detail}</span></p>'
             )
         return "".join(rows)

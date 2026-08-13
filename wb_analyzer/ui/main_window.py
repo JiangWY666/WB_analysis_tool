@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QStyle,
@@ -98,6 +100,8 @@ from ..roi_check import (
 )
 from ..tilt import estimate_tilt
 from . import errorlog
+from . import prefs as prefs_mod
+from . import theme
 from .canvas import BlotCanvas, Tool
 from .diagnostics_bar import DiagnosticsBar, Entry, entries_from_report
 from .figure_export_dialog import (
@@ -108,6 +112,8 @@ from .figure_export_dialog import (
 from .normalize_panel import NormalizePanel
 from .profile_panel import ProfilePanel
 from .results_panel import ResultsPanel
+from .settings_dialog import SettingsDialog
+from .widgets import ElidedLabel
 from .workers import cancel_all as cancel_workers
 from .workers import run_async
 
@@ -119,8 +125,14 @@ BG_MODES = (
     ("浅色条带 / 深底", "light_bands"),
 )
 
+APP_TITLE = "WB 灰度分析工具"
 MAX_RECENT = 5
 MAX_UNDO = 50
+# 停靠布局的持久化。版本号随"有哪些面板"递增：restoreState 认版本，对不上就
+# 整份丢弃、退回默认布局，而不是拿一份不认识的数据去摆位置。键名也和 0.4.0
+# 之前那份无版本的 win/state 分开，旧数据不会被误读。
+LAYOUT_STATE_KEY = "win/dock_state"
+LAYOUT_VERSION = 1
 # 关窗时最多等后台任务这么久，超时就放弃等待（已取消的任务不会再 emit）
 CLOSE_WAIT_MS = 4000
 
@@ -152,6 +164,23 @@ JOB_LABELS = {
 # ROI / 分隔线键盘微调步长（图像像素）
 NUDGE_STEP = 1.0
 NUDGE_STEP_FAST = 10.0
+
+ROTATION_TIP = (
+    f"微调角度，正值抬高右侧（纠正右低左高），范围 ±{MAX_STRAIGHTEN_ANGLE:.0f}°。\n"
+    "滑杆是 0.1° 一格的粗调，右边的数字框保留 2 位小数——自动测倾角与标尺都能"
+    "给到 0.01° 量级，1 位小数会白丢一位有效数字。\n"
+    "歪得更多请先用“编辑 → 旋转 90°”；也可以用标尺拖一条线后一键旋正。"
+)
+
+ROI_FIELD_MIN_PX = 72
+CONTROL_DOCK_MIN_PX = 380
+CONTROL_DOCK_MAX_PX = 560
+
+ROI_FIELD_TIP = (
+    "ROI 的位置与尺寸（图像像素）。鼠标拖动受缩放精度限制（20% 缩放时误差约"
+    " ±2.5 px），而 ROI 边界直接决定积分区间，需要精确值时在这里输入。\n"
+    "也可以点一下画布，用方向键微调 1 px、Shift+方向键 10 px、Ctrl+方向键改宽高。"
+)
 
 TILT_BUTTON_TIP = (
     "在当前 ROI 里自动测条带的倾角，只给建议、不自动旋转。\n"
@@ -236,6 +265,7 @@ _SHORTCUTS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         "文件与导出",
         (
             ("Ctrl+O", "打开图片"),
+            ("Ctrl+W", "关闭当前图片（归一化历史保留）"),
             ("Ctrl+E", "导出数据（CSV + 标注图）"),
             ("Ctrl+Shift+E", "导出展示图"),
             ("Ctrl+Q", "退出"),
@@ -262,6 +292,7 @@ _SHORTCUTS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         (
             ("Ctrl+Z", "撤销（含删除、清 ROI、旋转、切换定量路径）"),
             ("Ctrl+Y / Ctrl+Shift+Z", "重做"),
+            ("Ctrl+C", "复制选中条带为 TSV（结果表聚焦时；始终含全部 12 列）"),
             ("Delete", "删除选中条带（画布 / 结果表 / 历史表）；批量删除算一步撤销"),
             ("方向键", "微调 ROI 或最近动过的分隔线 1 px"),
             ("Shift+方向键", "同上，步长 10 px"),
@@ -283,6 +314,7 @@ _SHORTCUTS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("调整模式下拖拽空白", "框选多个条带（ROI 内需按住 Ctrl/Shift）"),
             ("双击 ROI 内空白", "添加分隔线（调整模式）"),
             ("Esc", "取消当前拖动 / 取消选中"),
+            ("Ctrl+,", "界面设置（字体大小、画布标注线宽、结果表列）"),
             ("F1", "打开本说明"),
         ),
     ),
@@ -354,6 +386,25 @@ def _under_split_warning(
         "多半是这几道的两条带挨得太近、连谷都没有，或者本来就只有一条。"
         "请对着底部剖面图确认，必要时收紧 ROI 高度、或用“补画条带”手动补一条。"
     )
+
+
+def _mixed_origin_headline(groups: list[str]) -> str:
+    """一句话判词：这些分组的比值算不出来。成因与做法留给诊断条详情。"""
+    return (
+        "⛔ 分组 "
+        + "、".join(f"“{g}”" for g in groups)
+        + " 混用了两套背景口径，归一化已拒绝给出比值。"
+    )
+
+
+MIXED_ORIGIN_DETAIL = (
+    "“ROI 定量”用的是橡皮筋基线，“自动检测”用的是环形中值局部背景，两套数字"
+    "不在同一个尺度上，相除得到的比值没有意义——所以核心层直接拒绝算，而不是算"
+    "一个看着正常的错数。\n"
+    "两侧的原始测量值照常显示、也照常能导出，被拒绝的只有比值那一列。\n"
+    "做法：挑一条路径，把这一组里的记录全部用它重新定量一遍再加入历史"
+    "（历史表的“口径”列写着每条记录是哪一套）。"
+)
 
 
 def _app_version() -> str:
@@ -664,7 +715,7 @@ def normalize_rows(session: AnalysisSession, control_lane: int):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("WB 灰度分析工具")
+        self.setWindowTitle(APP_TITLE)
         self.resize(1440, 900)
         self.setMinimumSize(1100, 680)
         self.setAcceptDrops(True)
@@ -732,6 +783,12 @@ class MainWindow(QMainWindow):
         self._pool = QThreadPool.globalInstance()
         self._wheel_guard = _WheelGuard(self)
         self._help_box = None
+        # 界面偏好（字体 / 线宽 / 结果表列）。这一句必须在任何控件建出来之前：
+        # 它把"进程启动时的应用字体"记下来，恢复默认要原样退回那一个。
+        prefs_mod.base_app_font()
+        self._prefs = prefs_mod.DEFAULTS
+        self._applied_font_scale = 1.0
+        self._settings_dialog = None
 
         self._rotate_timer = QTimer(self)
         self._rotate_timer.setSingleShot(True)
@@ -796,6 +853,17 @@ class MainWindow(QMainWindow):
             style.standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton), "打开", self
         )
         self.act_open.setShortcut(QKeySequence.StandardKey.Open)
+        # 关掉当前图之前只能"换一张"或"退出程序"，中间那一步一直是缺的
+        self.act_close = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton),
+            "关闭当前图片",
+            self,
+        )
+        self.act_close.setShortcut(QKeySequence("Ctrl+W"))
+        self.act_close.setToolTip(
+            "关闭当前图片（Ctrl+W），回到空白工作区。"
+            "归一化历史会保留，可以接着开下一张膜"
+        )
 
         self._tool_group = QActionGroup(self)
         self._tool_group.setExclusive(True)
@@ -867,6 +935,14 @@ class MainWindow(QMainWindow):
         self.act_guides = QAction("显示参考线", self)
         self.act_guides.setCheckable(True)
         self.act_guides.setChecked(True)
+        self.act_reset_layout = QAction("重置布局", self)
+        self.act_reset_layout.setToolTip(
+            "把控制面板与强度剖面拉回出厂位置（右侧 / 底部）并全部显示出来，"
+            "同时清掉记住的那份布局"
+        )
+        self.act_settings = QAction("界面设置…", self)
+        self.act_settings.setShortcut("Ctrl+,")
+        self.act_settings.setToolTip("字体大小、画布标注线宽、结果表显示哪几列")
         self.act_exit = QAction("退出", self)
         self.act_exit.setShortcut("Ctrl+Q")
         self.act_help = QAction("使用说明", self)
@@ -888,50 +964,38 @@ class MainWindow(QMainWindow):
         self.rotation_spin.setDecimals(2)
         self.rotation_spin.setSingleStep(0.1)  # 键盘 / 按钮步进仍是 0.1°，手点 0.01 太慢
         self.rotation_spin.setSuffix("°")  # sizeHint 会跟着 "-45.00°" 自己变宽
-        self.rotation_spin.setToolTip(
-            "微调角度，正值抬高右侧。保留 2 位小数：自动测倾角与标尺都能给到"
-            "0.01° 量级，左边的滑杆是 0.1° 一格的粗调。"
-        )
+        self.rotation_spin.setToolTip(ROTATION_TIP)
+        self.rotation_slider.setToolTip(ROTATION_TIP)
         zero_button = QPushButton("归零")
+        zero_button.setToolTip("把微调角度设回 0°（不影响 90° 整转）")
         zero_button.clicked.connect(lambda: self.rotation_spin.setValue(0.0))
         rotate_row = QHBoxLayout()
         rotate_row.addWidget(self.rotation_slider, 1)
         rotate_row.addWidget(self.rotation_spin)
         rotate_row.addWidget(zero_button)
-        rotate_hint = QLabel(
-            f"正值抬高右侧（纠正右低左高），范围 ±{MAX_STRAIGHTEN_ANGLE:.0f}°；"
-            "歪得更多请先用“编辑 → 旋转 90°”。也可用标尺拖线后一键旋正。"
-        )
-        rotate_hint.setWordWrap(True)
-        rotate_hint.setObjectName("dimHint")
-        self.ruler_label = QLabel("标尺：未测量")
+        self.ruler_label = ElidedLabel("标尺：未测量")
         self.tilt_button = QPushButton("自动测倾角")
         self.tilt_button.setToolTip(TILT_BUTTON_TIP)
         self.tilt_button.clicked.connect(self._measure_tilt)
-        tilt_row = QHBoxLayout()
-        tilt_row.addWidget(self.tilt_button)
-        tilt_row.addStretch(1)
-        tilt_hint = QLabel(
-            "测出角度只画一条参考线、不自动旋转。ROI 要框在条带上，"
-            "别贴着膜边或划痕——那些是贯穿全宽的强直线，算法会锁到它们身上，"
-            "而且照样给一个很自信的数字。看着线确认平行后再点下面的旋正。"
-        )
-        tilt_hint.setWordWrap(True)
-        tilt_hint.setObjectName("dimHint")
         ruler_row = QHBoxLayout()
         horizontal_button = QPushButton("旋正为水平")
         vertical_button = QPushButton("旋正为垂直")
+        for button in (horizontal_button, vertical_button):
+            button.setToolTip(
+                "把标尺量到（或自动测到）的那条线转成水平 / 垂直。"
+                "先确认画布上的虚线参考线确实与条带平行。"
+            )
         horizontal_button.clicked.connect(partial(self._apply_ruler, "horizontal"))
         vertical_button.clicked.connect(partial(self._apply_ruler, "vertical"))
         ruler_row.addWidget(horizontal_button)
         ruler_row.addWidget(vertical_button)
         ruler_row.addStretch(1)
+        tilt_row = QHBoxLayout()
+        tilt_row.addWidget(self.tilt_button)
+        tilt_row.addWidget(self.ruler_label, 1)
         rotate_layout = QVBoxLayout(rotate_box)
         rotate_layout.addLayout(rotate_row)
-        rotate_layout.addWidget(rotate_hint)
         rotate_layout.addLayout(tilt_row)
-        rotate_layout.addWidget(tilt_hint)
-        rotate_layout.addWidget(self.ruler_label)
         rotate_layout.addLayout(ruler_row)
 
         detect_box = QGroupBox("检测参数")
@@ -946,14 +1010,19 @@ class MainWindow(QMainWindow):
         weak_row.addWidget(conservative)
         weak_row.addWidget(self.weak_slider, 1)
         weak_row.addWidget(sensitive)
-        self.weak_hint = QLabel("当前：适中（漏检时可往右拖）")
+        self.weak_hint = ElidedLabel("当前：适中（漏检时可往右拖）")
         self.weak_hint.setObjectName("dimHint")
+        self.weak_slider.setToolTip(
+            "自动检测认定“这是一条带”的门槛。往右更灵敏（找得更全，也更容易把"
+            "噪声当条带），往左更保守。只影响“自动检测”，不影响 ROI 定量。"
+        )
         self.bg_combo = QComboBox()
         for label, _value in BG_MODES:
             self.bg_combo.addItem(label)
-        bg_hint = QLabel("普通白底深带选“深色条带”；黑底发光选“浅色条带”。一般保持自动即可。")
-        bg_hint.setWordWrap(True)
-        bg_hint.setObjectName("dimHint")
+        self.bg_combo.setToolTip(
+            "普通白底深带选“深色条带”；黑底化学发光选“浅色条带”。一般保持自动即可——"
+            "自动是按原生位深的直方图判的，只有在整张图几乎被条带占满时才会判错。"
+        )
         detect_form = QFormLayout()
         detect_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         detect_form.addRow("弱条带检出", weak_row)
@@ -961,7 +1030,6 @@ class MainWindow(QMainWindow):
         detect_form.addRow("条带颜色", self.bg_combo)
         detect_layout = QVBoxLayout(detect_box)
         detect_layout.addLayout(detect_form)
-        detect_layout.addWidget(bg_hint)
 
         roi_box = QGroupBox("ROI 与泳道")
         self.lane_spin = QSpinBox()
@@ -977,23 +1045,41 @@ class MainWindow(QMainWindow):
         self.band_spin.setSpecialValueText("自动")
         self.band_spin.setToolTip(BAND_COUNT_TIP)
         # ROI 数值框：鼠标拖动受缩放精度限制（20% 缩放时误差 ±2.5 图像像素），
-        # 而 ROI 边界直接决定积分区间，需要能精确输入
+        # 而 ROI 边界直接决定积分区间，需要能精确输入。
+        #
+        # 排成 2×2 而不是一行四个：一行四个（4 个 74 px 的框 + 4 个标签）最小要
+        # 488 px，而右侧停靠区视口只有 400 出头——整个「调整」页因此永远挂着一
+        # 条横向滚动条，把「归零」按钮和这几个框的右半截推到视口外。宽度也不再
+        # 写死，改成随字号伸缩，字体调大时不会把数字挤掉。
         self.roi_spins: dict[str, QSpinBox] = {}
-        roi_grid = QHBoxLayout()
-        roi_grid.setSpacing(4)
-        for key, label in (("x", "X"), ("y", "Y"), ("w", "宽"), ("h", "高")):
+        roi_grid = QGridLayout()
+        roi_grid.setContentsMargins(0, 0, 0, 0)
+        roi_grid.setHorizontalSpacing(6)
+        roi_grid.setVerticalSpacing(4)
+        for position, (key, label) in enumerate(
+            (("x", "X"), ("w", "宽"), ("y", "Y"), ("h", "高"))
+        ):
             spin = QSpinBox()
             spin.setRange(0 if key in ("x", "y") else 1, 999999)
             spin.setKeyboardTracking(False)  # 打字中途不要每敲一位就重算
             spin.setEnabled(False)
-            spin.setFixedWidth(74)
+            spin.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            )
+            # QSpinBox 的 minimumSizeHint 按上限的位数算：0..999999 要 145 px，
+            # 四个就再也塞不进停靠区。显式给一个下限压过它——真实取值是三四位
+            # 数，而且这几个框是 Expanding 的，宽度够时照样铺满。
+            spin.setMinimumWidth(ROI_FIELD_MIN_PX)
+            spin.setToolTip(ROI_FIELD_TIP)
             spin.valueChanged.connect(self._on_roi_field_changed)
             spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             spin.installEventFilter(self._wheel_guard)
             self.roi_spins[key] = spin
-            roi_grid.addWidget(QLabel(label))
-            roi_grid.addWidget(spin)
-        roi_grid.addStretch(1)
+            row, column = divmod(position, 2)
+            roi_grid.addWidget(QLabel(label), row, column * 2)
+            roi_grid.addWidget(spin, row, column * 2 + 1)
+        roi_grid.setColumnStretch(1, 1)
+        roi_grid.setColumnStretch(3, 1)
         self.snap_check = QCheckBox("分隔线吸附到剖面谷底")
         self.snap_check.setChecked(True)
         self.snap_check.setToolTip(
@@ -1002,35 +1088,40 @@ class MainWindow(QMainWindow):
         )
         self.snap_check.toggled.connect(self._on_snap_toggled)
         peaks_button = QPushButton("按剖面峰谷划分")
+        peaks_button.setToolTip("丢掉手动挪过的分隔线，按当前剖面的峰谷重新划分泳道")
         peaks_button.clicked.connect(self._reset_separators)
         clear_roi_button = QPushButton("清除 ROI")
         clear_roi_button.clicked.connect(self.act_clear_roi.trigger)
+        clear_roi_button.setToolTip(self.act_clear_roi.toolTip())
         roi_form = QFormLayout()
         roi_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         roi_form.addRow("期望泳道数", self.lane_spin)
         roi_form.addRow("每道条带数", self.band_spin)
-        roi_form.addRow("ROI 位置尺寸", roi_grid)
-        roi_hint = QLabel("方向键微调 1 px，Shift+方向键 10 px（先点一下画布）。")
-        roi_hint.setWordWrap(True)
-        roi_hint.setObjectName("dimHint")
+        # 整行跨两列：留一个「ROI 位置尺寸」的表单标签要吃掉 150 px（大字号下更
+        # 多），而 X / Y / 宽 / 高 四个小标签已经说清楚了这是什么
+        roi_form.addRow(roi_grid)
+        roi_buttons = QHBoxLayout()
+        roi_buttons.addWidget(peaks_button)
+        roi_buttons.addWidget(clear_roi_button)
         roi_layout = QVBoxLayout(roi_box)
         roi_layout.addLayout(roi_form)
-        roi_layout.addWidget(roi_hint)
         roi_layout.addWidget(self.snap_check)
-        roi_layout.addWidget(peaks_button)
-        roi_layout.addWidget(clear_roi_button)
+        roi_layout.addLayout(roi_buttons)
 
         display_box = QGroupBox("显示")
+        display_box.setToolTip(
+            "展示图的位深、灰度映射与标注图层在“导出展示图”（Ctrl+Shift+E）里选；"
+            "界面字体与画布线宽在“视图 → 界面设置”里调。"
+        )
         self.guides_check = QCheckBox("显示参考线")
         self.guides_check.setChecked(True)
-        display_hint = QLabel(
-            "展示图的位深、灰度映射、标注图层在“导出展示图”（Ctrl+Shift+E）里选。"
-        )
-        display_hint.setWordWrap(True)
-        display_hint.setObjectName("dimHint")
+        self.guides_check.setToolTip("画布中心的十字虚线，用来目测图有没有摆正")
+        settings_button = QPushButton("界面设置…")
+        settings_button.setToolTip("字体大小、画布标注线宽、结果表显示哪几列")
+        settings_button.clicked.connect(self._show_settings)
         display_layout = QVBoxLayout(display_box)
         display_layout.addWidget(self.guides_check)
-        display_layout.addWidget(display_hint)
+        display_layout.addWidget(settings_button)
 
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -1065,18 +1156,56 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._adjust_tab, "调整")
         tabs.addTab(self.results_panel, "结果")
         tabs.addTab(self.normalize_panel, "归一化")
-        tabs.setMinimumWidth(380)
+        tabs.setMinimumWidth(CONTROL_DOCK_MIN_PX)
         self._tabs = tabs
 
         self._control_dock = QDockWidget("控制面板", self)
         self._control_dock.setObjectName("controlDock")
         self._control_dock.setWidget(tabs)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._control_dock)
 
         self._profile_dock = QDockWidget("强度剖面", self)
         self._profile_dock.setObjectName("profileDock")
         self._profile_dock.setWidget(self.profile_panel)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._profile_dock)
+
+        # 停靠位置、允许区域与特性显式写出来：默认值本来就够用，但"浮动之后拖
+        # 不回去"通常正是被某个 setAllowedAreas / setFeatures 收紧害的，写在这
+        # 里才有一个地方可以断言。四面都允许 + Movable|Floatable|Closable =
+        # 双击标题栏能回到停靠位、拖到边缘会吸附。
+        for dock, area in self._dock_defaults():
+            dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+            dock.setFeatures(
+                QDockWidget.DockWidgetFeature.DockWidgetMovable
+                | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+                | QDockWidget.DockWidgetFeature.DockWidgetClosable
+            )
+            self.addDockWidget(area, dock)
+
+    def _dock_defaults(self) -> tuple[tuple[QDockWidget, Qt.DockWidgetArea], ...]:
+        """每个停靠面板的出厂位置——「重置布局」照着它复原。"""
+        return (
+            (self._control_dock, Qt.DockWidgetArea.RightDockWidgetArea),
+            (self._profile_dock, Qt.DockWidgetArea.BottomDockWidgetArea),
+        )
+
+    def _reset_layout(self) -> None:
+        """把停靠面板全部拉回出厂位置并显示出来。
+
+        这是用户把布局拖乱之后的唯一逃生口，所以它必须比"恢复上次布局"更强：
+        连**持久化的那份**一起清掉。否则用户存了一个坏布局，下次启动 restoreState
+        又把它读回来，重置就成了只管一次的安慰剂。
+        """
+        for dock, area in self._dock_defaults():
+            dock.setFloating(False)
+            self.removeDockWidget(dock)
+            self.addDockWidget(area, dock)
+            dock.show()
+        self.resizeDocks(
+            [self._control_dock], [420], Qt.Orientation.Horizontal
+        )
+        self.resizeDocks([self._profile_dock], [260], Qt.Orientation.Vertical)
+        settings = QSettings("WBAnalyzer", "WBAnalyzer")
+        settings.remove(LAYOUT_STATE_KEY)
+        self._set_status("已重置布局：控制面板回到右侧、强度剖面回到底部。")
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("主工具栏", self)
@@ -1086,6 +1215,8 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         toolbar.addAction(self.act_open)
+        # 关闭入口就摆在"打开"旁边：这是用户找它的第一个地方，藏进菜单等于没有
+        toolbar.addAction(self.act_close)
         toolbar.addSeparator()
         for action in self._tool_group.actions():
             toolbar.addAction(action)
@@ -1107,15 +1238,19 @@ class MainWindow(QMainWindow):
     def _build_menus(self) -> None:
         menubar = self.menuBar()
 
-        file_menu = menubar.addMenu("文件(&F)")
-        file_menu.addAction(self.act_open)
-        self._recent_menu = file_menu.addMenu("最近文件")
+        # 菜单对象自己留一份引用：只让 menubar 持有的话，事后想按标题找回来只能走
+        # action.menu()，那条路会拿到 shiboken 里的陈旧包装（"C++ object already
+        # deleted"），在测试里尤其容易撞上。
+        self.file_menu = menubar.addMenu("文件(&F)")
+        self.file_menu.addAction(self.act_open)
+        self._recent_menu = self.file_menu.addMenu("最近文件")
         self._recent_menu.setToolTipsVisible(True)
-        file_menu.addSeparator()
-        file_menu.addAction(self.act_export_data)
-        file_menu.addAction(self.act_export_figure)
-        file_menu.addSeparator()
-        file_menu.addAction(self.act_exit)
+        self.file_menu.addAction(self.act_close)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.act_export_data)
+        self.file_menu.addAction(self.act_export_figure)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.act_exit)
 
         edit_menu = menubar.addMenu("编辑(&E)")
         edit_menu.addAction(self.act_undo)
@@ -1135,18 +1270,29 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction(self.act_guides)
         view_menu.addSeparator()
-        profile_toggle = self._profile_dock.toggleViewAction()
-        profile_toggle.setText("强度剖面面板")
-        view_menu.addAction(profile_toggle)
-        control_toggle = self._control_dock.toggleViewAction()
-        control_toggle.setText("控制面板")
-        view_menu.addAction(control_toggle)
+        # 面板开关单独收进一个子菜单：以前它们混在一串缩放动作后面，关掉面板的
+        # 用户在这一长条里认不出哪一项是"把它加回来"。
+        self.panels_menu = view_menu.addMenu("面板(&P)")
+        self.panels_menu.setToolTipsVisible(True)
+        for dock, _area in self._dock_defaults():
+            action = dock.toggleViewAction()
+            action.setText(dock.windowTitle())
+            action.setToolTip(f"显示 / 隐藏“{dock.windowTitle()}”（可再拖回任意一边停靠）")
+            self.panels_menu.addAction(action)
+        self.panels_menu.addSeparator()
+        self.panels_menu.addAction(self.act_reset_layout)
+        view_menu.addAction(self.act_reset_layout)
+        view_menu.addSeparator()
+        view_menu.addAction(self.act_settings)
 
         help_menu = menubar.addMenu("帮助(&H)")
         help_menu.addAction(self.act_help)
 
     def _build_statusbar(self) -> None:
-        self._hint_label = QLabel()
+        # 状态栏文案有时不短（比如"已忽略本次自检提示…"）。用省略标签而不是普通
+        # QLabel：普通 QLabel 会在控件边缘硬切，看不出后面还有字；省略号至少能
+        # 告诉用户"还有"，全文挂在 tooltip 上。
+        self._hint_label = ElidedLabel()
         self.statusBar().addWidget(self._hint_label, 1)
         self._busy_bar = QProgressBar()
         self._busy_bar.setRange(0, 0)  # 不确定进度
@@ -1234,6 +1380,7 @@ class MainWindow(QMainWindow):
         self.guides_check.toggled.connect(self.act_guides.setChecked)
 
         self.act_open.triggered.connect(self._choose_image)
+        self.act_close.triggered.connect(self._close_document)
         self._tool_group.triggered.connect(self._on_tool_action)
         self.act_auto.triggered.connect(lambda: self._run_auto())
         self.act_quant.triggered.connect(lambda: self._run_quantify())
@@ -1251,8 +1398,107 @@ class MainWindow(QMainWindow):
         self.act_rot_left.triggered.connect(partial(self._rotate_90, False))
         self.act_rot_right.triggered.connect(partial(self._rotate_90, True))
         self.act_guides.toggled.connect(self._on_guides_toggled)
+        self.act_reset_layout.triggered.connect(self._reset_layout)
+        self.act_settings.triggered.connect(self._show_settings)
         self.act_exit.triggered.connect(self.close)
         self.act_help.triggered.connect(self._show_help)
+
+    # ------------------------------------------------------------------ 界面设置
+
+    def ui_prefs(self) -> prefs_mod.UiPrefs:
+        return self._prefs
+
+    def apply_ui_prefs(self, value: prefs_mod.UiPrefs, persist: bool = True) -> None:
+        """应用一份界面偏好：字体、画布线宽、结果表列。"""
+        value = value.sanitized()
+        self._prefs = value
+        self._apply_font_scale(value)
+        self.canvas.set_annotation_scales(
+            roi=value.roi_line,
+            band=value.band_line,
+            separator=value.separator_line,
+            font=value.font_scale,
+        )
+        self.profile_panel.set_font_scale(value.font_scale)
+        self.results_panel.set_optional_columns(value.result_columns)
+        self._sync_control_dock_width()
+        if persist:
+            prefs_mod.save(value)
+
+    def _sync_control_dock_width(self) -> None:
+        """让停靠区至少宽到「调整」页排得开、结果表看得全。
+
+        字号调大之后控件都变宽，宽度不跟着走就只能长出一条横向滚动条——而横向
+        滚动条正是这一轮要消灭的东西：它会把「归零」按钮和 ROI 数值框的右半截
+        推到视口外。宁可让面板占掉画布几十个像素，那是看得见也拖得动的。
+
+        结果表那一路要封顶：用户把 12 列全勾上时它想要 900 px，那已经不是"看不
+        全"而是他自己要了这么多列，让表格滚动比把画布吞掉合理。「调整」页那一路
+        不封顶——那条横向滚动条是这次要修的 bug 本身。
+        """
+        content = self._adjust_tab.widget()
+        if content is None:
+            return
+        gutter = self._adjust_tab.verticalScrollBar().sizeHint().width() + 4
+        need = max(CONTROL_DOCK_MIN_PX, content.minimumSizeHint().width() + gutter)
+        need = max(need, min(self.results_panel.preferred_width(), CONTROL_DOCK_MAX_PX))
+        self._tabs.setMinimumWidth(need)
+        # 光设最小宽度不够：主窗口只在下一次重新布局时才会照着它长，而"改完设置
+        # 立刻看效果"等不到那一次。当前窄了就直接撑开。
+        dock = self._control_dock
+        if dock.isVisible() and not dock.isFloating() and self._tabs.width() < need:
+            self.resizeDocks(
+                [dock],
+                [need + (dock.width() - self._tabs.width())],
+                Qt.Orientation.Horizontal,
+            )
+
+    def _scalable_widgets(self) -> list:
+        widgets = [self, *self.findChildren(QWidget)]
+        for dialog in (self._settings_dialog, self._help_box):
+            if dialog is not None:
+                widgets.append(dialog)
+                widgets.extend(dialog.findChildren(QWidget))
+        return widgets
+
+    def _apply_font_scale(self, value: prefs_mod.UiPrefs) -> None:
+        """把字号推到整棵控件树，外加应用级默认字体。
+
+        两处都要：应用级那份管的是消息框、文件对话框、tooltip 这些**没有父控件
+        字体可继承**的东西——这一轮把大量说明搬进了 tooltip，它跟着一起变大才
+        算数；逐控件那份管我们自己这棵树，因为装了全局 QSS 之后父级 setFont 传
+        不下去（见 :func:`prefs.scale_widget_font`）。
+
+        先整棵树记基准、再整棵树套倍数，两趟不能合并：合成一趟的话子控件会读到
+        父控件刚放大过的字号当基准，一层套一层。
+        """
+        scale = value.font_scale
+        widgets = self._scalable_widgets()
+        for widget in widgets:
+            prefs_mod.remember_base_font(widget, self._applied_font_scale)
+        app = QApplication.instance()
+        if app is not None:
+            app.setFont(
+                prefs_mod.base_app_font()
+                if value.uses_default_font
+                else theme.app_font(value.font_pt)
+            )
+        for widget in widgets:
+            prefs_mod.scale_widget_font(widget, scale)
+        self._applied_font_scale = scale
+
+    def _show_settings(self) -> None:
+        if self._settings_dialog is None:
+            dialog = SettingsDialog(self._prefs, self)
+            dialog.changed.connect(self.apply_ui_prefs)
+            self._settings_dialog = dialog
+            # 对话框是刚建出来的，还没被上面那轮缩放扫到
+            self._apply_font_scale(self._prefs)
+        else:
+            self._settings_dialog.set_value(self._prefs)
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+        self._settings_dialog.activateWindow()
 
     def _show_help(self) -> None:
         """非模态使用说明：分“流程 / 快捷键 / 关于”三页，可以边看边操作。"""
@@ -1310,6 +1556,8 @@ class MainWindow(QMainWindow):
             layout.addWidget(tabs, 1)
             layout.addLayout(bar)
             self._help_box = dialog
+            # 刚建出来的对话框还没被字号缩放扫到（说明书正是要看清字的地方）
+            self._apply_font_scale(self._prefs)
         self._help_box.show()
         self._help_box.raise_()
 
@@ -1377,6 +1625,110 @@ class MainWindow(QMainWindow):
         )
         self._set_status(f"⚠ 无法打开 {path.name}：{message}")
 
+    # ------------------------------------------------------------------ 文档复位 / 关闭
+
+    def _reset_document(
+        self, *, drop_jobs: bool = True, clear_canvas: bool = True
+    ) -> None:
+        """把窗口复位到"当前没有任何图"的状态。**归一化历史不动。**
+
+        这是"打开新图"和"关闭当前图片"共用的那一半动作，也是多文档改造要复用的
+        入口——切换文档时先用它把当前文档的一切痕迹清干净，再装上另一份。所以它
+        只管"当前这张图及其派生物"，不碰跨文档的东西：
+
+        * 清掉：三层图像、朝向、ROI 与分隔线、撤销 / 重做栈、剖面、结果、诊断
+          条、标尺、窗口标题、工具模式；
+        * 不碰：归一化历史（``self._session``）、最近文件、界面偏好、布局。
+
+        归一化历史留着是**必需**而不是方便：内参和目标蛋白常常分开拍在不同的膜
+        上，用户的流程就是"开 A 膜 → 定量 → 加为内参 → 关掉 → 开 B 膜 → …"，
+        关一次丢一次历史的话跨膜归一化根本做不成。
+
+        参数都是给复用方留的开关：
+        * ``drop_jobs``：作废在跑的后台任务。从加载回调里调用时要关掉——那次加载
+          自己就是当前任务，已经由 ``_finish_job`` 收过尾了。
+        * ``clear_canvas``：把画布也退回空白。紧接着要 ``set_image`` 的调用方关掉
+          它，省掉一次"清空再铺上"的闪烁。
+        """
+        if drop_jobs:
+            self._invalidate_jobs()
+        self._blot_loaded = None
+        self._blot_original = None
+        self._blot = None
+        self._angle = 0.0
+        self._quarter_turns = 0
+        self._orient_target = (0, 0.0)
+        self._pending_restore = None
+        # 图像换了：doc / source 版本双双 +1，此前提交的任何任务都作废
+        self._bump_document()
+        self._source_version += 1
+        self._result_stale = False
+        self._detect_dropped_roi = False
+        self._set_rotation_controls(0.0)
+        self._ruler_angle = None
+        self.ruler_label.setText("标尺：未测量")
+        self._ruler_popup.hide()
+        self._roi = None
+        self._separators = []
+        self._undo.clear()
+        self._redo.clear()
+        self._committed = self._EMPTY_STATE
+        self._column_profile = None
+        if clear_canvas:
+            self.canvas.clear_image()
+            self._select_tool(Tool.ROI)
+            self.setWindowTitle(APP_TITLE)
+        else:
+            self.canvas.clear_roi()
+            self.canvas.clear_result_boxes()
+        self.profile_panel.clear()
+        # _clear_result 里会顺手刷诊断条与动作可用性
+        self._clear_result()
+        self._sync_roi_fields()
+
+    def _unhistoried_band_count(self) -> int:
+        """当前这批结果里还没进过归一化历史的条带数。
+
+        判据是"有没有一条历史记录是从**这一版图像**测出来的"：加入历史时记的就是
+        当时的 ``doc_version``，比对它比比对文件名可靠（同一张膜转过 90° 再定量
+        是另一批数字）。
+        """
+        if self._result is None or not self._result.measurements:
+            return 0
+        if self._result_doc_version < 0:
+            return 0
+        if any(
+            int(getattr(entry, "doc_version", -1)) == int(self._result_doc_version)
+            for entry in self._session.entries
+        ):
+            return 0
+        return len(self._result.measurements)
+
+    def _close_document(self) -> bool:
+        """关闭当前图片，回到空白工作区。返回是否真的关掉了。"""
+        if self._blot is None:
+            self._set_status("当前没有打开的图片。")
+            return False
+        # "没加入历史"排在"没导出"前面：跨膜流程里历史是唯一把这张膜和别的膜连
+        # 起来的东西，丢了得重新定量；结果表重跑一次就有。
+        pending = self._unhistoried_band_count()
+        extra = (
+            [f"这张膜的 {pending} 个条带还没加入归一化历史，关掉后要重新定量。"]
+            if pending
+            else []
+        )
+        if not self._confirm_discard_results(
+            title="关闭当前图片",
+            question="确定要关闭这张图片吗？",
+            extra=extra,
+        ):
+            return False
+        self._reset_document()
+        self._set_status(
+            "已关闭当前图片；归一化历史保留着，可以直接打开下一张膜继续。"
+        )
+        return True
+
     def _on_load_done(
         self, token: object, path: Path, abandoned: bool, blot: object
     ) -> None:
@@ -1395,36 +1747,17 @@ class MainWindow(QMainWindow):
         )
         prev_roi = self._roi
         prev_seps = list(self._separators)
+        # 复位与"关闭当前图片"是同一套动作，只是这里紧接着装上新图。任务不用再
+        # 作废一遍：走到这儿说明本次加载就是当前任务，_finish_job 已经收过尾了。
+        self._reset_document(drop_jobs=False, clear_canvas=False)
         self._blot_loaded = blot
         self._blot_original = blot
         self._blot = blot
-        self._angle = 0.0
-        self._quarter_turns = 0
-        self._orient_target = (0, 0.0)
-        self._pending_restore = None
-        # 图像换了：doc / source 版本双双 +1，此前提交的任何任务都作废
-        self._bump_document()
-        self._source_version += 1
-        self._result_stale = False
-        self._set_rotation_controls(0.0)
-        self._ruler_angle = None
-        self.ruler_label.setText("标尺：未测量")
-        self._ruler_popup.hide()
-        self._roi = None
-        self._separators = []
-        self._undo.clear()
-        self._redo.clear()
-        self._committed = self._EMPTY_STATE
-        self.canvas.clear_roi()
-        self.canvas.clear_result_boxes()
         shown = self.canvas.set_image(blot.display_bgr)
         self.canvas.fit_view()
-        self.profile_panel.clear()
-        self._column_profile = None
-        self._clear_result()
         self._last_open_dir = str(path.parent)
         self._add_recent(path)
-        self.setWindowTitle(f"WB 灰度分析工具 — {path.name}")
+        self.setWindowTitle(f"{APP_TITLE} — {path.name}")
         # 加载完立刻把焦点给画布：Space 平移 / Delete 删条带 / 方向键微调
         # 都是画布的按键，否则用户得先点一下画布才生效
         self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -2552,10 +2885,10 @@ class MainWindow(QMainWindow):
                 "",
             )
             text += f" ⛔ 自检严重：{fatal}（详情见画布上方的诊断条）。"
-        self._set_status(
-            text + " 剖面图上双击可加分隔线、右键线上可删除，改完自动重新定量；"
-            "点选条带 Delete 可删除（可撤销）。"
-        )
+        # 这里以前还缀着两句"剖面图上双击可加分隔线…点选条带 Delete 可删除"。
+        # 那是操作说明不是状态，每次定量完都念一遍纯属噪音，而且剖面图标题里
+        # 逐字写着同一句。状态栏只报这次算出了什么、有没有出事。
+        self._set_status(text)
 
     def _run_auto(self, synchronous: bool = False) -> None:
         if self._busy or self._blot is None:
@@ -2676,6 +3009,8 @@ class MainWindow(QMainWindow):
         # 带上 measurements：删条带后 lanes 不重算，右图的积分填充区得按现存
         # 条带重画，否则被删掉那条的填充还留在图上
         self.profile_panel.set_lane_profiles(self._lanes, list(measurements))
+        # 数值的位数变了，结果表要的宽度跟着变（九位数的积分灰度比四位数宽一截）
+        self._sync_control_dock_width()
         self._update_action_states()
 
     def _clear_result(self) -> None:
@@ -3010,14 +3345,10 @@ class MainWindow(QMainWindow):
                 warnings.append(f"“{entry.name}”：{tip}")
         mixed = self._mixed_origin_groups()
         if mixed:
-            # 口径混用比"某个泳道没配上"严重得多：数字看着都在，比值压根算不出来
-            warnings.insert(
-                0,
-                "分组 "
-                + "、".join(f"“{g}”" for g in mixed)
-                + " 里混用了 ROI 基线与局部背景两套口径，归一化已拒绝给出比值；"
-                "请用同一条路径重新定量后再加入历史。",
-            )
+            # 口径混用比"某个泳道没配上"严重得多：数字看着都在，比值压根算不出
+            # 来。这里只留一句判词，成因与做法在画布上方的诊断条里（error 级、
+            # 默认展开）——那条无论用户停在哪一页都看得见，而这一页可能是关着的。
+            warnings.insert(0, _mixed_origin_headline(mixed))
         if rows:
             return ("⚠ " + " ".join(warnings)) if warnings else None
         if not self._session.entries:
@@ -3031,9 +3362,9 @@ class MainWindow(QMainWindow):
             for group, pair in counts.items()
         ]
         text = (
-            "尚无归一化结果——同一分组需要同时有内参与目标蛋白。当前 "
+            "尚无归一化结果：同一分组要同时有内参与目标蛋白。当前 "
             + "；".join(parts)
-            + "。若某条“类型”选错了，双击历史表对应单元格即可修改。"
+            + "（类型选错了双击历史表那格就能改）。"
         )
         if warnings:
             text += " " + " ".join(warnings)
@@ -3047,6 +3378,8 @@ class MainWindow(QMainWindow):
         rows = normalize_rows(self._session, self.normalize_panel.control_lane())
         self.normalize_panel.set_rows(rows)
         self.normalize_panel.set_diagnosis(self._normalize_diagnosis(rows))
+        # 跨口径要出现在诊断条上，而它只在历史变了的时候才可能变
+        self._refresh_diagnostics()
 
     def _on_history_band_pick_changed(self, row: int, pick: str) -> None:
         """历史表里改条带策略：只重新聚合，不重新定量，且可撤销。"""
@@ -3161,6 +3494,20 @@ class MainWindow(QMainWindow):
         """
         entries = entries_from_report(self._roi_report)
         covered = {i.kind for i in (self._roi_report.issues if self._roi_report else ())}
+        # 跨口径原本只写在“归一化”页的提示行里。那一页可能是关着的，而这条的
+        # 含义是"这一组的比值算不出来"——不能靠用户恰好切到那一页才看见。分组名
+        # 写进标题，换了一组问题指纹就变，「我知道了」不会连带把新的也捂住。
+        mixed = self._mixed_origin_groups()
+        if mixed:
+            entries.append(
+                Entry(
+                    severity="error",
+                    title="分组 "
+                    + "、".join(f"“{g}”" for g in mixed)
+                    + " 混用了两套背景口径",
+                    detail=MIXED_ORIGIN_DETAIL,
+                )
+            )
         measurements = list(self._result.measurements) if self._result is not None else []
         if not measurements:
             return entries
@@ -3725,6 +4072,7 @@ class MainWindow(QMainWindow):
         has_result = self._result is not None and bool(self._result.measurements)
         # 忙碌期间不许换图：否则后台结果回来时已经不知道该落到哪张图上
         self.act_open.setEnabled(not self._busy)
+        self.act_close.setEnabled(has_image and not self._busy)
         self._recent_menu.setEnabled(not self._busy)
         self.act_auto.setEnabled(has_image and not self._busy)
         self.act_quant.setEnabled(has_image and not self._busy)
@@ -3826,9 +4174,13 @@ class MainWindow(QMainWindow):
         geometry = settings.value("win/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
-        state = settings.value("win/state")
-        if state is not None:
-            self.restoreState(state)
+        state = settings.value(LAYOUT_STATE_KEY)
+        # 版本号跟着面板集合走：以后加一个 dock，旧状态直接对不上号被丢弃、退回
+        # 默认布局，而不是让 restoreState 拿一份认不出来的数据去摆位置。
+        if state is None or not self.restoreState(state, LAYOUT_VERSION):
+            self._reset_layout()
+            self._set_status()
+        self.apply_ui_prefs(prefs_mod.load(settings), persist=False)
         self._last_open_dir = str(settings.value("paths/last_open_dir", "") or "")
         self._last_export_dir = str(settings.value("paths/last_export_dir", "") or "")
         recent = settings.value("paths/recent", [])
@@ -3878,17 +4230,34 @@ class MainWindow(QMainWindow):
         self.guides_check.setChecked(show_guides)
         self.guides_check.blockSignals(False)
 
-    def _confirm_discard_results(self) -> bool:
-        """有没导出的定量结果时挽留一次。"""
-        if not self._results_dirty or self._result is None:
-            return True
-        if not self._result.measurements:
+    def _confirm_discard_results(
+        self,
+        *,
+        title: str = "还没有导出结果",
+        question: str = "关闭窗口后这些数据会丢失，确定要退出吗？",
+        extra: tuple[str, ...] | list[str] = (),
+    ) -> bool:
+        """要丢掉当前文档的成果时挽留一次；没什么可丢的就直接放行。
+
+        退出程序和关闭当前图片走的是同一段挽留，只有问句和 ``extra`` 里额外点名
+        的损失不同。``extra`` 里的话排在前面：那是调用方认为比"没导出"更值得说的
+        事（关图时就是"还没加入归一化历史"）。
+        """
+        lines = list(extra)
+        if (
+            self._results_dirty
+            and self._result is not None
+            and self._result.measurements
+        ):
+            lines.append(
+                f"当前有 {len(self._result.measurements)} 个条带的定量结果尚未导出。"
+            )
+        if not lines:
             return True
         answer = QMessageBox.question(
             self,
-            "还没有导出结果",
-            f"当前有 {len(self._result.measurements)} 个条带的定量结果尚未导出。\n"
-            "关闭窗口后这些数据会丢失，确定要退出吗？",
+            title,
+            "\n".join([*lines, question]),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -3918,7 +4287,8 @@ class MainWindow(QMainWindow):
         self._shutdown_jobs()
         settings = QSettings("WBAnalyzer", "WBAnalyzer")
         settings.setValue("win/geometry", self.saveGeometry())
-        settings.setValue("win/state", self.saveState())
+        settings.setValue(LAYOUT_STATE_KEY, self.saveState(LAYOUT_VERSION))
+        prefs_mod.save(self._prefs, settings)
         settings.setValue("paths/last_open_dir", self._last_open_dir)
         settings.setValue("paths/last_export_dir", self._last_export_dir)
         settings.setValue("paths/recent", self._recent)

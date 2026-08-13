@@ -36,6 +36,7 @@ from ..normalize import (
 )
 from . import theme
 from .tablefmt import NumberDelegate, full_precision
+from .widgets import ElidedLabel
 
 HISTORY_HEADERS = ["类型", "名称", "分组", "泳道数", "口径", "条带", "来源文件"]
 HISTORY_KIND_COLUMN = 0
@@ -133,6 +134,14 @@ def _make_table(headers: list[str]) -> QTableWidget:
     table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
     table.setAlternatingRowColors(True)
     table.verticalHeader().setVisible(False)
+    # 按内容取列宽 + 行高跟字体走：固定列宽在 400 px 的停靠区里必然要横向滚动，
+    # 而这两张表的列大多只有两三个字
+    table.verticalHeader().setSectionResizeMode(
+        QHeaderView.ResizeMode.ResizeToContents
+    )
+    table.horizontalHeader().setSectionResizeMode(
+        QHeaderView.ResizeMode.ResizeToContents
+    )
     table.horizontalHeader().setStretchLastSection(True)
     return table
 
@@ -240,7 +249,11 @@ class NormalizePanel(QWidget):
         entry_layout.addLayout(form)
         entry_layout.addWidget(add_button)
 
-        history_box = QGroupBox("历史记录（类型 / 名称 / 分组 / 条带可双击修改）")
+        history_box = QGroupBox("历史记录")
+        history_box.setToolTip(
+            "每一行是一次定量的结果。类型 / 名称 / 分组 / 条带这四列双击就能改，"
+            "改完只重新聚合，不重新定量。"
+        )
         self.history_table = _make_table(HISTORY_HEADERS)
         self.history_table.setEditTriggers(
             QAbstractItemView.EditTrigger.DoubleClicked
@@ -296,8 +309,9 @@ class NormalizePanel(QWidget):
         )
         export_norm_button = QPushButton("导出归一化 CSV")
         export_norm_button.clicked.connect(self.exportNormalizedRequested)
-        self._result_hint = QLabel(DEFAULT_RESULT_HINT)
-        self._result_hint.setWordWrap(True)
+        # 单行省略而不是自动折行：这条提示可能把每条历史记录的警告都串进来，
+        # wordWrap 之后它会长成一段话、把下面的结果表挤没
+        self._result_hint = ElidedLabel(DEFAULT_RESULT_HINT)
         result_layout = QVBoxLayout(result_box)
         result_layout.addLayout(control_row)
         result_layout.addWidget(self._result_hint)
@@ -464,10 +478,11 @@ class NormalizePanel(QWidget):
         ]
 
     def set_diagnosis(self, text: str | None) -> None:
-        """结果下方的提示：没结果时说原因，有结果但有泳道没配上时给警告。"""
+        """结果下方的提示：没结果时说原因，有结果但有泳道没配上时给警告。
+
+        ``ElidedLabel`` 自己把全文挂进 tooltip，界面上只占一行。
+        """
         self._result_hint.setText(text or DEFAULT_RESULT_HINT)
-        # 警告可能很长（每条记录都可能带一句），标签被布局压扁时全文还能悬停看到
-        self._result_hint.setToolTip(text or DEFAULT_RESULT_HINT)
         self._result_hint.setVisible(bool(text) or self.result_table.rowCount() == 0)
 
     # ------------------------------------------------------------------ 编辑 / 删除

@@ -1,14 +1,18 @@
-"""结果表面板：条带测量列表，支持排序、复制 TSV、删除选中。"""
+"""结果表面板：条带测量列表，支持排序、复制 TSV、删除选中。
+
+列的可见性是**显示**层面的事，与数据无关：表格永远建满 12 列、复制 TSV 永远
+带全 12 列，只是默认把其中一半藏起来。这样"看不全"和"导不全"就永远不会变成
+同一个问题——用户在设置里勾掉某列，不会悄悄改变他粘进 Excel 的东西。
+"""
 
 from __future__ import annotations
 
-from PySide6.QtCore import QItemSelectionModel, Qt, Signal
+from PySide6.QtCore import QEvent, QItemSelectionModel, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
-    QLabel,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -18,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from . import theme
 from .tablefmt import NumberDelegate, full_precision
+from .widgets import ElidedLabel
 
 HEADERS = [
     "泳道",
@@ -33,6 +38,50 @@ HEADERS = [
     "饱和 %",
     "S/N",
 ]
+
+# 列的稳定标识：QSettings 里存的是这些键而不是列号，以后插一列不会让旧配置错位
+COLUMN_KEYS = (
+    "lane",
+    "band",
+    "usage",
+    "x",
+    "y",
+    "w",
+    "h",
+    "density",
+    "background",
+    "mean",
+    "saturated",
+    "snr",
+)
+COLUMN_INDEX = {key: index for index, key in enumerate(COLUMN_KEYS)}
+
+# 锁定列：藏了这张表就没有意义了。
+#   lane / band —— 没有它们就不知道哪一行是哪一条带；
+#   density     —— 这个工具的产出本身。
+LOCKED_COLUMNS = ("lane", "band", "density")
+# 「计入」不给开关：它只有在当前条带策略确实漏掉了某些条带时才有信息量，
+# 其余时候整列都是"计入"，纯噪音。可见性由数据自己决定（见 _apply_columns）。
+AUTO_COLUMNS = ("usage",)
+# 可勾选的列，与默认勾上的那几个。默认留下饱和 % 与 S/N 是因为它们是"这个数
+# 能不能用"的两道闸：结果表已经用颜色表达了越界与否，但贴着阈值的那些行只有
+# 看到数值才判断得了。位置坐标（x/y/宽/高）只在核对框画得对不对时才看，背景与
+# 平均灰度是基线扣除的中间量——都收进设置。
+OPTIONAL_COLUMNS = ("saturated", "snr", "background", "mean", "x", "y", "w", "h")
+DEFAULT_OPTIONAL_COLUMNS = ("saturated", "snr")
+
+COLUMN_TIPS = {
+    "usage": "当前条带策略有没有把这一条计入泳道合计（只有存在未采用的条带时才出现）",
+    "density": "扣除背景后的积分灰度——这张表的产出，相对定量用的就是它",
+    "background": "该条带扣掉的基线（ROI 定量是橡皮筋基线，自动检测是环形中值）",
+    "mean": "积分灰度 ÷ 条带面积，受框大小影响，不能直接跨条带比较",
+    "saturated": "落在量程顶部的像素占比；≥ 5% 时定量会偏低",
+    "snr": "信噪比；< 3 视为低于检出限，该行整体压暗",
+    "x": "条带框左上角的图像列号（核对框画得对不对时才需要）",
+    "y": "条带框左上角的图像行号（核对框画得对不对时才需要）",
+    "w": "条带框宽度（像素）",
+    "h": "条带框高度（像素）",
+}
 SATURATED_COLOR = QColor("#ffb74d")
 BELOW_DETECTION_COLOR = QColor(theme.RESULT_BOX_WEAK)
 """低于检出限的行整体压暗：数值还在，但不该被当成真实信号读。"""
@@ -100,11 +149,12 @@ class ResultsPanel(QWidget):
         self._measurements: list = []
         self._unused: set[int] = set()
         self._updating = False
+        self._optional: tuple[str, ...] = tuple(DEFAULT_OPTIONAL_COLUMNS)
 
         toolbar = QHBoxLayout()
-        self._count_label = QLabel("暂无结果")
+        self._count_label = ElidedLabel("暂无结果")
         copy_button = QPushButton("复制选中")
-        copy_button.setToolTip("复制选中行为 TSV（Ctrl+C）")
+        copy_button.setToolTip("复制选中行为 TSV（Ctrl+C）。复制的永远是全部 12 列，与表上显示了几列无关")
         delete_button = QPushButton("删除选中")
         toolbar.addWidget(self._count_label, 1)
         toolbar.addWidget(copy_button)
@@ -118,14 +168,26 @@ class ResultsPanel(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setDefaultSectionSize(72)
-        # 「计入 / 未采用」必须整读，截成"未采…"就没了区分度
-        self.table.horizontalHeader().setSectionResizeMode(
-            USAGE_COLUMN, QHeaderView.ResizeMode.ResizeToContents
+        # 行高跟着字体走：字号调大之后固定行高会把文字上下切掉
+        self.table.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
         )
-        self.table.horizontalHeader().setStretchLastSection(True)
+        header = self.table.horizontalHeader()
+        header.setDefaultSectionSize(72)
+        # 每列按内容取宽：默认只剩 5～6 列，按内容排完刚好放得下，横向滚动条
+        # 就此消失。固定 72 px 一列时 12 列一定要 860 px，停靠区从来给不起。
+        # 全局模式也设成 ResizeToContents（而不是留着默认的 Interactive）：
+        # _apply_columns 会给最后一列单独换成 Stretch，但 QHeaderView 内部重排
+        # 时用的是全局模式，留 Interactive 会让它保住换字号之前的旧列宽。
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(False)
         self.table.setItemDelegate(NumberDelegate(self.table))
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        for key, tip in COLUMN_TIPS.items():
+            item = self.table.horizontalHeaderItem(COLUMN_INDEX[key])
+            if item is not None:
+                item.setToolTip(tip)
+        self._apply_columns()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -143,6 +205,72 @@ class ResultsPanel(QWidget):
         delete_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         delete_shortcut.activated.connect(self._request_delete)
         delete_button.setToolTip("删除选中行（表格聚焦时可直接按 Delete）")
+
+    # ------------------------------------------------------------------ 列显示
+
+    def set_optional_columns(self, keys) -> None:
+        """设置里勾上的可选列（锁定列不受影响，未知键忽略）。"""
+        wanted = {str(k) for k in (keys or ())}
+        self._optional = tuple(k for k in OPTIONAL_COLUMNS if k in wanted)
+        self._apply_columns()
+
+    def optional_columns(self) -> tuple[str, ...]:
+        return self._optional
+
+    def preferred_width(self) -> int:
+        """完整显示当前这些列需要多宽——停靠区照着它定最小宽度。
+
+        用户点名的问题就是"看不到所有的数值"。列砍到 5 条之后大多数情况已经放
+        得下，但字号调大或积分灰度位数很多时还是会差几十个像素；与其让表格横向
+        滚动，不如让面板宽这几十个像素。
+        """
+        header = self.table.horizontalHeader()
+        total = sum(
+            header.sectionSizeHint(index)
+            for index in COLUMN_INDEX.values()
+            if not self.table.isColumnHidden(index)
+        )
+        return int(total + self.table.verticalScrollBar().sizeHint().width() + 8)
+
+    def visible_columns(self) -> list[str]:
+        """当前真正显示出来的列（含自动列），按表上的顺序。"""
+        return [
+            key
+            for key in COLUMN_KEYS
+            if not self.table.isColumnHidden(COLUMN_INDEX[key])
+        ]
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().changeEvent(event)
+        # 字号一变，每列该多宽就变了，但 QHeaderView 不会自己按新字体重排——
+        # 不推它一把，14 pt 下会拿 9 pt 时算出的列宽继续用，于是又冒出横向滚动条
+        if event.type() == QEvent.Type.FontChange:
+            self._apply_columns()
+
+    def _apply_columns(self) -> None:
+        shown = set(LOCKED_COLUMNS) | set(self._optional)
+        # 「计入」只在真有条带没被采用时才占一列——全是"计入"的一列没有信息量
+        if self._unused:
+            shown.add("usage")
+        header = self.table.horizontalHeader()
+        last_visible = None
+        for key, index in COLUMN_INDEX.items():
+            hidden = key not in shown
+            self.table.setColumnHidden(index, hidden)
+            if not hidden:
+                last_visible = index
+        # 最后一列改成 Stretch：ResizeToContents 的列不肯缩到内容宽度以下，行多
+        # 到冒出竖直滚动条时视口窄了那十几个像素，就会为此长出一条横向滚动条。
+        # Stretch 的列拿"剩下多少给多少"，总宽永远等于视口。
+        for key, index in COLUMN_INDEX.items():
+            if self.table.isColumnHidden(index):
+                continue
+            header.setSectionResizeMode(
+                index,
+                QHeaderView.ResizeMode.Stretch
+                if index == last_visible
+                else QHeaderView.ResizeMode.ResizeToContents,
+            )
 
     # ------------------------------------------------------------------ 数据
 
@@ -182,6 +310,7 @@ class ResultsPanel(QWidget):
                 self.table.setItem(row, col, item)
             self._apply_usage(row, row)
         self.table.setSortingEnabled(True)
+        self._apply_columns()
         self._refresh_summary()
 
     def set_band_usage(self, unused: list | None) -> None:
@@ -201,6 +330,7 @@ class ResultsPanel(QWidget):
             original = anchor.data(Qt.ItemDataRole.UserRole)
             if original is not None:
                 self._apply_usage(row, int(original))
+        self._apply_columns()
         self._refresh_summary()
 
     def unused_bands(self) -> list[int]:

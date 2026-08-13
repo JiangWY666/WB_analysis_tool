@@ -70,7 +70,17 @@ CLEARANCE_TIP = (
 
 # 被自检点名的分隔线：与诊断条 error 级用同一个红，两处才对得上号
 SEPARATOR_FLAG_COLOR = QColor(theme.ERROR)
-SEPARATOR_FLAG_WIDTH = 5
+
+# 画布标注的基准线宽（设备像素）。界面设置里调的是**倍数**，整族一起缩放，
+# 族内的比例恒定——"被点名的分隔线更粗"、"选中的条带框更粗"这两个区分靠的就是
+# 比例，做成可调的绝对像素会让它们在某些取值下失效。
+ROI_WIDTH = 2.0
+BAND_WIDTH = 1.5
+BAND_HOVER_WIDTH = 2.5
+BAND_SELECT_WIDTH = 3.0
+SEPARATOR_WIDTH = 3.0
+SEPARATOR_FOCUS_WIDTH = 4.0
+SEPARATOR_FLAG_WIDTH = 5.0
 
 # ROI 自检角标：屏幕像素，随缩放恒定
 FLAG_PX = 11.0
@@ -219,9 +229,10 @@ class BandFlagItem(QGraphicsItem):
     三件事各说各的，不会互相盖掉。角标画在框外的右上角，避开左上角的标签锚点。
     """
 
-    def __init__(self, color: QColor) -> None:
+    def __init__(self, color: QColor, scale: float = 1.0) -> None:
         super().__init__()
         self._color = QColor(color)
+        self._scale = max(0.5, float(scale))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setZValue(LABEL_Z - 0.1)
@@ -230,27 +241,41 @@ class BandFlagItem(QGraphicsItem):
         self._color = QColor(color)
         self.update()
 
+    def set_scale_factor(self, scale: float) -> None:
+        """字号调大时角标跟着放大，否则那个 ! 会缩成一个点。"""
+        scale = max(0.5, float(scale))
+        if abs(scale - self._scale) < 1e-6:
+            return
+        self.prepareGeometryChange()
+        self._scale = scale
+        self.update()
+
+    def _size(self) -> float:
+        return FLAG_PX * self._scale
+
     def boundingRect(self) -> QRectF:  # noqa: N802 - Qt API
-        return QRectF(-FLAG_PX, -FLAG_PX, FLAG_PX + 1.0, FLAG_PX + 1.0)
+        size = self._size()
+        return QRectF(-size, -size, size + 1.0, size + 1.0)
 
     def paint(self, painter, option, widget=None) -> None:
+        size = self._size()
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         path_points = [
-            QPointF(0.0, -FLAG_PX),
-            QPointF(-FLAG_PX, -FLAG_PX),
+            QPointF(0.0, -size),
+            QPointF(-size, -size),
             QPointF(0.0, 0.0),
         ]
         painter.setPen(QPen(LABEL_PLATE_COLOR, 1))
         painter.setBrush(QBrush(self._color))
         painter.drawPolygon(path_points)
         font = QFont(painter.font())
-        font.setPointSize(FLAG_FONT_PT)
+        font.setPointSizeF(FLAG_FONT_PT * self._scale)
         font.setBold(True)
         painter.setFont(font)
         painter.setPen(QPen(LABEL_PLATE_COLOR))
         painter.drawText(
-            QRectF(-FLAG_PX + 1.0, -FLAG_PX + 0.5, FLAG_PX - 2.0, FLAG_PX - 2.0),
+            QRectF(-size + 1.0, -size + 0.5, size - 2.0, size - 2.0),
             Qt.AlignmentFlag.AlignCenter,
             "!",
         )
@@ -260,7 +285,15 @@ class BandFlagItem(QGraphicsItem):
 class BandBoxItem(QGraphicsRectItem):
     """可直接操纵的条带结果框：悬停高亮、点击/Ctrl 多选、Delete 删除。"""
 
-    def __init__(self, index: int, lane: int, base_color: QColor, rect: QRectF) -> None:
+    def __init__(
+        self,
+        index: int,
+        lane: int,
+        base_color: QColor,
+        rect: QRectF,
+        line_scale: float = 1.0,
+        flag_scale: float = 1.0,
+    ) -> None:
         super().__init__(rect)
         self.index = int(index)
         self.lane = int(lane)
@@ -268,6 +301,8 @@ class BandBoxItem(QGraphicsRectItem):
         self._hover = False
         self._adopted = True
         self._flag_tip = ""
+        self._line_scale = max(0.1, float(line_scale))
+        self._flag_scale = max(0.5, float(flag_scale))
         self.flag: BandFlagItem | None = None
         self.base_tooltip = ""
         self.label: BandLabelItem | None = None
@@ -280,11 +315,19 @@ class BandBoxItem(QGraphicsRectItem):
     def is_flagged(self) -> bool:
         return self.flag is not None
 
+    def set_scales(self, line_scale: float, flag_scale: float) -> None:
+        """界面设置改了线宽 / 字号：重画描边与角标，比例关系原样保留。"""
+        self._line_scale = max(0.1, float(line_scale))
+        self._flag_scale = max(0.5, float(flag_scale))
+        if self.flag is not None:
+            self.flag.set_scale_factor(self._flag_scale)
+        self._apply_style()
+
     def set_flagged(self, flagged: bool, tip: str = "") -> None:
         """ROI 自检点到了这一条：右上角挂个三角角标。"""
         self._flag_tip = str(tip or "")
         if flagged and self.flag is None:
-            self.flag = BandFlagItem(self._base)
+            self.flag = BandFlagItem(self._base, self._flag_scale)
             self.flag.setParentItem(self)
             self.flag.setPos(self.rect().right(), self.rect().top())
         elif not flagged and self.flag is not None:
@@ -340,14 +383,15 @@ class BandBoxItem(QGraphicsRectItem):
         super().paint(painter, option, widget)
 
     def _apply_style(self) -> None:
+        scale = self._line_scale
         if self.isSelected():
-            pen = QPen(BAND_SELECT_COLOR, 3)
+            pen = QPen(BAND_SELECT_COLOR, BAND_SELECT_WIDTH * scale)
             brush = QBrush(BAND_SELECT_FILL)
         elif self._hover:
-            pen = QPen(self._base.lighter(150), 2.5)
+            pen = QPen(self._base.lighter(150), BAND_HOVER_WIDTH * scale)
             brush = QBrush(QColor(255, 255, 255, 18))
         else:
-            pen = QPen(self._base, 1.5)
+            pen = QPen(self._base, BAND_WIDTH * scale)
             brush = QBrush(Qt.BrushStyle.NoBrush)
         if not self._adopted:
             # 虚线 = "还在，只是不计入合计"。删除是框直接消失，两者一眼可分。
@@ -422,7 +466,13 @@ class BlotCanvas(QGraphicsView):
             self._scene.addItem(item)
         self._guides_on = True
 
-        roi_pen = QPen(ROI_COLOR, 2)
+        # 界面设置里的线宽 / 字号倍数；1.0 = 出厂值，此时一处像素都不动
+        self._roi_scale = 1.0
+        self._band_scale = 1.0
+        self._sep_scale = 1.0
+        self._font_scale = 1.0
+
+        roi_pen = QPen(ROI_COLOR, ROI_WIDTH)
         roi_pen.setCosmetic(True)
         self._roi_item = QGraphicsRectItem()
         self._roi_item.setPen(roi_pen)
@@ -539,6 +589,35 @@ class BlotCanvas(QGraphicsView):
         self.clear_ruler()
         self.viewport().update()
         return not pixmap.isNull()
+
+    def clear_image(self) -> None:
+        """退回"没有图"的空画布。
+
+        多文档改造里"关闭当前图片" / "切走当前文档"都走这里，所以它必须把
+        set_image 建立起来的**每一样**东西都撤掉：像素图、图像尺寸、场景矩形、
+        参考线、ROI、条带框、标尺、缩放变换。漏一样就会留下"图没了但还能拖 ROI"
+        之类的鬼影状态。
+        """
+        self._image_ref = None
+        self._display_ref = None
+        self._image_w = 0
+        self._image_h = 0
+        self._display_step_used = 1
+        self._pixmap_item.setPixmap(QPixmap())
+        self._pixmap_item.setScale(1.0)
+        self._pixmap_item.setVisible(False)
+        self.clear_roi()
+        self.clear_result_boxes()
+        self.clear_ruler()
+        self._nudge_target = None
+        self._snap_targets = []
+        self._guide_h.setLine(0, 0, 0, 0)
+        self._guide_v.setLine(0, 0, 0, 0)
+        self._update_guides()
+        self._scene.setSceneRect(0, 0, 0, 0)
+        self.setTransform(QTransform())
+        self.viewport().update()
+        self.zoomChanged.emit(self.current_scale())
 
     @staticmethod
     def _display_step(width: int, height: int) -> int:
@@ -800,12 +879,17 @@ class BlotCanvas(QGraphicsView):
             # 分开走两个通道，正在微调一条被点名的线时两件事都还看得见。
             flagged = index in self._flagged_seps
             color = SEPARATOR_FLAG_COLOR if flagged else SEPARATOR_COLOR
+            width = (
+                SEPARATOR_FLAG_WIDTH
+                if flagged
+                else (SEPARATOR_FOCUS_WIDTH if index == focused else SEPARATOR_WIDTH)
+            ) * self._sep_scale
             if index == focused:
                 color = SEPARATOR_FLAG_COLOR if flagged else SEPARATOR_FOCUS_COLOR
-                pen = QPen(color, SEPARATOR_FLAG_WIDTH if flagged else 4)
+                pen = QPen(color, width)
                 pen.setStyle(Qt.PenStyle.DashLine)
             else:
-                pen = QPen(color, SEPARATOR_FLAG_WIDTH if flagged else 3)
+                pen = QPen(color, width)
             pen.setCosmetic(True)
             item.setPen(pen)
             item.setToolTip(self._flagged_sep_tip if flagged else "")
@@ -820,9 +904,49 @@ class BlotCanvas(QGraphicsView):
 
     # ------------------------------------------------------------------ 结果叠加
 
+    # ------------------------------------------------------------------ 界面设置
+
+    def set_annotation_scales(
+        self,
+        roi: float = 1.0,
+        band: float = 1.0,
+        separator: float = 1.0,
+        font: float = 1.0,
+    ) -> None:
+        """应用界面设置里的线宽 / 字号倍数（1.0 = 出厂值）。
+
+        字号倍数同时管条带标签与自检角标：字放大了角标不放大，那个 ! 会缩成一
+        个看不出是什么的点；标签放大之后会重新走一遍错行避让，挤不下就照旧整
+        批隐藏——这条降级链本来就是为"标签放不下"设计的，字号变大只是让它更早
+        触发而已。
+        """
+        self._roi_scale = max(0.1, float(roi))
+        self._band_scale = max(0.1, float(band))
+        self._sep_scale = max(0.1, float(separator))
+        self._font_scale = max(0.5, float(font))
+
+        pen = QPen(ROI_COLOR, ROI_WIDTH * self._roi_scale)
+        pen.setCosmetic(True)
+        self._roi_item.setPen(pen)
+        for item in self._band_items:
+            item.set_scales(self._band_scale, self._font_scale)
+        label_font = self._label_font()
+        for label in self._band_labels:
+            label.setFont(label_font)
+        self._sync_roi_items()
+        self._relayout_band_labels()
+
+    def annotation_scales(self) -> tuple[float, float, float, float]:
+        return (self._roi_scale, self._band_scale, self._sep_scale, self._font_scale)
+
+    def _label_font(self) -> QFont:
+        font = QFont(self.font().family(), -1)
+        font.setPointSizeF(LABEL_FONT_PT * self._font_scale)
+        return font
+
     def show_result_boxes(self, measurements) -> None:
         self.clear_result_boxes()
-        label_font = QFont(self.font().family(), LABEL_FONT_PT)
+        label_font = self._label_font()
         self._updating_selection = True
         try:
             for index, m in enumerate(measurements):
@@ -837,6 +961,8 @@ class BlotCanvas(QGraphicsView):
                     lane=int(m.lane),
                     base_color=color,
                     rect=QRectF(float(m.x), float(m.y), float(m.width), float(m.height)),
+                    line_scale=self._band_scale,
+                    flag_scale=self._font_scale,
                 )
                 box.setToolTip(
                     f"L{m.lane}-B{m.band}\n"

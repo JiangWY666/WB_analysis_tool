@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -45,6 +45,21 @@ LANE_TITLE_EMPTY = "泳道纵向剖面（先 ROI 定量）"
 # 求和后的信号。以前都标"信号强度"，读数会被误解成同一口径。
 COLUMN_Y_LABEL = "列平均信号（每像素灰度）"
 LANE_Y_LABEL = "行累加信号（整条泳道宽度求和）"
+
+
+TITLE_PT = 10.0
+LEGEND_PT_DROP = 1.0  # 图例比正文小一号
+LEGEND_PT_FLOOR = 7.5
+# 相邻泳道标签之间至少留出的空白（设备像素）。贴着算"不重叠"在视觉上仍然是
+# 一团，留一点缝才读得出这是两个数。
+LANE_LABEL_GAP = 5.0
+# 摆不开时依次尝试的间隔："每 2 道标一个"、"每 3 道标一个"……都摆不开就整批
+# 隐藏。间隔必须是规则的：用户能预期"标出来的是第 1、3、5 道"，而"能塞下的那
+# 几个"没人能预期。
+LANE_LABEL_STRIDES = (2, 3, 4, 6, 8, 12)
+# 面板最矮多高。字号一放大就得跟着长高：坐标轴刻度是按像素高度排的，绘图区不
+# 变而字变大，几个刻度会直接叠在一起（实测 14 pt 时 12000/10000/8000 糊成一团）。
+MIN_PANEL_H = 200
 
 
 def _style_plot(widget: pg.PlotWidget) -> None:
@@ -99,6 +114,7 @@ class LegendStrip(QWidget):
 
     def __init__(self, entries, parent=None) -> None:
         super().__init__(parent)
+        self._labels: list[QLabel] = []
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 0, 4, 0)
         layout.setSpacing(4)
@@ -108,24 +124,32 @@ class LegendStrip(QWidget):
             swatch.setFixedSize(SWATCH_W, SWATCH_H)
             label = QLabel(text)
             label.setObjectName("dimHint")
-            font = label.font()
-            font.setPointSizeF(max(7.5, font.pointSizeF() - 1.0))
-            label.setFont(font)
+            self._labels.append(label)
             layout.addWidget(swatch)
             layout.addWidget(label)
             layout.addSpacing(6)
         layout.addStretch(1)
+        self.refresh_font()
+
+    def refresh_font(self) -> None:
+        """跟着父级字体走。显式 setFont 过的控件收不到继承的字体变更。"""
+        base = self.font().pointSizeF()
+        for label in self._labels:
+            font = label.font()
+            font.setPointSizeF(max(LEGEND_PT_FLOOR, base - LEGEND_PT_DROP))
+            label.setFont(font)
 
 
-def _with_legend(plot: pg.PlotWidget, entries) -> QWidget:
+def _with_legend(plot: pg.PlotWidget, entries) -> tuple[QWidget, LegendStrip]:
     """把绘图控件和它的图例条竖着摞成一个整体，供 splitter 使用。"""
     box = QWidget()
+    strip = LegendStrip(entries)
     layout = QVBoxLayout(box)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(2)
     layout.addWidget(plot, 1)
-    layout.addWidget(LegendStrip(entries))
-    return box
+    layout.addWidget(strip)
+    return box, strip
 
 
 def _confirm_delete_separator(parent: QWidget, screen_pos) -> bool:
@@ -150,14 +174,22 @@ class ProfilePanel(QWidget):
         self._sep_lines: list[pg.InfiniteLine] = []
         self._regions: list[pg.LinearRegionItem] = []
         self._labels: list[pg.TextItem] = []
+        # 泳道标签的横坐标（数据单位）与当前降级档位，见 _relayout_lane_labels
+        self._label_centers: list[float] = []
+        self._labels_packed = True
+        self._labels_compact = False
+        self._label_stride = 1
+        self._relaying_labels = False
         self._lanes: list = []
         self._measurements: list = []
         self._current_lane: int | None = None
+        # 界面设置里的字号倍数。1.0 时下面所有字号与改动前逐字节相同。
+        self._font_scale = 1.0
 
         self._col_plot = pg.PlotWidget()
         _style_plot(self._col_plot)
         self._col_plot.getPlotItem().setTitle(
-            COLUMN_TITLE, color=TITLE_COLOR, size="10pt"
+            COLUMN_TITLE, color=TITLE_COLOR, size=self._title_size()
         )
         self._col_plot.setLabel("bottom", "X（像素）")
         self._col_plot.setLabel("left", COLUMN_Y_LABEL)
@@ -168,16 +200,18 @@ class ProfilePanel(QWidget):
             "双击空白处添加分隔线；右键分隔线删除；拖动橙线微调。\n"
             "位置按图像像素对齐，和画布上的分隔线是同一条。"
         )
+        # 图例只说"这个颜色是什么"。怎么加 / 怎么删写在图标题里了，图例里再写
+        # 一遍就是同一句话在同一张图上出现两次。
         col_entries = [
             (ACCENT, None, False, "列平均信号"),
-            (SEPARATOR, None, False, "泳道分隔线（双击加 / 拖动调 / 右键删）"),
-            (ACCENT_DIM, REGION_BRUSHES[0], False, "泳道分区（深浅相间）"),
+            (SEPARATOR, None, False, "泳道分隔线"),
+            (ACCENT_DIM, REGION_BRUSHES[0], False, "泳道分区"),
         ]
 
         self._lane_plot = pg.PlotWidget()
         _style_plot(self._lane_plot)
         self._lane_plot.getPlotItem().setTitle(
-            LANE_TITLE_EMPTY, color=TITLE_COLOR, size="10pt"
+            LANE_TITLE_EMPTY, color=TITLE_COLOR, size=self._title_size()
         )
         self._lane_plot.setLabel("bottom", "Y（像素）")
         self._lane_plot.setLabel("left", LANE_Y_LABEL)
@@ -192,18 +226,21 @@ class ProfilePanel(QWidget):
         reset_button = QPushButton("复位视图")
         reset_button.setToolTip("把两张剖面图恢复为自动缩放（框选放大后用它退出）")
         reset_button.clicked.connect(self.reset_views)
-        hint = QLabel("左图：双击加分隔线 · 拖动微调 · 右键线上删除 · 框选放大后按右侧按钮复位")
-        hint.setObjectName("dimHint")
+        # 这里以前还有一行"双击加分隔线 · 拖动微调 · 右键删除"的说明，和左图标题
+        # 逐字重复——同一句话在同一个面板里出现两次，占掉一整行高度却没多说什么。
+        # 留标题（在图内、看图时就在眼前），这一行撤掉。
         bar = QHBoxLayout()
         bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(8)
-        bar.addWidget(hint)
         bar.addStretch(1)
         bar.addWidget(reset_button)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(_with_legend(self._col_plot, col_entries))
-        splitter.addWidget(_with_legend(self._lane_plot, lane_entries))
+        col_box, col_legend = _with_legend(self._col_plot, col_entries)
+        lane_box, lane_legend = _with_legend(self._lane_plot, lane_entries)
+        self._legends = (col_legend, lane_legend)
+        splitter.addWidget(col_box)
+        splitter.addWidget(lane_box)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         layout = QVBoxLayout(self)
@@ -211,7 +248,7 @@ class ProfilePanel(QWidget):
         layout.setSpacing(4)
         layout.addWidget(splitter, 1)
         layout.addLayout(bar)
-        self.setMinimumHeight(200)
+        self.setMinimumHeight(MIN_PANEL_H)
         # 装在 scene 上而不是 ViewBox 上：分隔线（InfiniteLine）压在 ViewBox
         # 上面，装 ViewBox 会漏掉正好点在线上的那些事件，而右键删除偏偏只发生
         # 在线上。scene 是视图派发给任何图元之前的必经之路。
@@ -219,6 +256,55 @@ class ProfilePanel(QWidget):
         self._lane_scene = self._lane_plot.scene()
         self._col_scene.installEventFilter(self)
         self._lane_scene.installEventFilter(self)
+        # 泳道标签的屏幕尺寸恒定，能给它的像素却随控件宽度与缩放变化——这两件事
+        # 一变就得重新评一次降级档位，否则窄图 / 放大后标签直接叠成一团。
+        view_box = self._col_view_box()
+        view_box.sigResized.connect(self._on_col_view_changed)
+        view_box.sigRangeChanged.connect(self._on_col_view_changed)
+
+    # ------------------------------------------------------------------ 界面设置
+
+    def _title_size(self) -> str:
+        return f"{TITLE_PT * self._font_scale:g}pt"
+
+    def set_font_scale(self, scale: float) -> None:
+        """跟随界面字体大小缩放图内文字。
+
+        pyqtgraph 的文字是另一套：坐标轴刻度用画笔当前字体（跟着控件走），但
+        标题与轴标签是内嵌 CSS 字号、图例条的小字是显式 setFont 过的，这三处
+        都收不到 Qt 的字体继承。所以要在这里逐个推一遍，否则调大字号后图里只
+        有刻度变大、标题和轴标签纹丝不动。
+        """
+        scale = max(0.5, float(scale))
+        if abs(scale - self._font_scale) < 1e-6:
+            return
+        self._font_scale = scale
+        self.setMinimumHeight(int(round(MIN_PANEL_H * scale)))
+        tick_font = QFont(self.font())
+        tick_font.setPointSizeF(max(6.0, self.font().pointSizeF()))
+        label_style = {"color": AXIS_TEXT, "font-size": f"{self.font().pointSizeF():g}pt"}
+        for widget, bottom, left in (
+            (self._col_plot, "X（像素）", COLUMN_Y_LABEL),
+            (self._lane_plot, "Y（像素）", LANE_Y_LABEL),
+        ):
+            plot_item = widget.getPlotItem()
+            for name in ("left", "bottom"):
+                plot_item.getAxis(name).setStyle(tickFont=tick_font)
+            widget.setLabel("bottom", bottom, **label_style)
+            widget.setLabel("left", left, **label_style)
+        self._col_plot.getPlotItem().setTitle(
+            COLUMN_TITLE, color=TITLE_COLOR, size=self._title_size()
+        )
+        if self._current_lane is None:
+            self._lane_plot.getPlotItem().setTitle(
+                LANE_TITLE_EMPTY, color=TITLE_COLOR, size=self._title_size()
+            )
+        else:
+            self.show_lane(self._current_lane)
+        for legend in self._legends:
+            legend.refresh_font()
+        # 泳道分区标签是 TextItem，字体同样不继承
+        self._rebuild_regions()
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt API
         """左图：双击加分隔线、右键删分隔线；右图：双击 View All。
@@ -427,6 +513,10 @@ class ProfilePanel(QWidget):
         for label in self._labels:
             self._col_plot.removeItem(label)
         self._labels.clear()
+        self._label_centers.clear()
+        self._labels_packed = True
+        self._labels_compact = False
+        self._label_stride = 1
         if self._profile is None or self._roi_w <= 0:
             return
         positions = sorted(float(line.value()) for line in self._sep_lines)
@@ -446,9 +536,138 @@ class ProfilePanel(QWidget):
             self._col_plot.addItem(region)
             self._regions.append(region)
             label = pg.TextItem(text=f"L{index + 1}", color=LANE_LABEL, anchor=(0.5, 0.0))
+            self._apply_label_font(label)
             label.setPos((a + b) / 2.0, y_top)
-            self._col_plot.addItem(label)
+            # ignoreBounds：标签的宽度不许参与自动量程。参与的话"改文案 → 量程变
+            # → 每像素的数据单位变 → 再评一次降级"会绕成一个环。
+            self._col_plot.addItem(label, ignoreBounds=True)
             self._labels.append(label)
+            self._label_centers.append((a + b) / 2.0)
+        self._relayout_lane_labels()
+
+    def _apply_label_font(self, label) -> None:
+        """L# 分区标签的字号跟着界面走（TextItem 不继承控件字体）。
+
+        字号无论有没有缩放都显式推一遍：避碰判据读的是标签**真实的**外接矩形，
+        而"没设过字体"时那个矩形取决于 pyqtgraph 内部默认，量出来的宽度和真正
+        画出来的可能不是一回事。
+        """
+        try:
+            font = QFont(self.font())
+            # self.font() 已经被界面设置按倍数改过了，这里不能再乘一次
+            font.setPointSizeF(max(6.0, self.font().pointSizeF()))
+            label.textItem.setFont(font)
+            label.updateTextPos()
+        except AttributeError:  # pyqtgraph 换了内部结构：标签字号不值得连累绘图
+            pass
+
+    # ------------------------------------------------------------------ 泳道标签避碰
+
+    def _on_col_view_changed(self, *_args) -> None:
+        if self._relaying_labels:
+            return
+        self._relayout_lane_labels()
+
+    def _view_px_per_unit(self) -> float:
+        """横轴一个数据单位占几个设备像素；视图还没布局时返回 0。"""
+        try:
+            size = float(self._col_view_box().viewPixelSize()[0])
+        except (TypeError, IndexError, ValueError):
+            return 0.0
+        return 1.0 / size if size > 0 else 0.0
+
+    def _set_lane_label_texts(self, compact: bool) -> None:
+        for index, label in enumerate(self._labels):
+            label.setText(f"{index + 1}" if compact else f"L{index + 1}")
+            # setText 会重建内部文档，字体得重新推一遍
+            self._apply_label_font(label)
+
+    def _lane_label_widths(self) -> list[float]:
+        """当前文案下每个标签的实际宽度（设备像素）。
+
+        读的是 TextItem 自己的外接矩形，而不是拿 QFontMetrics 估一个——判据必须
+        和最终画出来的那个矩形逐像素同一个来源，否则"算得开、画出来却压住"。
+        TextItem 带 ItemIgnoresTransformations，它的 boundingRect 就是设备像素。
+        """
+        return [float(label.boundingRect().width()) for label in self._labels]
+
+    def _lane_labels_fit(self, widths: list[float], stride: int) -> bool:
+        px = self._view_px_per_unit()
+        if px <= 0:  # 还没布局，别急着降级——布局好了 sigResized 会再来一次
+            return True
+        shown = list(range(0, len(self._label_centers), stride))
+        for first, second in zip(shown, shown[1:]):
+            gap = (self._label_centers[second] - self._label_centers[first]) * px
+            need = (widths[first] + widths[second]) / 2.0 + LANE_LABEL_GAP
+            if gap < need:
+                return False
+        return True
+
+    def _apply_lane_labels(self, compact: bool, stride: int) -> None:
+        """stride <= 0 表示整批隐藏。"""
+        self._set_lane_label_texts(compact)
+        for index, label in enumerate(self._labels):
+            label.setVisible(stride > 0 and index % stride == 0)
+        self._labels_compact = compact
+        self._label_stride = max(0, int(stride))
+        self._labels_packed = stride == 1
+
+    def _relayout_lane_labels(self) -> None:
+        """按能给的像素宽逐级降级，绝不留"糊成一团"的中间态。
+
+        和画布上的条带标签同一套契约：
+
+        1. 完整文案 ``L3``，每道都标；
+        2. 摆不开就去掉 ``L`` 只留数字 ``3``；
+        3. 还摆不开就按规则间隔标（每 2 道一个、每 3 道一个……）；
+        4. 最稀的间隔也摆不开时整批隐藏。
+
+        只显示"恰好塞得下的那几个"是不做的：泳道号一旦跳着漏，用户读错的代价
+        比读不到更大。
+        """
+        if not self._labels:
+            self._labels_packed = True
+            self._labels_compact = False
+            self._label_stride = 1
+            return
+        self._relaying_labels = True
+        try:
+            for compact in (False, True):
+                self._set_lane_label_texts(compact)
+                if self._lane_labels_fit(self._lane_label_widths(), 1):
+                    self._apply_lane_labels(compact, 1)
+                    return
+            # 到这里已经是纯数字文案，宽度不会再变，量一次给所有间隔用
+            widths = self._lane_label_widths()
+            for stride in LANE_LABEL_STRIDES:
+                if stride >= len(self._labels):
+                    break
+                if self._lane_labels_fit(widths, stride):
+                    self._apply_lane_labels(True, stride)
+                    return
+            self._apply_lane_labels(True, 0)
+        finally:
+            self._relaying_labels = False
+
+    def lane_labels_packed(self) -> bool:
+        """当前是不是每道都标、且互不重叠（没有任何降级）。"""
+        return bool(self._labels_packed)
+
+    def lane_labels_compact(self) -> bool:
+        """显示的是不是紧凑文案（只有数字、没有 ``L``）。"""
+        return bool(self._labels_compact)
+
+    def lane_label_stride(self) -> int:
+        """每几道标一个；0 表示整批隐藏。"""
+        return int(self._label_stride)
+
+    def lane_label_rects(self) -> list:
+        """可见泳道标签在场景里的矩形，供重叠检查使用。"""
+        return [
+            label.mapRectToScene(label.boundingRect())
+            for label in self._labels
+            if label.isVisible()
+        ]
 
     def _on_line_moved(self, line: pg.InfiniteLine) -> None:
         if self._updating:
@@ -487,16 +706,11 @@ class ProfilePanel(QWidget):
             region.setRegion((bounds[index], bounds[index + 1]))
             if index < len(self._labels):
                 pos = self._labels[index].pos()
-                self._labels[index].setPos(
-                    (bounds[index] + bounds[index + 1]) / 2.0, pos.y()
-                )
-        if self._labels:
-            last = len(self._regions) - 1
-            if last < len(self._labels):
-                pos = self._labels[last].pos()
-                self._labels[last].setPos(
-                    (bounds[last] + bounds[last + 1]) / 2.0, pos.y()
-                )
+                center = (bounds[index] + bounds[index + 1]) / 2.0
+                self._labels[index].setPos(center, pos.y())
+                self._label_centers[index] = center
+        # 拖分隔线会把某一道挤窄：间距变了，降级档位得重新评一次
+        self._relayout_lane_labels()
 
     # ------------------------------------------------------------------ 右图：泳道纵向剖面
 
@@ -513,7 +727,7 @@ class ProfilePanel(QWidget):
             self._current_lane = None
             self._lane_plot.clear()
             self._lane_plot.getPlotItem().setTitle(
-                LANE_TITLE_EMPTY, color=TITLE_COLOR, size="10pt"
+                LANE_TITLE_EMPTY, color=TITLE_COLOR, size=self._title_size()
             )
             return
         wanted = self._current_lane
@@ -584,10 +798,13 @@ class ProfilePanel(QWidget):
         plot_item.setTitle(
             f"L{self._current_lane} 条带积分合计：{self._lane_total(target):,.1f}",
             color=TITLE_COLOR,
-            size="10pt",
+            size=self._title_size(),
         )
         plot_item.enableAutoRange()
 
     def clear(self) -> None:
         self.clear_column_profile()
         self.set_lane_profiles([])
+        # 量程也要退回去：不复位的话空面板上还留着上一张膜的横轴刻度（"50…350"），
+        # 看上去像是图还在、只是曲线没画出来。
+        self.reset_views()
