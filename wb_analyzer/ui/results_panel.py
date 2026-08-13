@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QItemSelectionModel, Qt, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QPushButton,
     QTableWidget,
@@ -18,21 +19,48 @@ from PySide6.QtWidgets import (
 from . import theme
 from .tablefmt import NumberDelegate, full_precision
 
-HEADERS = ["泳道", "条带", "X", "Y", "宽", "高", "积分灰度", "背景", "平均灰度", "饱和 %", "S/N"]
+HEADERS = [
+    "泳道",
+    "条带",
+    "计入",
+    "X",
+    "Y",
+    "宽",
+    "高",
+    "积分灰度",
+    "背景",
+    "平均灰度",
+    "饱和 %",
+    "S/N",
+]
 SATURATED_COLOR = QColor("#ffb74d")
 BELOW_DETECTION_COLOR = QColor(theme.RESULT_BOX_WEAK)
 """低于检出限的行整体压暗：数值还在，但不该被当成真实信号读。"""
 
+USAGE_COLUMN = 2
+DENSITY_COLUMN = 7
+ADOPTED_TEXT = "计入"
+UNUSED_TEXT = "未采用"
+UNUSED_COLOR = QColor(theme.TEXT_FAINT)
+
 # 积分灰度 / 背景 / 平均灰度：显示按千分位取整，悬停给全精度
-FULL_PRECISION_COLUMNS = (6, 7, 8)
+FULL_PRECISION_COLUMNS = (7, 8, 9)
 LOD_TIP = "信噪比 < 3，低于检出限：该积分与空白泳道无法区分，不要用它做比值"
+UNUSED_TIP = (
+    "当前条带策略没有采用这一条：它仍是真实测量值，只是不计入该泳道的合计"
+    "（积分灰度上划了删除线的就是没被加进去的那个数）。\n"
+    "这和“删除”是两回事——删除会让它从结果表和画布上彻底消失，"
+    "未采用只是不参与聚合，换个策略随时会重新计入。"
+)
+ADOPTED_TIP = "这一条计入了该泳道的合计"
 
 
-def _row_values(m) -> tuple:
+def _row_values(m, adopted: bool = True) -> tuple:
     """一行的列值，顺序与 :data:`HEADERS` 一致（表格与复制共用一份）。"""
     return (
         int(m.lane),
         int(m.band),
+        ADOPTED_TEXT if adopted else UNUSED_TEXT,
         int(m.x),
         int(m.y),
         int(m.width),
@@ -70,6 +98,7 @@ class ResultsPanel(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._measurements: list = []
+        self._unused: set[int] = set()
         self._updating = False
 
         toolbar = QHBoxLayout()
@@ -90,6 +119,10 @@ class ResultsPanel(QWidget):
         self.table.setSortingEnabled(True)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setDefaultSectionSize(72)
+        # 「计入 / 未采用」必须整读，截成"未采…"就没了区分度
+        self.table.horizontalHeader().setSectionResizeMode(
+            USAGE_COLUMN, QHeaderView.ResizeMode.ResizeToContents
+        )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setItemDelegate(NumberDelegate(self.table))
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
@@ -113,14 +146,15 @@ class ResultsPanel(QWidget):
 
     # ------------------------------------------------------------------ 数据
 
-    def set_measurements(self, measurements: list) -> None:
+    def set_measurements(self, measurements: list, unused: list | None = None) -> None:
         self._measurements = list(measurements or [])
+        self._unused = {int(i) for i in (unused or [])}
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(self._measurements))
         for row, m in enumerate(self._measurements):
             saturated = float(m.saturated_fraction) >= 0.05
             weak = bool(m.below_detection)
-            for col, value in enumerate(_row_values(m)):
+            for col, value in enumerate(_row_values(m, row not in self._unused)):
                 item = QTableWidgetItem()
                 # EditRole 存数值：排序按数值走，显示交给 NumberDelegate
                 item.setData(Qt.ItemDataRole.EditRole, value)
@@ -132,19 +166,72 @@ class ResultsPanel(QWidget):
                 if col in FULL_PRECISION_COLUMNS:
                     tips.append(f"精确值：{full_precision(value)}")
                 # 饱和是「数值偏低但确实有信号」，低于检出限是「可能压根没有信号」，
-                # 后者更根本，两者同时命中时按它着色。
-                if weak:
+                # 后者更根本，两者同时命中时按它着色。“计入”列不参与这套配色：
+                # 它只表达“采没采用”，混进强弱配色就分不清是哪一件事了。
+                if col == USAGE_COLUMN:
+                    pass
+                elif weak:
                     item.setForeground(BELOW_DETECTION_COLOR)
                     tips.append(LOD_TIP)
                 elif saturated:
                     item.setForeground(SATURATED_COLOR)
-                if saturated:
+                if saturated and col != USAGE_COLUMN:
                     tips.append("饱和比例 ≥ 5%，定量可能失真")
                 if tips:
                     item.setToolTip("\n".join(tips))
                 self.table.setItem(row, col, item)
+            self._apply_usage(row, row)
         self.table.setSortingEnabled(True)
-        self._count_label.setText(_summary(self._measurements))
+        self._refresh_summary()
+
+    def set_band_usage(self, unused: list | None) -> None:
+        """更新“哪些条带不计入合计”，不重建表格（排序与选中都保持原样）。
+
+        未采用 ≠ 已删除：这里改的只是聚合口径，行还在、数字还在、画布上的框也
+        还在，只是描边换成虚线、积分灰度划掉。删除才会让它整个消失。
+
+        策略未生效之类的文字提示不在这里——它们和 ROI 自检一起挂在画布上方的
+        统一诊断条上（见 diagnostics_bar），免得同一件事在两个面板各说一遍。
+        """
+        self._unused = {int(i) for i in (unused or [])}
+        for row in range(self.table.rowCount()):
+            anchor = self.table.item(row, 0)
+            if anchor is None:
+                continue
+            original = anchor.data(Qt.ItemDataRole.UserRole)
+            if original is not None:
+                self._apply_usage(row, int(original))
+        self._refresh_summary()
+
+    def unused_bands(self) -> list[int]:
+        return sorted(self._unused)
+
+    def _apply_usage(self, row: int, original: int) -> None:
+        adopted = original not in self._unused
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item is None:
+                continue
+            font = QFont(self.table.font())
+            # 斜体是这张表里没被别的状态占用的通道（颜色归饱和 / 检出限），
+            # 删除线正好划在“本该被加进合计、现在没加”的那个数上
+            font.setItalic(not adopted)
+            font.setStrikeOut(not adopted and col == DENSITY_COLUMN)
+            item.setFont(font)
+        usage = self.table.item(row, USAGE_COLUMN)
+        if usage is None:
+            return
+        usage.setData(
+            Qt.ItemDataRole.EditRole, ADOPTED_TEXT if adopted else UNUSED_TEXT
+        )
+        usage.setForeground(QColor(theme.TEXT_DIM) if adopted else UNUSED_COLOR)
+        usage.setToolTip(ADOPTED_TIP if adopted else UNUSED_TIP)
+
+    def _refresh_summary(self) -> None:
+        text = _summary(self._measurements)
+        if self._measurements and self._unused:
+            text += f"，{len(self._unused)} 个未采用（仍显示，不计入合计）"
+        self._count_label.setText(text)
 
     def measurements(self) -> list:
         return list(self._measurements)
@@ -166,7 +253,8 @@ class ResultsPanel(QWidget):
         lines = ["\t".join(HEADERS)]
         for index in originals:
             m = self._measurements[index]
-            lines.append("\t".join(str(v) for v in _row_values(m)))
+            values = _row_values(m, index not in self._unused)
+            lines.append("\t".join(str(v) for v in values))
         QGuiApplication.clipboard().setText("\n".join(lines))
 
     def _request_delete(self) -> None:

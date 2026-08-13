@@ -1,10 +1,24 @@
-"""界面层并发与结果一致性回归测试（离屏运行）。
+﻿"""界面层并发与结果一致性回归测试（离屏运行）。
 
-覆盖三块：
+覆盖：
 * U1：后台任务必须绑定图像身份，换图 / 旋转后旧结果不得落到新图上。
   加载与旋转本身异步化之后，这里额外盯住 doc_version 的递增时机。
 * U5：两类后台任务的界面反馈——结果类锁输入、呈现类不锁且后来者顶掉前者。
 * U2：删除条带 / 撤销只能过滤，不能换一套算法重测、也不能重排泳道号。
+* U6：ROI 定量与自动检测是两套背景口径，画布 / 结果表 / 归一化历史都不许混。
+* U7：条带标签在任何缩放下要么清晰不重叠、要么整批隐藏（必须真渲染才算测到）。
+* U8：橡皮筋框选多个条带，批量删除只占撤销栈一格。
+* U9：剖面图里增删分隔线要和画布同一套判定、同一套坐标，图例不许遮挡泳道标签。
+* U10：溯源接线——口径与条带策略由 QuantEntry 自己带；跨口径显式标红；
+  未采用的条带仍然显示但一眼能和"已删除"分开；单条带泳道要说清策略没生效。
+* U11：「每道条带数」——自动判据切不开时的手动兜底，语义与「期望泳道数」对称；
+  改它只重新分段、不许动分隔线；切不够那么多条时必须点名说清楚。
+* U12：ROI 自检接线——与定量同一次任务同一个 expected_bands；三路提示汇到一条
+  诊断条；画布只用形状与纹理标注（不新增第五种颜色）；「我知道了」按内容忽略。
+* U13：自动测倾角——只给建议不自动转；必须画出参考线让人目视确认；四种拒答
+  一律不许抹掉用户手动量的标尺值。
+* U14：发表级导出——两个版本各用各的灰度映射；旋转要从原图按 Lanczos 重做；
+  覆盖确认要覆盖全部 4 个落盘文件；对话框里不许再出现有损格式。
 """
 
 from __future__ import annotations
@@ -22,14 +36,17 @@ pytest.importorskip("PySide6")
 pytest.importorskip("pyqtgraph")
 
 from PySide6.QtCore import QEvent, QPointF, QSettings, Qt  # noqa: E402
-from PySide6.QtGui import QKeyEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PySide6.QtGui import QKeyEvent, QMouseEvent  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox  # noqa: E402
 
 from wb_analyzer.imageio import blot_from_array  # noqa: E402
-from wb_analyzer.roi import MAX_STRAIGHTEN_ANGLE, RoiRect  # noqa: E402
+from wb_analyzer.roi import MAX_STRAIGHTEN_ANGLE, RoiRect, lane_boundaries  # noqa: E402
 from wb_analyzer.ui import canvas as canvas_mod  # noqa: E402
 from wb_analyzer.ui import errorlog, workers  # noqa: E402
 from wb_analyzer.ui import main_window as mw  # noqa: E402
+from wb_analyzer.ui import normalize_panel as nzp  # noqa: E402
+from wb_analyzer.ui import profile_panel as pp  # noqa: E402
 from wb_analyzer.ui import results_panel as rp  # noqa: E402
 from wb_analyzer.ui.canvas import Tool  # noqa: E402
 from wb_analyzer.ui.main_window import MainWindow  # noqa: E402
@@ -78,6 +95,7 @@ def noisy_raw(depths: list[float], *, noise: float, seed: int = 4) -> np.ndarray
 def make_window(qt_app) -> MainWindow:
     window = MainWindow()
     window.lane_spin.setValue(0)
+    window.band_spin.setValue(0)  # 同样会被 QSettings 记住，逐项复位
     window.bg_combo.setCurrentIndex(1)  # 固定“深色条带”，排除自动判定的干扰
     # 显式复位会被持久化的开关，别让上一次运行留下的 QSettings 影响断言
     window.snap_check.setChecked(True)
@@ -195,10 +213,18 @@ def key_event(key, modifiers=Qt.KeyboardModifier.NoModifier) -> QKeyEvent:
     return QKeyEvent(QEvent.Type.KeyPress, key, modifiers)
 
 
-def add_history(window: MainWindow, kind: str, name: str, group: str = "默认") -> None:
+def add_history(
+    window: MainWindow,
+    kind: str,
+    name: str,
+    group: str = "默认",
+    pick: str | None = None,
+) -> None:
     window.normalize_panel.set_kind(kind)
     window.normalize_panel.set_protein_name(name)
     window.normalize_panel.set_group_name(group)
+    if pick is not None:
+        window.normalize_panel.set_band_pick(pick)
     window._on_add_to_history()
 
 
@@ -623,9 +649,10 @@ def test_quantify_roi_profiles_each_lane_once(qt_app, monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(mw.quant, "compute_lane_profiles", counted)
-    result, lanes = mw.quantify_roi(blot, roi, [107.0, 202.0], True)
+    result, lanes, report = mw.quantify_roi(blot, roi, [107.0, 202.0], True)
 
     assert len(calls) == 1, "一次 ROI 定量只该算一遍泳道剖面"
+    assert report is not None, "自检要和定量在同一次后台任务里跑完"
     assert [lane.lane for lane in lanes] == [1, 2, 3]
     for m in result.measurements:
         lane = lanes[m.lane - 1]
@@ -1206,3 +1233,2096 @@ def test_worker_cancel_suppresses_callbacks(qt_app):
     qt_app.processEvents()
     assert calls == []
     assert workers.active_count() == 0
+
+
+# ------------------------------------------------------------------ U6 两条口径互斥
+
+
+def test_auto_detect_clears_the_roi_path_overlay(qt_app):
+    """点“自动检测”＝换一套背景口径：ROI、分隔线与 ROI 定量结果一起下画布。
+
+    两套结果同时挂在图上时，用户分不出手里的数字出自哪套口径——README 方法学
+    第 9 节明确写着它们不可混用。
+    """
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    assert window.canvas.separators(), "前置条件：ROI 定量应当画出分隔线"
+    assert window._result_origin == mw.ORIGIN_ROI
+
+    window._run_auto(synchronous=True)
+    assert settle(window)
+
+    assert window._result_origin == mw.ORIGIN_DETECT
+    assert window._roi is None, "自动检测口径下不该还留着 ROI"
+    assert window.canvas.roi() is None
+    assert window.canvas.separators() == [], "橙色分隔线属于 ROI 定量那条路"
+    assert window.profile_panel._profile is None, "ROI 横向剖面也该一起清掉"
+    close(window)
+
+
+def test_switching_to_auto_detect_is_one_undo_step(qt_app):
+    """切换口径是一次真正的状态变更：Ctrl+Z 一步把 ROI 和它的结果一起找回来。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    before = bands(window)
+    roi_before = window._roi
+    seps_before = list(window._separators)
+    undo_depth = len(window._undo)
+
+    window._run_auto(synchronous=True)
+    assert settle(window)
+    assert len(window._undo) == undo_depth + 1, "切换口径只该压一步撤销"
+
+    window._undo_last()
+    assert settle(window)
+    assert window._roi == roi_before
+    assert window._separators == seps_before
+    assert bands(window) == before, "撤销要连同 ROI 定量的原始数值一起回来"
+    assert window._result_origin == mw.ORIGIN_ROI
+    close(window)
+
+
+def test_new_roi_drops_detect_boxes_before_quantifying(qt_app):
+    """画上 ROI 的那一刻自动检测的框就得消失，不能等定量算完才换。
+
+    定量要等剖面任务 + 400 ms 防抖，大图上是好几秒；这期间画布上会同时挂着
+    "新 ROI + 上一轮检测框"，而且定量失败的话它们再也不会被换掉。
+    """
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    window._run_auto(synchronous=True)
+    assert window._result is not None and window._result.measurements
+    assert window.canvas._band_items, "前置条件：自动检测应当画出条带框"
+
+    x, y, inset, height = ROI_BOX
+    window.canvas.set_roi(x, y, window._blot.width + inset, height)
+    window._apply_roi_change()
+    # 还没 settle：此刻定量必然没算完
+    assert window.canvas._band_items == [], "旧口径的条带框必须当场清掉"
+    assert window._result is None
+
+    assert settle(window)
+    assert window._result_origin == mw.ORIGIN_ROI
+    close(window)
+
+
+def test_hand_drawn_band_refuses_to_mix_background_conventions(qt_app):
+    """ROI 口径下补画的框量不了时宁可不加，也不能退回局部背景凑一个数。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    set_roi_and_quantify(window)
+    before = bands(window)
+
+    # 1 px 宽的框：measure_band_roi_style 给不出结果
+    window._on_band_drawn(float(window._blot.width - 1), 100.0, 1.0, 20.0)
+
+    assert bands(window) == before, "不可比的数值不许混进同一张结果表"
+    assert "口径" in window._hint_label.text()
+    close(window)
+
+
+def test_history_flags_mixed_background_conventions(qt_app):
+    """同一分组里混进两套口径的历史记录：必须显式警告，不能默默算比值。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    add_history(window, "loading_control", "Actin", "G1")
+    assert window.normalize_panel.history_table.item(0, 4).text() == "ROI 基线"
+
+    window._run_auto(synchronous=True)
+    assert settle(window)
+    assert window._result is not None and window._result.measurements
+    add_history(window, "target", "PAD4", "G1")
+
+    assert window._mixed_origin_groups() == ["G1"]
+    assert window.normalize_panel.history_table.item(1, 4).text() == "局部背景"
+    hint = window.normalize_panel._result_hint.text()
+    assert "口径" in hint and "G1" in hint
+    close(window)
+
+
+# ------------------------------------------------------------------ U7 条带标签可读性
+
+
+def fake_bands(count: int, *, x0: float = 20.0, pitch: float = 45.0, width: float = 36.0):
+    """一排等间距窄条带——标签比条带还宽，正是用户那张图的形态。
+
+    直接造 BandMeasurement 而不跑定量：标签排布是纯绘制问题，不该被泳道划分
+    算法的改动带偏。
+    """
+    out = []
+    for i in range(count):
+        out.append(
+            mw.BandMeasurement(
+                lane=i + 1,
+                band=1,
+                x=int(x0 + i * pitch),
+                y=100,
+                width=int(width),
+                height=30,
+                area=int(width) * 30,
+                mean_intensity=100.0,
+                background=10.0,
+                integrated_density=1000.0 * (i + 1),
+            )
+        )
+    return out
+
+
+def canvas_with_bands(qt_app, count: int = 9, *, extra_stacked: bool = True):
+    canvas = canvas_mod.BlotCanvas()
+    canvas.resize(900, 500)
+    canvas.set_image(np.full((240, 60 + count * 45, 3), 200, dtype=np.uint8))
+    measurements = fake_bands(count)
+    if extra_stacked:
+        # 同一泳道纵向叠放的第二条带：标签会和上面那条抢位置
+        first = measurements[0]
+        measurements.append(
+            mw.BandMeasurement(
+                lane=1,
+                band=2,
+                x=first.x,
+                y=first.y + 40,
+                width=first.width,
+                height=first.height,
+                area=first.area,
+                mean_intensity=90.0,
+                background=10.0,
+                integrated_density=800.0,
+            )
+        )
+    canvas.show_result_boxes(measurements)
+    qt_app.processEvents()
+    return canvas, measurements
+
+
+def label_overlaps(canvas) -> list[tuple[int, int]]:
+    rects = canvas.band_label_rects()
+    return [
+        (i, j)
+        for i in range(len(rects))
+        for j in range(i + 1, len(rects))
+        if rects[i].intersects(rects[j])
+    ]
+
+
+def zoom_to(canvas, scale: float) -> None:
+    canvas.zoom_100()
+    canvas.scale(scale, scale)
+    canvas._on_scale_changed()
+
+
+def test_band_labels_never_overlap_at_any_zoom(qt_app):
+    """25% / 51% / 100% / 200% 各真渲染一遍：要么清晰不重叠，要么干脆不画。
+
+    这是纯绘制改动，离屏断言不触发 paint，必须 grab() 一次才算测到。
+    """
+    canvas, measurements = canvas_with_bands(qt_app)
+    for scale in (0.25, 0.51, 1.0, 2.0):
+        zoom_to(canvas, scale)
+        render(canvas, qt_app)
+        overlaps = label_overlaps(canvas)
+        assert not overlaps, f"{scale:.0%} 下标签互相压住：{overlaps}"
+        visible = canvas.band_label_rects()
+        assert len(visible) in (0, len(measurements)), (
+            f"{scale:.0%} 下只显示了一部分标签，用户无法预期哪几个会留下"
+        )
+    canvas.deleteLater()
+
+
+def test_band_labels_stay_inside_the_image(qt_app):
+    """最左 / 最右那个条带的标签不许探出图像边界。"""
+    canvas, _ = canvas_with_bands(qt_app, count=4, extra_stacked=False)
+    for scale in (0.51, 1.0, 3.0):
+        zoom_to(canvas, scale)
+        render(canvas, qt_app)
+        left_edge = canvas.mapFromScene(QPointF(0.0, 0.0)).x()
+        right_edge = canvas.mapFromScene(QPointF(float(canvas._image_w), 0.0)).x()
+        for rect in canvas.band_label_rects():
+            assert rect.left() >= left_edge - 1, "标签探出了图像左边界"
+            assert rect.right() <= right_edge + 1, "标签探出了图像右边界"
+    canvas.deleteLater()
+
+
+def test_crowded_labels_degrade_then_hide(qt_app):
+    """从大到小走一遍缩放：完整文案 → 只剩泳道号 → 整批隐藏，全程不许重叠。
+
+    具体在哪个倍率换档取决于字体度量，不写死；要保证的是三档都出现过，而且
+    任何一档都不会出现"糊成一团"的中间态。
+    """
+    canvas, _ = canvas_with_bands(qt_app)
+    seen: list[tuple[bool, bool]] = []
+    for scale in (2.0, 1.5, 1.0, 0.8, 0.6, 0.5, 0.45, 0.4, 0.35, 0.3, 0.2, 0.1):
+        zoom_to(canvas, scale)
+        render(canvas, qt_app)
+        assert not label_overlaps(canvas), f"{scale:.0%} 下标签重叠了"
+        if canvas.labels_packed() and canvas.labels_compact():
+            assert canvas._band_labels[0].text() == "L1"
+        seen.append((canvas.labels_packed(), canvas.labels_compact()))
+
+    assert seen[0] == (True, False), "放得开时应当显示完整的 L#-B#"
+    assert (True, True) in seen, "中间应当有一档退化成只写泳道号"
+    assert seen[-1][0] is False, "缩到最小就整批隐藏"
+    assert canvas.band_label_rects() == [], "隐藏这一档一个标签都不该画"
+    canvas.deleteLater()
+
+
+def test_selected_band_label_shows_even_when_hidden(qt_app):
+    """整批隐藏之后，选中的那几个仍要能看清是谁。"""
+    canvas, measurements = canvas_with_bands(qt_app)
+    zoom_to(canvas, 0.1)
+    assert canvas.band_label_rects() == []
+
+    canvas.select_bands([0, 8])
+    qt_app.processEvents()
+    render(canvas, qt_app)
+    assert len(canvas.band_label_rects()) == 2, "选中的条带标签要露出来"
+    assert not label_overlaps(canvas)
+
+    # 全选到摆不开时也不能退回一团糊
+    canvas.select_bands(list(range(len(measurements))))
+    qt_app.processEvents()
+    render(canvas, qt_app)
+    assert not label_overlaps(canvas)
+    canvas.deleteLater()
+
+
+# ------------------------------------------------------------------ U8 框选多选与批量删除
+
+
+def mouse_event(canvas, kind, scene_x, scene_y, modifiers=Qt.KeyboardModifier.NoModifier):
+    pos = QPointF(canvas.mapFromScene(QPointF(float(scene_x), float(scene_y))))
+    return QMouseEvent(
+        kind,
+        pos,
+        pos,
+        QPointF(canvas.viewport().mapToGlobal(pos.toPoint())),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        modifiers,
+    )
+
+
+def rubber_band(canvas, start, end, modifiers=Qt.KeyboardModifier.NoModifier) -> None:
+    canvas.mousePressEvent(
+        mouse_event(canvas, QEvent.Type.MouseButtonPress, *start, modifiers)
+    )
+    canvas.mouseMoveEvent(
+        mouse_event(canvas, QEvent.Type.MouseMove, *end, modifiers)
+    )
+    canvas.mouseReleaseEvent(
+        mouse_event(canvas, QEvent.Type.MouseButtonRelease, *end, modifiers)
+    )
+
+
+def test_rubber_band_selects_many_bands_in_adjust_mode(qt_app):
+    """“调整”模式下在 ROI 外拖一个框：框到的条带全部进入选中态。"""
+    canvas, measurements = canvas_with_bands(qt_app, count=9, extra_stacked=False)
+    canvas.set_tool(Tool.ADJUST)
+    canvas.set_roi(10, 90, 400, 50)
+    reported: list[list[int]] = []
+    canvas.bandSelectionChanged.connect(reported.append)
+
+    third = measurements[2]
+    end = (third.x + third.width + 2, 200)
+    canvas.mousePressEvent(mouse_event(canvas, QEvent.Type.MouseButtonPress, 5, 20))
+    canvas.mouseMoveEvent(mouse_event(canvas, QEvent.Type.MouseMove, *end))
+    render(canvas, qt_app)  # 选择框本身也是新画的图元，得真画一遍
+    canvas.mouseReleaseEvent(
+        mouse_event(canvas, QEvent.Type.MouseButtonRelease, *end)
+    )
+
+    assert canvas.selected_bands() == [0, 1, 2]
+    assert reported == [[0, 1, 2]], "拖动过程中不该反复往结果表发信号"
+    render(canvas, qt_app)
+    canvas.deleteLater()
+
+
+def test_rubber_band_adds_with_ctrl_inside_the_roi(qt_app):
+    """ROI 内空白默认还是整体拖 ROI；按住 Ctrl 才改成框选加选。"""
+    canvas, measurements = canvas_with_bands(qt_app, count=9, extra_stacked=False)
+    canvas.set_tool(Tool.ADJUST)
+    canvas.set_roi(0, 80, 500, 80)
+
+    # 无修饰键：ROI 内空白处（避开条带框）拖拽仍是移动 ROI
+    canvas.mousePressEvent(
+        mouse_event(canvas, QEvent.Type.MouseButtonPress, 240, 150)
+    )
+    assert canvas._drag is not None and canvas._drag["kind"] == "move_roi"
+    canvas._cancel_drag()
+
+    canvas.select_bands([7])
+    first, second = measurements[0], measurements[1]
+    rubber_band(
+        canvas,
+        (first.x - 4, 90),
+        (second.x + second.width + 2, 150),
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert canvas.selected_bands() == [0, 1, 7], "Ctrl 框选是加选，不该丢掉原有选中"
+    canvas.deleteLater()
+
+
+def test_rubber_band_does_not_steal_other_tools_drags(qt_app):
+    """框选只在“调整”模式生效：画 ROI / 补画条带 / 标尺的拖拽不能被抢走。"""
+    canvas, _ = canvas_with_bands(qt_app, count=4, extra_stacked=False)
+    for tool, kind in (
+        (Tool.ROI, "new_roi"),
+        (Tool.BAND, "new_band"),
+        (Tool.RULER, "ruler"),
+    ):
+        canvas.set_tool(tool)
+        canvas.mousePressEvent(
+            mouse_event(canvas, QEvent.Type.MouseButtonPress, 5, 20)
+        )
+        assert canvas._drag is not None and canvas._drag["kind"] == kind
+        canvas._cancel_drag()
+    canvas.deleteLater()
+
+
+def test_ctrl_click_toggles_and_shift_click_adds(qt_app):
+    canvas, measurements = canvas_with_bands(qt_app, count=4, extra_stacked=False)
+    canvas.set_tool(Tool.ADJUST)
+
+    def click(index, modifiers=Qt.KeyboardModifier.NoModifier):
+        m = measurements[index]
+        canvas.mousePressEvent(
+            mouse_event(
+                canvas,
+                QEvent.Type.MouseButtonPress,
+                m.x + m.width / 2.0,
+                m.y + m.height / 2.0,
+                modifiers,
+            )
+        )
+
+    click(0)
+    assert canvas.selected_bands() == [0]
+    click(1, Qt.KeyboardModifier.ShiftModifier)
+    assert canvas.selected_bands() == [0, 1]
+    click(2, Qt.KeyboardModifier.ControlModifier)
+    assert canvas.selected_bands() == [0, 1, 2]
+    click(1, Qt.KeyboardModifier.ControlModifier)
+    assert canvas.selected_bands() == [0, 2], "Ctrl 再点一次应当减选"
+    click(3)
+    assert canvas.selected_bands() == [3], "无修饰键是单选"
+    canvas.deleteLater()
+
+
+def test_escape_cancels_a_rubber_band_without_losing_the_selection(qt_app):
+    canvas, measurements = canvas_with_bands(qt_app, count=6, extra_stacked=False)
+    canvas.set_tool(Tool.ADJUST)
+    canvas.select_bands([4])
+
+    canvas.mousePressEvent(mouse_event(canvas, QEvent.Type.MouseButtonPress, 5, 20))
+    canvas.mouseMoveEvent(mouse_event(canvas, QEvent.Type.MouseMove, 200, 200))
+    assert canvas.selected_bands() != [4], "拖动中应当实时改选中态"
+    canvas.keyPressEvent(key_event(Qt.Key.Key_Escape))
+
+    assert canvas.selected_bands() == [4], "Esc 取消框选要把选中还原回去"
+    assert canvas._drag is None
+    canvas.deleteLater()
+
+
+def test_batch_delete_is_a_single_undo_step(qt_app):
+    """一次删掉多个条带只占撤销栈一格：Ctrl+Z 按一次就全回来。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0, 8000.0]))
+    set_roi_and_quantify(window)
+    before = bands(window)
+    assert len(before) >= 3
+    undo_depth = len(window._undo)
+
+    window.canvas.select_bands([0, 1, 2])
+    window.canvas.keyPressEvent(key_event(Qt.Key.Key_Delete))
+
+    assert len(bands(window)) == len(before) - 3
+    assert len(window._undo) == undo_depth + 1, "批量删除不该压成 3 步"
+
+    window._undo_last()
+    assert bands(window) == before, "一次 Ctrl+Z 要把整批都恢复"
+    close(window)
+
+
+def test_results_table_deletes_every_selected_row_at_once(qt_app):
+    """结果表的“删除选中”支持多选，并且同样只算一步撤销。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0, 8000.0]))
+    set_roi_and_quantify(window)
+    before = bands(window)
+    assert len(before) >= 3
+    undo_depth = len(window._undo)
+
+    window.results_panel.select_rows_by_original([0, 2])
+    assert window.results_panel._selected_original_rows() == [0, 2], (
+        "结果表应当支持多行选中"
+    )
+    window.results_panel._request_delete()
+
+    assert len(bands(window)) == len(before) - 2
+    assert len(window._undo) == undo_depth + 1
+    window._undo_last()
+    assert bands(window) == before
+    close(window)
+
+
+# ------------------------------------------------------------------ U9 剖面图增删分隔线
+
+
+def profile_ready(qt_app, lanes: int = 4, width: int = 1500):
+    """加载 → ROI → 定量，并把窗口真的摆出来（换算坐标需要视口尺寸）。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0 - 2000.0 * i for i in range(lanes)]))
+    window.resize(width, 950)
+    window.show()
+    qt_app.processEvents()
+    set_roi_and_quantify(window)
+    qt_app.processEvents()
+    assert window.profile_panel._profile is not None, "前置条件：左图要有剖面"
+    assert len(window._separators) >= 2
+    return window
+
+
+def profile_pos(window, image_x: float):
+    """图像像素 x → 左图视口坐标。"""
+    plot = window.profile_panel._col_plot
+    view_box = plot.getPlotItem().getViewBox()
+    low, high = view_box.viewRange()[1]
+    scene_pt = view_box.mapViewToScene(QPointF(float(image_x), (low + high) / 2.0))
+    return plot.mapFromScene(scene_pt)
+
+
+def profile_x_under(window, pos):
+    """视口坐标底下真正的图像像素 x。
+
+    视口坐标是整数，点不到正好的整数图像列；断言要拿"光标底下那一列"去比，
+    拿名义目标去比只是在比 mapFromScene 的取整误差。
+    """
+    panel = window.profile_panel
+    return panel.image_x_at(panel._col_plot.mapToScene(pos))
+
+
+def profile_double_click(window, pos) -> None:
+    QTest.mouseDClick(
+        window.profile_panel._col_plot.viewport(),
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        pos,
+    )
+
+
+def profile_right_click(window, pos) -> None:
+    viewport = window.profile_panel._col_plot.viewport()
+    for send in (QTest.mousePress, QTest.mouseRelease):
+        send(viewport, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, pos)
+
+
+def test_double_click_on_the_profile_adds_a_separator_at_that_pixel(qt_app):
+    """双击剖面曲线加分隔线，落点必须就是光标底下那一列。
+
+    横轴是绝对图像列号，差一像素泳道边界就挪一列，积分跟着变——所以这里比的
+    是逐位相等，不是"差不多"。
+    """
+    window = profile_ready(qt_app)
+    panel = window.profile_panel
+    before = list(window._separators)
+    pos = profile_pos(window, float(window._roi.x) + 137.0)
+    expected = profile_x_under(window, pos)
+    assert expected is not None
+
+    profile_double_click(window, pos)
+    assert settle(window), "加分隔线之后应当自动重新定量"
+
+    added = [s for s in window._separators if all(abs(s - old) > 1e-12 for old in before)]
+    assert len(added) == 1, "剖面图双击应当加出一条分隔线"
+    assert added[0] == expected, "落点必须逐位等于光标下那一列"
+    assert window.canvas.separators() == window._separators, "画布要拿到同一批分隔线"
+    assert panel.separators() == sorted(window._separators)
+
+    bounds = lane_boundaries(window._roi, window._separators)
+    edges = {edge for pair in bounds for edge in pair}
+    assert int(round(expected)) in edges, "泳道边界必须切在这一列上"
+    assert len(bounds) == len(before) + 2, "泳道数应当正好多一个"
+    close(window)
+
+
+def test_profile_x_axis_is_absolute_image_columns(qt_app):
+    """左图横轴就是图像列号：任何常数偏移都会静悄悄改掉定量。"""
+    window = profile_ready(qt_app)
+    panel = window.profile_panel
+    roi = window._roi
+    xs, _ys = panel._col_curve.getData()
+    assert float(xs[0]) == float(roi.x)
+    assert float(xs[-1]) == float(roi.x) + float(roi.width) - 1.0
+
+    scale = float(panel._col_plot.getPlotItem().getViewBox().viewPixelSize()[0])
+    for offset in (5.0, 100.0, float(roi.width) / 2.0, float(roi.width) - 10.0):
+        target = float(roi.x) + offset
+        back = profile_x_under(window, profile_pos(window, target))
+        assert back is not None
+        assert abs(back - target) <= scale, f"{target} 换算回来偏了 {back - target} 列"
+    close(window)
+
+
+def test_profile_add_separator_obeys_the_canvas_limits(qt_app):
+    """内缩量、最小间距都照抄画布，两处不能各有一套判定。"""
+    window = profile_ready(qt_app)
+    panel = window.profile_panel
+    roi = window._roi
+
+    assert panel.add_separator(float(roi.x) - 80.0), "贴边点击应当夹进 ROI 而不是丢掉"
+    assert settle(window)
+    assert min(window._separators) == pytest.approx(float(roi.x) + canvas_mod.MIN_ROI_PX)
+
+    count = len(window._separators)
+    assert not panel.add_separator(min(window._separators) + 1.0), "紧挨着不许再插一条"
+    assert len(window._separators) == count
+
+    assert panel.add_separator(float(roi.x) + float(roi.width) + 50.0)
+    assert settle(window)
+    assert max(window._separators) == pytest.approx(
+        float(roi.x) + float(roi.width) - canvas_mod.MIN_ROI_PX
+    )
+
+    # 拖动可达范围也要和画布同一个内缩量
+    assert panel._drag_bounds() == (
+        float(roi.x) + canvas_mod.SEP_MARGIN,
+        float(roi.x) + float(roi.width) - canvas_mod.SEP_MARGIN,
+    )
+    close(window)
+
+
+def test_right_click_on_a_profile_separator_deletes_it(qt_app, monkeypatch):
+    """右键分隔线删除，和画布上右键弹的是同一个确认菜单。"""
+    window = profile_ready(qt_app)
+    for plot in (window.profile_panel._col_plot, window.profile_panel._lane_plot):
+        assert plot.getPlotItem().getViewBox().menuEnabled() is False, (
+            "pyqtgraph 默认右键菜单必须让位"
+        )
+
+    before = list(window._separators)
+    victim = before[1]
+    monkeypatch.setattr(pp, "_confirm_delete_separator", lambda *_args: False)
+    profile_right_click(window, profile_pos(window, victim))
+    assert settle(window)
+    assert window._separators == before, "菜单里没点确认就不能删"
+
+    monkeypatch.setattr(pp, "_confirm_delete_separator", lambda *_args: True)
+    profile_right_click(window, profile_pos(window, victim))
+    assert settle(window)
+    assert window._separators == [s for s in before if s != victim]
+    assert window.canvas.separators() == window._separators
+
+    count = len(window._separators)
+    empty = (window._separators[0] + window._separators[1]) / 2.0
+    profile_right_click(window, profile_pos(window, empty))
+    assert settle(window)
+    assert len(window._separators) == count, "空白处右键不许误删最近的那条"
+    close(window)
+
+
+def test_profile_separator_edit_is_one_undo_step(qt_app):
+    """在剖面图里增删和在画布上增删一样：一次编辑一格撤销，并自动重新定量。"""
+    window = profile_ready(qt_app)
+    before = list(window._separators)
+    lanes_before = len(window._lanes)
+    depth = len(window._undo)
+
+    assert window.profile_panel.add_separator(float(window._roi.x) + 137.0)
+    assert settle(window)
+    assert len(window._undo) == depth + 1, "加一条分隔线只该占撤销栈一格"
+    assert len(window._lanes) == lanes_before + 1, "定量必须跟着重跑"
+
+    window._undo_last()
+    assert settle(window)
+    assert window._separators == before
+    assert window.canvas.separators() == before
+    assert window.profile_panel.separators() == sorted(before)
+    close(window)
+
+
+def test_profile_separator_editing_ignores_the_canvas_tool_mode(qt_app):
+    """剖面图里增删分隔线不受工具模式约束。
+
+    画布上双击加分隔线只在"调整"模式生效，是因为框选 ROI / 补画条带都占着鼠标
+    拖拽，不分模式就打架。剖面图里没有别的手势要抢，而且分隔线本来就随时能拖，
+    只把"加 / 删"卡在调整模式，同一张图里三个动作两套规矩反而更别扭；用户的流程
+    又正是"圈完 ROI 立刻调分隔线"，强制切模式等于把这个改进的价值打掉一半。
+    """
+    window = profile_ready(qt_app)
+    for index, tool in enumerate(Tool):
+        window._select_tool(tool)
+        count = len(window._separators)
+        profile_double_click(window, profile_pos(window, float(window._roi.x) + 30.0 + 8.0 * index))
+        assert settle(window)
+        assert len(window._separators) == count + 1, f"{tool.value} 模式下也该加得上"
+    close(window)
+
+
+def test_profile_double_click_no_longer_resets_the_left_view(qt_app):
+    """双击让给了加分隔线，复位改走按钮——手势没了，功能不能丢。"""
+    window = profile_ready(qt_app)
+    panel = window.profile_panel
+    view_box = panel._col_plot.getPlotItem().getViewBox()
+    left = float(window._roi.x) + 20.0
+    view_box.setXRange(left, left + 60.0, padding=0)
+    qt_app.processEvents()
+    zoomed = list(view_box.viewRange()[0])
+
+    count = len(window._separators)
+    pos = profile_pos(window, left + 30.0)
+    expected = profile_x_under(window, pos)
+    profile_double_click(window, pos)
+    assert settle(window)
+    assert len(window._separators) == count + 1, "双击应当加分隔线"
+    assert expected in window._separators, "放大之后落点换算同样必须逐位对得上"
+    assert list(view_box.viewRange()[0]) == pytest.approx(zoomed, rel=1e-6), (
+        "双击不该再顺手把视图复位"
+    )
+
+    panel.reset_views()
+    qt_app.processEvents()
+    assert list(view_box.viewRange()[0]) != pytest.approx(zoomed, rel=1e-6), (
+        "复位视图按钮仍然必须能退出框选放大"
+    )
+    close(window)
+
+
+def test_profile_legend_never_covers_lane_labels(qt_app):
+    """图例挪出坐标区：9 / 12 / 16 泳道都不许盖住任何 L# 分区标签。"""
+    for lanes in (9, 12, 16):
+        window = make_window(qt_app)
+        load_array(
+            window, synthetic_raw([20000.0 - 700.0 * i for i in range(lanes)])
+        )
+        window.resize(1500, 950)
+        window.show()
+        qt_app.processEvents()
+        set_roi_and_quantify(window)
+        panel = window.profile_panel
+        render(panel, qt_app)
+
+        for plot in (panel._col_plot, panel._lane_plot):
+            assert plot.getPlotItem().legend is None, "坐标区里不该再有压住标签的图例"
+        assert len(panel._labels) == lanes, "前置条件：每个泳道一个分区标签"
+
+        view_rect = panel._col_plot.getPlotItem().getViewBox().sceneBoundingRect()
+        rects = [item.mapRectToScene(item.boundingRect()) for item in panel._labels]
+        for index, rect in enumerate(rects):
+            assert view_rect.contains(rect.center()), f"L{index + 1} 跑出了绘图区"
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                assert not rects[i].intersects(rects[j]), (
+                    f"{lanes} 泳道时 L{i + 1} 和 L{j + 1} 叠在一起"
+                )
+
+        texts = {
+            label.text()
+            for strip in panel.findChildren(pp.LegendStrip)
+            for label in strip.findChildren(QLabel)
+        }
+        for wanted in ("列平均信号", "泳道信号", "扣除用基线", "积分区间（条带）"):
+            assert any(wanted in text for text in texts), f"图例丢了「{wanted}」"
+        close(window)
+
+
+# ------------------------------------------------------------------ U10 溯源接线
+
+
+DOUBLET_CENTERS = (85.0, 155.0)  # 上下两条，谷底够深，segment_bands 切得开
+
+
+def doublet_window(qt_app, depths=(20000.0, 16000.0, 12000.0)) -> MainWindow:
+    """每个泳道上下两条带的 ROI 定量结果——双条带策略的前置条件。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw(list(depths), centers=DOUBLET_CENTERS))
+    set_roi_and_quantify(window)
+    counts: dict[int, int] = {}
+    for m in window._result.measurements:
+        counts[int(m.lane)] = counts.get(int(m.lane), 0) + 1
+    assert set(counts.values()) == {2}, f"前置条件：每个泳道两条带，实际 {counts}"
+    return window
+
+
+def history_cell(window: MainWindow, row: int, column: int) -> str:
+    item = window.normalize_panel.history_table.item(row, column)
+    return "" if item is None else item.text()
+
+
+def result_cell(window: MainWindow, row: int, column: int) -> str:
+    item = window.normalize_panel.result_table.item(row, column)
+    return "" if item is None else item.text()
+
+
+def diag_text(window: MainWindow) -> str:
+    """诊断条上的全部文字：一行摘要 + 每条的标题与详情。
+
+    三路提示（ROI 自检 / 条带数没切够 / 策略未生效）现在都汇到这里，测试跟着
+    读同一个地方——分散在各面板时，"同一件事说了两遍"这种问题断言不出来。
+    """
+    bar = window.diagnostics
+    return f"{bar.summary()} {bar.detail_text()}"
+
+
+def usage_texts(window: MainWindow) -> dict[tuple[int, int], str]:
+    """(泳道, 条带号) → 结果表“计入”列的文案。"""
+    table = window.results_panel.table
+    out: dict[tuple[int, int], str] = {}
+    for row in range(table.rowCount()):
+        lane = table.item(row, 0).data(Qt.ItemDataRole.EditRole)
+        band = table.item(row, 1).data(Qt.ItemDataRole.EditRole)
+        out[(int(lane), int(band))] = table.item(row, rp.USAGE_COLUMN).text()
+    return out
+
+
+def test_history_entry_carries_its_own_background_origin(qt_app):
+    """口径由 QuantEntry 自己带，界面不再并行记一份账。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    add_history(window, "loading_control", "Actin", "G1")
+    assert window._session.entries[0].origin == "roi_baseline"
+
+    window._run_auto(synchronous=True)
+    assert settle(window)
+    add_history(window, "target", "PAD4", "G2")
+    assert window._session.entries[1].origin == "local_background"
+
+    # 改名走的是 replace，口径必须跟着走（旧实现靠 (kind,name,group) 记账，
+    # 一改名就对不上号，口径悄悄丢成“未知”）
+    window._on_history_edited(0, "loading_control", "ActinB", "G1")
+    assert window._session.entries[0].origin == "roi_baseline"
+    assert history_cell(window, 0, 4) == "ROI 基线"
+    assert history_cell(window, 1, 4) == "局部背景"
+    assert not hasattr(window, "_entry_origins")
+    close(window)
+
+
+def test_cross_origin_rows_are_flagged_in_the_result_table(qt_app):
+    """跨口径 = 这组数字不能用：备注成列 + 整行标红，不能只挂 tooltip。"""
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    add_history(window, "loading_control", "Actin", "G1")
+    window._run_auto(synchronous=True)
+    assert settle(window)
+    add_history(window, "target", "PAD4", "G1")
+
+    panel = window.normalize_panel
+    assert panel.result_table.rowCount() > 0, "两侧的原始测量值仍要照常成行"
+    for row in range(panel.result_table.rowCount()):
+        assert result_cell(window, row, 4) == "—", "跨口径不该给出归一化值"
+        assert result_cell(window, row, 5) == "—", "跨口径不该给出 fold change"
+        assert result_cell(window, row, nzp.RESULT_NOTE_COLUMN) == "背景口径不一致"
+        # 面板窄时右边的备注列要滚动才看得见，最左列的标记不会被滚走
+        assert result_cell(window, row, 0).startswith("⛔")
+        # 目标值 / 内参值本身必须还在——被拒绝的是比值，不是测量
+        assert result_cell(window, row, 2) not in ("", "—")
+        assert result_cell(window, row, 3) not in ("", "—")
+    assert panel.cross_origin_rows() == list(range(panel.result_table.rowCount()))
+
+    hint = panel._result_hint.text()
+    assert "拒绝" in hint and "G1" in hint
+    render(panel, qt_app)
+    close(window)
+
+
+def test_band_pick_feeds_the_history_entry(qt_app):
+    """录入区的条带下拉直通核心层：只取上面那条 = 只加上面那条的积分。"""
+    window = doublet_window(qt_app)
+    top_by_lane = {}
+    for m in window._result.measurements:
+        current = top_by_lane.get(int(m.lane))
+        if current is None or m.y < current.y:
+            top_by_lane[int(m.lane)] = m
+
+    add_history(window, "loading_control", "Actin", "G1", pick="top")
+    entry = window._session.entries[0]
+    assert entry.band_pick == "top"
+    assert entry.used_bands == [[1], [1], [1]]
+    for lane, value in zip(entry.lanes, entry.intensities, strict=False):
+        assert value == pytest.approx(top_by_lane[lane].integrated_density)
+    assert history_cell(window, 0, nzp.HISTORY_PICK_COLUMN) == "只取上面那条"
+    close(window)
+
+
+def test_unused_bands_stay_visible_and_are_marked_not_deleted(qt_app):
+    """未采用 ≠ 已删除：行还在、框还在，只是标出来不计入合计。"""
+    window = doublet_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    total = len(window._result.measurements)
+
+    window.normalize_panel.set_band_pick("top")
+    qt_app.processEvents()
+
+    assert window.results_panel.table.rowCount() == total, "未采用的行必须还在表里"
+    marks = usage_texts(window)
+    assert {key: text for key, text in marks.items() if text == rp.UNUSED_TEXT}.keys() == {
+        (1, 2), (2, 2), (3, 2)
+    }
+    assert all(marks[(lane, 1)] == rp.ADOPTED_TEXT for lane in (1, 2, 3))
+    # 未采用的那一行：积分灰度划掉、整行斜体——和"低于检出限/饱和"的配色是两个通道
+    table = window.results_panel.table
+    for row in range(table.rowCount()):
+        unused = table.item(row, rp.USAGE_COLUMN).text() == rp.UNUSED_TEXT
+        assert table.item(row, rp.DENSITY_COLUMN).font().strikeOut() is unused
+        assert table.item(row, 0).font().italic() is unused
+
+    # 画布：未采用是虚线框，删除是框直接消失
+    assert window.canvas.unused_bands() == sorted(
+        i for i, m in enumerate(window._result.measurements) if m.band == 2
+    )
+    boxes = {(b.lane, b.index): b for b in window.canvas._band_items}
+    dashed = [b for b in boxes.values() if not b.is_adopted()]
+    assert dashed and all(
+        b.pen().style() == Qt.PenStyle.DashLine for b in dashed
+    ), "未采用的框要画成虚线"
+    assert all(
+        b.pen().style() == Qt.PenStyle.SolidLine
+        for b in boxes.values()
+        if b.is_adopted()
+    )
+    assert all(canvas_mod.UNUSED_BAND_TIP in b.toolTip() for b in dashed)
+    render(window.canvas, qt_app)
+    render(window.results_panel, qt_app)
+
+    # 复制出去的 TSV 也要带上"计入 / 未采用"，否则粘到表格里分不出哪些进了合计
+    window.results_panel.table.selectAll()
+    window.results_panel.copy_selected()
+    lines = QApplication.clipboard().text().splitlines()
+    assert lines[0].split("\t") == rp.HEADERS
+    assert sum(1 for line in lines[1:] if rp.UNUSED_TEXT in line) == 3
+
+    # 真正删掉一条：它从表和画布上一起消失，这就是与"未采用"的区别
+    victim = next(
+        i for i, m in enumerate(window._result.measurements) if (m.lane, m.band) == (1, 2)
+    )
+    window._on_delete_rows([victim])
+    assert settle(window)
+    assert window.results_panel.table.rowCount() == total - 1
+    assert (1, 2) not in usage_texts(window)
+    assert sorted(b.lane for b in window.canvas._band_items if not b.is_adopted()) == [2, 3]
+    close(window)
+
+
+def test_history_band_pick_change_is_one_undo_step(qt_app):
+    """历史表里改条带策略：只重新聚合，且 Ctrl+Z 一次全恢复。"""
+    window = doublet_window(qt_app)
+    add_history(window, "loading_control", "Actin", "G1")
+    before = list(window._session.entries[0].intensities)
+    assert window._session.entries[0].band_pick == "all"
+
+    table = window.normalize_panel.history_table
+    table.item(0, nzp.HISTORY_PICK_COLUMN).setText("只取下面那条")
+    qt_app.processEvents()
+
+    entry = window._session.entries[0]
+    assert entry.band_pick == "bottom"
+    assert entry.used_bands == [[2], [2], [2]]
+    assert all(new < old for new, old in zip(entry.intensities, before, strict=True))
+    assert history_cell(window, 0, nzp.HISTORY_PICK_COLUMN) == "只取下面那条"
+    assert "重新聚合" in window._hint_label.text()
+
+    depth = len(window._undo)
+    window._undo_last()
+    qt_app.processEvents()
+    assert len(window._undo) == depth - 1, "一次策略切换只该占撤销栈一格"
+    assert window._session.entries[0].band_pick == "all"
+    assert window._session.entries[0].intensities == before
+    close(window)
+
+
+def test_csv_imported_entry_refuses_a_band_pick_change(qt_app, monkeypatch, tmp_path):
+    """CSV 里只有合计值，改不了策略：弹中文提示，表格刷回原样。"""
+    window = doublet_window(qt_app)
+    add_history(window, "loading_control", "Actin", "G1")
+    csv_path = tmp_path / "lc.csv"
+    window._session.export_loading_control_csv(csv_path)
+    window._session.clear()
+    monkeypatch.setattr(
+        mw.QFileDialog, "getOpenFileName", lambda *a, **k: (str(csv_path), "")
+    )
+    window._on_import_lc()
+    assert window._session.entries and not window._session.entries[0].bands
+
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        mw.QMessageBox, "warning", lambda _p, title, text, *a, **k: warnings.append((title, text))
+    )
+    depth = len(window._undo)
+    window.normalize_panel.history_table.item(0, nzp.HISTORY_PICK_COLUMN).setText(
+        "只取上面那条"
+    )
+    qt_app.processEvents()
+
+    assert warnings and "重新定量" in warnings[0][1]
+    assert window._session.entries[0].band_pick == "all"
+    assert history_cell(window, 0, nzp.HISTORY_PICK_COLUMN) == "合并全部", "表格要刷回原样"
+    assert len(window._undo) == depth, "改失败不该留下撤销步"
+    close(window)
+
+
+def test_single_band_lane_says_the_strategy_did_not_apply(qt_app):
+    """只检出一条带的泳道：必须明说"策略未生效"，这是发现漏检的唯一线索。"""
+    window = doublet_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    # 删掉泳道 2 的下面那条 → 泳道 2 只剩一条带，正是用户那张膜的情形
+    victim = next(
+        i for i, m in enumerate(window._result.measurements) if (m.lane, m.band) == (2, 2)
+    )
+    window._on_delete_rows([victim])
+    assert settle(window)
+
+    window.normalize_panel.set_band_pick("top")
+    qt_app.processEvents()
+    hint = diag_text(window)
+    assert "泳道 2" in hint and "只检出 1 条带" in hint and "未生效" in hint
+    assert "只取上面那条" in hint
+    render(window.diagnostics, qt_app)
+
+    add_history(window, "loading_control", "Actin", "G1", pick="top")
+    assert window._entry_single_band_lanes(window._session.entries[0]) == [2]
+    tip = window.normalize_panel.history_table.item(
+        0, nzp.HISTORY_PICK_COLUMN
+    ).toolTip()
+    assert "只检出 1 条带" in tip and "泳道 2" in tip
+    assert "只检出 1 条带" in window.normalize_panel._result_hint.text()
+
+    # 合并全部时这句提示不该出现：没选上下策略就无所谓生效不生效
+    window.normalize_panel.set_band_pick("all")
+    qt_app.processEvents()
+    assert "未生效" not in diag_text(window)
+    close(window)
+
+
+def test_exported_band_csv_records_the_background_origin(qt_app, monkeypatch, tmp_path):
+    """条带 CSV 要写明这批数字是哪套口径测的。"""
+    import csv
+
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    set_roi_and_quantify(window)
+    monkeypatch.setattr(
+        mw.QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path)
+    )
+    window._export_data()
+    exported = list(tmp_path.glob("*_bands.csv"))
+    assert exported, "导出没落地"
+    with exported[0].open(encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows and {row["origin"] for row in rows} == {"roi_baseline"}
+    close(window)
+
+
+# ------------------------------------------------------------------ U11 每道条带数
+
+
+# 两条带中心只隔 17 px，半高宽约 18.8 px（d/FWHM ≈ 0.90）——几何谷深与统计
+# 显著性两条判据都够不着，自动分段只给出一条带。用户那张膜正是这个量级。
+TIGHT_CENTERS = (111.5, 128.5)
+
+
+def lane_band_counts(window: MainWindow) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for m in window._result.measurements if window._result else []:
+        counts[int(m.lane)] = counts.get(int(m.lane), 0) + 1
+    return counts
+
+
+def tight_doublet_window(qt_app) -> MainWindow:
+    """自动判据切不开的贴脸双条带——「每道条带数」存在的理由。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0], centers=TIGHT_CENTERS))
+    set_roi_and_quantify(window)
+    assert set(lane_band_counts(window).values()) == {1}, "前置条件：自动判据在这张图上切不开"
+    return window
+
+
+def set_band_count(window: MainWindow, value: int) -> None:
+    window.band_spin.setValue(value)
+    assert settle(window), "改「每道条带数」没有触发自动重新定量"
+
+
+def test_band_count_control_mirrors_the_lane_count_control(qt_app):
+    """两个控件语义对称，写法就得一样：0 = 自动，不另加复选框。"""
+    window = make_window(qt_app)
+    spin, lanes = window.band_spin, window.lane_spin
+    assert spin.minimum() == 0 and spin.maximum() == 10
+    # 0 走 specialValueText，和「期望泳道数」同一套惯用法；核心层 < 1 会抛
+    # ValueError，下限设 0 且 0 折成 None，用户碰不到那条路
+    assert spin.specialValueText() == lanes.specialValueText() == "自动"
+    assert window._expected_bands() is None
+    spin.setValue(2)
+    assert window._expected_bands() == 2
+    assert spin.focusPolicy() == lanes.focusPolicy()  # 未聚焦时同样忽略滚轮
+    close(window)
+
+
+def test_band_count_forces_a_split_the_auto_criterion_misses(qt_app):
+    """填 2 就该切成 2 条——这是自动判据在分辨极限上失手时的兜底。"""
+    window = tight_doublet_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+
+    set_band_count(window, 2)
+    assert set(lane_band_counts(window).values()) == {2}
+    assert len(window._result.measurements) == 6
+    # 剖面面板画的分段来自同一份 LaneProfile，跟着一起更新
+    assert [len(lane.segments) for lane in window._lanes] == [2, 2, 2]
+    render(window.profile_panel, qt_app)
+    render(window.results_panel, qt_app)
+
+    set_band_count(window, 0)  # 回到自动
+    assert set(lane_band_counts(window).values()) == {1}
+    close(window)
+
+
+def test_band_count_only_adds_cuts_never_merges(qt_app):
+    """只加刀、不合并——已经被空白分成两段的泳道，填 1 也并不回去。
+
+    界面不能让用户以为这个框能"压回 N 条"：它只决定切几刀。
+    """
+    window = doublet_window(qt_app)  # 两条带隔着 70 px，中间是空白，本就是两段
+    set_band_count(window, 1)
+    assert set(lane_band_counts(window).values()) == {2}
+    close(window)
+
+
+def test_band_count_one_suppresses_a_cut_inside_one_run(qt_app):
+    """同一段里的两个峰：填 1 就是"别切这一刀"。"""
+    window = tight_doublet_window(qt_app)
+    set_band_count(window, 2)
+    assert set(lane_band_counts(window).values()) == {2}
+    set_band_count(window, 1)
+    assert set(lane_band_counts(window).values()) == {1}
+    close(window)
+
+
+def test_band_count_never_touches_the_separators(qt_app):
+    """纵向分段和横向分隔线是两回事，改前者不许冲掉手调过的后者。
+
+    「期望泳道数」走的是 _reset_separators（按剖面峰谷重划），照抄那条路会
+    把用户手动拖过的分隔线全部抹掉。
+    """
+    window = tight_doublet_window(qt_app)
+    moved = [s + 4.0 for s in window._separators]
+    assert moved, "前置条件：得先有分隔线"
+    window._on_profile_separators_changed(moved)  # 等价于在剖面图上拖了一下
+    window._on_separators_committed()
+    assert settle(window)
+
+    set_band_count(window, 2)
+    assert window._separators == pytest.approx(moved), "分隔线被重划了"
+    assert window.canvas.separators() == pytest.approx(moved)
+
+    # 对照：改「期望泳道数」本来就该重划，这条路径没被改坏
+    window.lane_spin.setValue(3)
+    assert settle(window)
+    assert window._separators != pytest.approx(moved)
+    close(window)
+
+
+def test_saturated_band_count_is_spelled_out(qt_app):
+    """填了却切不出那么多时必须点名，否则用户以为强制生效了。
+
+    这话现在由核心层的「条带数与泳道数对不上」说（它按 source 分岔，用户填过
+    时不会再劝人去填），界面那条重复的 info 已经撤掉。这里盯的是"用户看得到
+    这句话"，不关心是谁说的。
+    """
+    window = doublet_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+
+    set_band_count(window, 3)  # 只有两条带，第三刀没谷可切
+    counts = lane_band_counts(window)
+    assert set(counts.values()) == {2}, "候选谷不够时应当饱和，不是报错也不是硬切"
+
+    hint = diag_text(window)
+    assert "你指定了每道 3 条带" in hint, "要认下用户填过这个数，别装作没看见"
+    assert "少切了" in hint and "有几个谷切几个" in hint
+    assert "连可切的谷都没有" in hint
+    assert "可以用「每道条带数」强制切分" not in hint, "不许劝人去填他已经填过的框"
+    render(window.diagnostics, qt_app)
+
+    set_band_count(window, 2)  # 切得够就不该再唠叨
+    assert "少切了" not in diag_text(window)
+    assert "没切够" not in diag_text(window)
+
+    # 只有个别泳道没切够时逐个点名
+    victim = next(
+        i for i, m in enumerate(window._result.measurements) if (m.lane, m.band) == (2, 2)
+    )
+    window._on_delete_rows([victim])
+    assert settle(window)
+    assert "第 2 道少切了（1 条）" in diag_text(window)
+    close(window)
+
+
+def test_single_band_hint_points_at_the_band_count_box(qt_app):
+    """提示发现问题之后要给出解决手段——就是这个新控件。"""
+    window = tight_doublet_window(qt_app)
+    window.normalize_panel.set_band_pick("top")
+    qt_app.processEvents()
+
+    hint = diag_text(window)
+    assert "只检出 1 条带" in hint and "未生效" in hint
+    assert "每道条带数" in hint and "填成 2" in hint
+    close(window)
+
+
+def test_single_band_hint_stops_nagging_once_the_box_is_filled(qt_app):
+    """已经填过了还劝人去填就是废话，换成说明那儿根本没有可切的谷。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))  # 每道就一条带
+    window.band_spin.setValue(2)
+    set_roi_and_quantify(window)
+    assert set(lane_band_counts(window).values()) == {1}, "单条带图切不出第二条，正是要测的情形"
+
+    window.normalize_panel.set_band_pick("bottom")
+    qt_app.processEvents()
+    hint = diag_text(window)
+    assert "第 1、2、3 道少切了" in hint, "核心层要点名哪几道没切够"
+    assert "「每道条带数」已填 2" in hint and "找不到可切的谷" in hint
+    assert "填成 2" not in hint, "不该再劝用户去填他已经填过的框"
+    close(window)
+
+
+def test_band_count_reaches_the_quantify_job(qt_app, monkeypatch):
+    """接线点只有 compute_lane_profiles 那一次调用。"""
+    seen: list[object] = []
+    original = mw.quant.compute_lane_profiles
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("expected_bands"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mw.quant, "compute_lane_profiles", spy)
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 16000.0], centers=TIGHT_CENTERS))
+    window.band_spin.setValue(2)
+    set_roi_and_quantify(window)
+    assert seen and seen[-1] == 2
+    # quantify_lanes 拿到 lanes 后不再重算分段，所以整轮只该算一次剖面
+    assert len(seen) == 1
+    close(window)
+
+
+# ------------------------------------------------------------------ U12 ROI 自检
+
+
+def quantify_box(window: MainWindow, x: int, y: int, w: int, h: int) -> None:
+    """按给定 ROI 走一遍完整链路（分隔线重划 → 定量 → 自检）。"""
+    window.canvas.set_roi(x, y, w, h)
+    window._apply_roi_change(recompute=True)
+    assert settle(window), "ROI → 剖面 → 自动定量的链条没跑完"
+
+
+def clean_roi_window(qt_app) -> MainWindow:
+    """条带居中、上下都留着干净背景的 ROI——自检该放行的那种。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))
+    set_roi_and_quantify(window)
+    assert window.diagnostics.severity() is None, (
+        f"前置条件：这个 ROI 该通过自检，实际 {diag_text(window)}"
+    )
+    return window
+
+
+def clipped_roi_window(qt_app) -> MainWindow:
+    """上边压着条带的 ROI——用户那张膜的习惯画法，自检必须拦下。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))
+    # 条带中心在 y=120、半高宽约 19 px：上边切到 108 就贴上去了
+    quantify_box(window, 15, 108, window._blot.width - 30, 82)
+    assert window.diagnostics.severity() is not None, "前置条件：这个 ROI 该被拦下"
+    return window
+
+
+def test_a_clean_roi_gets_a_quiet_pass(qt_app):
+    """通过也要有反馈，否则用户分不清"查过了"和"根本没查"——但要轻。"""
+    window = clean_roi_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    bar = window.diagnostics
+    assert bar.isVisibleTo(window), "通过时也要留一行确认"
+    assert bar.severity() is None
+    assert "ROI 自检通过" in bar.summary()
+    assert "要求 ≥" in bar.summary(), "该说清楚判据的实际数值，不是一句“没问题”"
+    assert not bar.is_expanded(), "通过时不展开详情"
+    assert not bar._dismiss_button.isVisibleTo(bar), "没问题就没什么可忽略的"
+    render(bar, qt_app)
+    close(window)
+
+
+def test_roi_check_shares_the_job_and_the_expected_bands(qt_app, monkeypatch):
+    """自检必须与定量同一次任务、同一个 expected_bands，不能各读各的。"""
+    seen: list[object] = []
+    original = mw.check_roi_quality
+
+    def spy(lanes, *, expected_bands=None):
+        seen.append(expected_bands)
+        return original(lanes, expected_bands=expected_bands)
+
+    monkeypatch.setattr(mw, "check_roi_quality", spy)
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0], centers=TIGHT_CENTERS))
+    window.band_spin.setValue(2)
+    set_roi_and_quantify(window)
+    assert seen == [2], f"自检拿到的每道条带数不是定量用的那个：{seen}"
+
+    # 改了 SpinBox、重算还没落地时，提示读的必须是产出这批结果时的那个值，
+    # 而不是实时控件（400 ms 防抖窗口里两者不一致）
+    window.band_spin.setValue(5)
+    assert window._roi_expected_bands() == 2
+    assert settle(window)
+    assert window._roi_expected_bands() == 5
+    close(window)
+
+
+def test_clipped_roi_marks_bands_without_a_fifth_colour(qt_app):
+    """画布只加形状与纹理：角标 + 斜纹留白带，条带框的四种状态一个没动。"""
+    window = clipped_roi_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+
+    flagged = window.canvas.flagged_bands()
+    assert flagged, "被自检点名的条带该挂上角标"
+    top, bottom = window.canvas.clearance_strips()
+    assert top > 0.0, "上边留白不足，斜纹带该画在上边"
+    assert bottom == 0.0, "下边没问题就别画"
+
+    boxes = {item.index: item for item in window.canvas._band_items}
+    for index in flagged:
+        box = boxes[index]
+        assert box.flag is not None
+        # 角标用条带框自己的描边色：没有引入第五种颜色，区分靠"多了个三角形"
+        assert box.flag._color == box._base
+        assert "ROI 自检" in box.toolTip()
+
+    # 未采用（虚线 + 半透明）和被点名（角标）是两个独立通道，可以同时成立
+    window.normalize_panel.set_band_pick("top")
+    qt_app.processEvents()
+    both = [i for i in window.canvas.unused_bands() if i in flagged]
+    if both:
+        box = boxes[both[0]]
+        assert box.flag is not None and not box.is_adopted()
+        assert "未采用" in box.toolTip() and "ROI 自检" in box.toolTip()
+    render(window.canvas, qt_app)
+    close(window)
+
+
+def test_severity_is_visible_at_a_glance(qt_app):
+    """严重和提醒得一眼分得开：徽标文字 + 左边框颜色都跟着 severity 走。"""
+    window = clipped_roi_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    bar = window.diagnostics
+    assert bar.severity() in ("warning", "error")
+    assert bar._chip.text() in ("警告", "严重")
+    assert bar._chip.isVisibleTo(bar)
+    # 具体动作要露在详情里，不能只挂 tooltip
+    assert "挪至少" in bar.detail_text() and "px" in bar.detail_text()
+    render(bar, qt_app)
+
+    bar._toggle_detail()
+    qt_app.processEvents()
+    assert bar.is_expanded()
+    render(bar, qt_app)  # 展开态是另一条绘制路径，得单独渲染
+    close(window)
+
+
+def test_acknowledge_lasts_until_something_changes(qt_app):
+    """「我知道了」按内容忽略，不是全局关掉自检。"""
+    window = clipped_roi_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    bar = window.diagnostics
+    assert not bar.is_dismissed()
+
+    marks = window.canvas.flagged_bands()
+    assert marks, "前置条件：忽略之前画布上有角标"
+
+    bar.dismiss()
+    qt_app.processEvents()
+    assert bar.is_dismissed()
+    assert bar.isVisibleTo(window), "忽略后仍留一行淡色痕迹，随时能翻回来"
+    assert "已忽略" in bar._text.text()
+    # 只闭掉文字、留着满屏角标，等于没让用户忽略成
+    assert window.canvas.flagged_bands() == []
+    assert window.canvas.clearance_strips() == (0.0, 0.0)
+    render(bar, qt_app)
+    render(window.canvas, qt_app)
+
+    # 原地重新定量：同一个 ROI、同一批问题，不该又冒出来烦人
+    window._run_quantify(synchronous=True)
+    assert settle(window)
+    assert bar.is_dismissed()
+
+    # 动了 ROI：问题可能变了，必须重新提醒
+    quantify_box(window, 15, 100, window._blot.width - 30, 90)
+    assert not bar.is_dismissed()
+
+    # 「重新查看」把它连同画布标注一起收回来
+    bar.dismiss()
+    assert bar.is_dismissed() and window.canvas.flagged_bands() == []
+    bar.dismiss()
+    assert not bar.is_dismissed() and window.canvas.flagged_bands()
+    close(window)
+
+
+def test_three_hint_sources_share_one_place_without_repeating(qt_app):
+    """三路提示汇到同一条，且不把同一件事说两遍。
+
+    核心层的「条带数与泳道数对不上」按 source 分岔之后已经把"没切够"说全了
+    （认下用户填过、讲清饱和语义、给出两种成因），界面那条重复的 info 整条
+    撤掉——一件事说两遍比说一遍差，哪怕第二遍降成了 info。
+    """
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))  # 每道就一条带
+    window.band_spin.setValue(2)  # 切不出第二条：自检会报"条带数对不上"
+    set_roi_and_quantify(window)
+    window.normalize_panel.set_band_pick("top")  # 策略在单条带泳道上落空
+    qt_app.processEvents()
+
+    entries = window.diagnostics.entries()
+    titles = [e.title for e in entries]
+    assert len(titles) == len(set(titles)), f"同一件事出现了两次：{titles}"
+    assert any("条带数与泳道数对不上" in t for t in titles), "自检那条要在"
+    assert any("未生效" in t for t in titles), "条带策略那条是另一件事，要留着"
+    assert not any("饱和的" in t for t in titles), "自检说过了，界面不许再说一遍"
+    assert window.diagnostics.severity() == "error"
+    render(window.diagnostics, qt_app)
+    close(window)
+
+
+def test_the_shortfall_hint_still_covers_for_a_missing_self_check(qt_app):
+    """自检缺席时（它自己抛了异常）界面得兜住，否则这句话没人说了。"""
+    window = doublet_window(qt_app)
+    set_band_count(window, 3)
+    assert not any("饱和的" in e.title for e in window._diagnostic_entries())
+
+    window._roi_report = None
+    window._refresh_diagnostics()
+    entry = next(e for e in window.diagnostics.entries() if "饱和的" in e.title)
+    assert entry.severity == "warning"
+    assert "全部 3 个泳道都只切出 2 条" in entry.detail
+    assert "不报错" in entry.detail and "硬切" in entry.detail
+    close(window)
+
+
+def test_the_bar_never_eats_the_canvas(qt_app):
+    """诊断条不能挡住工作区：窄窗、展开长文，高度都得有上限。"""
+    window = clipped_roi_window(qt_app)
+    bar = window.diagnostics
+    for width in (900, 1200, 1700):
+        window.resize(width, 800)
+        window.show()
+        qt_app.processEvents()
+        collapsed = bar.height()
+        assert collapsed <= 90, f"{width} px 宽时折叠态就占了 {collapsed} px"
+        bar._toggle_detail()
+        qt_app.processEvents()
+        render(bar, qt_app)
+        expanded = bar.height()
+        assert expanded <= 300, f"{width} px 宽时展开占了 {expanded} px，详情该自己滚"
+        assert window.canvas.height() > expanded, "画布得比诊断条高"
+        bar._toggle_detail()
+        qt_app.processEvents()
+    close(window)
+
+
+def test_deleting_bands_rechecks_the_roi(qt_app):
+    """删掉条带之后自检要按剩下的重算，画布上的角标跟着走。
+
+    这条路径没有剖面，走的是 check_roi_quality_from_measurements；ROI 必须传
+    裁剪后的那个，否则留白全算错。
+    """
+    window = clipped_roi_window(qt_app)
+    flagged = window.canvas.flagged_bands()
+    assert flagged
+    window._on_delete_rows([flagged[0]])
+    assert settle(window)
+    assert window._roi_report is not None, "删完还得有一份自检结论"
+    # 删除只做过滤，剩下的条带索引整体前移；被删的那个不该还挂着角标
+    assert len(window.canvas._band_items) == len(window._result.measurements)
+    assert set(window.canvas.flagged_bands()) <= set(
+        range(len(window._result.measurements))
+    )
+    close(window)
+
+
+def test_auto_detect_has_no_roi_self_check(qt_app):
+    """自动检测那条路径不走 ROI 基线，自检的两条判据都不适用。"""
+    window = clean_roi_window(qt_app)
+    window._run_auto(synchronous=True)
+    assert settle(window)
+    assert window._roi_report is None
+    assert window.canvas.flagged_bands() == []
+    assert window.canvas.clearance_strips() == (0.0, 0.0)
+    close(window)
+
+
+# ------------------------------------------------------------------ U13 自动测倾角
+#
+# 核心层把话说得很死：这个算法在干净的膜上能到 0.02°，但被一条划痕或一道膜边
+# 骗到时会**用同样自信的语气**给出错 4° 的答案，而且它测不出自己被骗了。所以
+# 界面这一侧只有两件事非做不可——把角度画出来让人看，以及绝不自动应用。
+
+
+def tilted_raw(angle_deg: float, lanes: int = 4, center: float = 120.0) -> np.ndarray:
+    """条带整体倾斜 ``angle_deg`` 的合成图（右端低为正，与标尺约定一致）。
+
+    不用 cv2 旋转整图：那会在四角留下背景块，而贯穿全宽的硬边正是这个算法最
+    容易锁上去的东西——那样测的就不是条带了。这里直接让高斯条带的中心随列
+    平移，膜内不留任何假直线。
+    """
+    height, width = 240, 20 + lanes * 95
+    slope = float(np.tan(np.radians(angle_deg)))
+    columns = np.arange(width, dtype=float)
+    rows = np.arange(height, dtype=float)[:, None]
+    offsets = slope * (columns - (width - 1) / 2.0)[None, :]
+    raw = np.full((height, width), 60000.0)
+    profile = 22000.0 * np.exp(-0.5 * ((rows - center - offsets) / 8.0) ** 2)
+    for index in range(lanes):
+        x0 = 20 + index * 95
+        raw[:, x0 : x0 + 80] -= profile[:, x0 : x0 + 80]
+    return np.clip(raw, 0, 65535).astype(np.uint16)
+
+
+def tilt_window(qt_app, angle_deg: float = -1.5, lanes: int = 4) -> MainWindow:
+    window = make_window(qt_app)
+    load_array(window, tilted_raw(angle_deg, lanes))
+    window.canvas.set_roi(20, 70, window._blot.width - 40, 100)
+    window._apply_roi_change()
+    assert settle(window)
+    return window
+
+
+def measure_tilt(window: MainWindow) -> None:
+    window._measure_tilt()
+    assert settle(window), "自动测倾角没跑完"
+
+
+def guide_angle(window: MainWindow) -> float:
+    """从画布上真正画出来的那条线反算角度。断言看的是像素，不是变量。"""
+    items = window.canvas._ruler_items
+    assert items, "测出角度却没画参考线"
+    line = items[0].line()
+    return float(np.degrees(np.arctan2(line.dy(), line.dx())))
+
+
+def test_auto_tilt_suggests_an_angle_without_touching_the_image(qt_app):
+    """测出来只写标尺位、只画线；旋转角必须还是 0。"""
+    window = tilt_window(qt_app, -1.5)
+    measure_tilt(window)
+    assert window._ruler_angle == pytest.approx(-1.5, abs=0.25)
+    assert "自动" in window.ruler_label.text(), "要说清这是自动量的，不是手拖的"
+    assert window.rotation_spin.value() == pytest.approx(0.0), "绝不许自动应用"
+    assert window._angle == pytest.approx(0.0)
+    assert "建议值" in window._hint_label.text()
+    render(window.canvas, qt_app)
+    close(window)
+
+
+def test_the_guide_line_is_what_the_user_judges_by(qt_app):
+    """参考线必须真按测出的角度、真横穿 ROI——数字对、线画错等于没画。"""
+    window = tilt_window(qt_app, 2.0)
+    measure_tilt(window)
+    angle = window._ruler_angle
+    assert angle == pytest.approx(2.0, abs=0.25)
+    assert guide_angle(window) == pytest.approx(angle, abs=0.05)
+    line = window.canvas._ruler_items[0].line()
+    roi = window._roi
+    assert min(line.x1(), line.x2()) <= roi.x, "线没横穿 ROI 左边"
+    assert max(line.x1(), line.x2()) >= roi.x + roi.width, "线没横穿 ROI 右边"
+    mid_y = (line.y1() + line.y2()) / 2.0
+    assert roi.y <= mid_y <= roi.y + roi.height
+    render(window.canvas, qt_app)
+    close(window)
+
+
+def test_the_suggestion_goes_out_through_the_existing_straighten_button(qt_app):
+    """成功之后就是普通的标尺值：用户点老按钮，走 _apply_ruler 原路。"""
+    window = tilt_window(qt_app, -1.5)
+    measure_tilt(window)
+    measured = window._ruler_angle
+    window._apply_ruler("horizontal")
+    assert window.rotation_spin.value() == pytest.approx(measured, abs=0.01)
+    assert window.canvas._ruler_items == [], "应用后参考线要收掉"
+    assert settle(window)
+    close(window)
+
+
+@pytest.mark.parametrize(
+    ("case", "keyword"),
+    [
+        ("no_roi", "先框出 ROI"),
+        ("narrow", "250"),
+        ("short", "高"),
+        ("at_limit", "10"),
+        ("no_signal", "看不到条带结构"),
+    ],
+)
+def test_a_refusal_never_eats_the_manual_measurement(qt_app, case, keyword):
+    """测不准时只说话。把 _ruler_angle 清成 None 等于替用户扔掉他手里量的值。"""
+    window = make_window(qt_app)
+    if case == "no_signal":
+        load_array(window, np.full((240, 400), 40000, dtype=np.uint16))
+    elif case == "at_limit":
+        load_array(window, tilted_raw(13.0))
+    else:
+        load_array(window, tilted_raw(-1.5))
+    if case == "no_roi":
+        window._roi = None
+        window.canvas.clear_roi()
+    elif case == "narrow":
+        window.canvas.set_roi(20, 70, 200, 100)
+        window._apply_roi_change()
+    elif case == "short":
+        window.canvas.set_roi(20, 110, window._blot.width - 40, 18)
+        window._apply_roi_change()
+    else:
+        window.canvas.set_roi(20, 70, window._blot.width - 40, 100)
+        window._apply_roi_change()
+    assert settle(window)
+
+    window._ruler_angle = 3.25  # 用户刚手动量的值
+    window.ruler_label.setText("标尺倾角：3.25°（相对水平）")
+    before = window.canvas._ruler_items[:]
+    measure_tilt(window)
+
+    text = window._hint_label.text()
+    assert text.startswith("⚠"), f"拒答要看得出是拒答，实际：{text}"
+    assert keyword in text, f"没给出 {case} 的具体原因：{text}"
+    assert "标尺" in text or "手动" in text, "拒答要指向手动兜底"
+    assert window._ruler_angle == pytest.approx(3.25), "手动量的值被抹了"
+    assert "3.25" in window.ruler_label.text()
+    assert window.canvas._ruler_items == before, "拒答不该动画布"
+    close(window)
+
+
+def test_the_raw_angle_stays_in_the_log(qt_app, monkeypatch):
+    """顶到边界时核心层仍带回一个原始极值点——那是诊断用的，不能显示给用户。"""
+    logged: list[str] = []
+    monkeypatch.setattr(mw.errorlog, "log_message", lambda text: logged.append(text))
+    window = make_window(qt_app)
+    load_array(window, tilted_raw(13.0))
+    window.canvas.set_roi(20, 70, window._blot.width - 40, 100)
+    window._apply_roi_change()
+    assert settle(window)
+    measure_tilt(window)
+    assert any("raw=" in line for line in logged), "原始极值点要留档"
+    assert "raw" not in window._hint_label.text().lower()
+    assert window._ruler_angle is None
+    close(window)
+
+
+def test_tilt_runs_off_the_ui_thread(qt_app, monkeypatch):
+    """本身只要几毫秒，但耗时随原图面积涨，大幅面扫描件不该卡住界面。"""
+    window = tilt_window(qt_app)
+    real = mw.estimate_tilt
+    monkeypatch.setattr(
+        mw, "estimate_tilt", lambda *a, **k: (time.sleep(0.25), real(*a, **k))[1]
+    )
+    window._measure_tilt()
+    pump(window, 0.05)
+    assert window._tilt_running, "应该还在后台跑"
+    assert not window.tilt_button.isEnabled(), "跑的时候不许重复点"
+    assert not window._busy, "它不产出结果，不该锁住参数区和画布"
+    assert settle(window)
+    assert window.tilt_button.isEnabled()
+    assert window._ruler_angle is not None
+    close(window)
+
+
+def test_a_tilt_result_for_the_previous_image_is_dropped(qt_app):
+    """回调排队时用户换了图：这个角度是量另一张图的，落下去就是错的。"""
+    window = tilt_window(qt_app, -1.5)
+    stale = mw.estimate_tilt(window._blot.raw, roi=window._roi, dark_bands=True)
+    assert stale.trusted
+    version = window._doc_version
+    load_array(window, tilted_raw(2.0))
+    window._on_tilt_done(version, None, stale)
+    assert window._ruler_angle is None, "上一张图的角度不许落到新图上"
+    assert window.canvas._ruler_items == []
+    close(window)
+
+
+def test_the_button_says_not_to_hug_the_membrane_edge(qt_app):
+    """这个功能最容易踩的坑得写在按钮上，不是写在 README 里。"""
+    window = make_window(qt_app)
+    tip = window.tilt_button.toolTip()
+    assert "膜边" in tip and "ROI" in tip
+    assert "不自动旋转" in tip or "只给建议" in tip
+    close(window)
+
+
+# ------------------------------------------------------------------ U14 发表级导出
+
+
+def export_window(qt_app, *, angle: float = 0.0) -> MainWindow:
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 12000.0, 9000.0]))
+    if angle:
+        # 和真实流程一样：_blot_original 是整转基准，_blot 是叠了微调角度的显示图
+        window._blot = mw.rotate_blot(window._blot_original, float(angle))
+        window._angle = float(angle)
+        window.canvas.set_image(window._blot.display_bgr)
+    set_roi_and_quantify(window)
+    return window
+
+
+def run_export(
+    window: MainWindow, monkeypatch, target, options=None, answer=None
+) -> list:
+    """把两个模态框换成固定答案，跑一次真导出，返回落盘的 FigureExport。"""
+    chosen = options or mw.FigureExportOptions()
+    monkeypatch.setattr(
+        mw.FigureExportDialog, "exec", lambda self: mw.QDialog.DialogCode.Accepted
+    )
+    monkeypatch.setattr(mw.FigureExportDialog, "options", lambda self: chosen)
+    monkeypatch.setattr(
+        mw.QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), "TIFF (*.tif)")
+    )
+    if answer is not None:
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: answer)
+    seen: list = []
+    monkeypatch.setattr(
+        MainWindow, "_show_figure_info", lambda self, exports: seen.extend(exports)
+    )
+    window._export_figure()
+    return seen
+
+
+def test_the_two_versions_do_not_share_one_mapping(qt_app):
+    """线性映射下 8 位标注图只剩两百来个灰阶，条带在屏幕上看不出来。
+
+    干净版是 16 位存档、标注版是给人看的，一个下拉管两个必然有一版是错的。
+    """
+    window = make_window(qt_app)
+    dialog = mw.FigureExportDialog(
+        window, width_px=1344, height_px=1100, source_bit_depth=16, white_level=65535.0
+    )
+    options = dialog.options()
+    assert options.clean is True and options.annotated is False
+    assert options.clean_mapping == "linear"
+    assert options.annotated_mapping == "auto"
+    assert options.bit_depth is None, "默认跟随源位深"
+    assert options.print_width_mm is None
+    assert len(options.layers) == 4, "标注图层默认全勾"
+    render(dialog, qt_app)
+    dialog.deleteLater()
+    close(window)
+
+
+def test_the_dialog_reports_the_dpi_it_can_actually_reach(qt_app):
+    """dpi 是印刷宽度算出来的结果，不是能调大的设置——拉宽度就该看见它掉。"""
+    window = make_window(qt_app)
+    dialog = mw.FigureExportDialog(
+        window, width_px=1200, height_px=800, source_bit_depth=16, white_level=65535.0
+    )
+    dialog.width_spin.setValue(101.6)  # 4 英寸 → 300 dpi
+    assert "300 dpi" in dialog.dpi_label.text()
+    dialog.width_spin.setValue(203.2)  # 8 英寸 → 150 dpi
+    text = dialog.dpi_label.text()
+    assert "150 dpi" in text and "低于 300" in text
+    assert "不插值放大" in text
+    dialog.deleteLater()
+    close(window)
+
+
+def test_the_dialog_will_not_let_you_export_nothing(qt_app):
+    window = make_window(qt_app)
+    dialog = mw.FigureExportDialog(
+        window, width_px=400, height_px=240, has_result=True, white_level=65535.0
+    )
+    dialog.clean_check.setChecked(False)
+    assert not dialog.ok_button.isEnabled()
+    dialog.annotated_check.setChecked(True)
+    assert dialog.ok_button.isEnabled()
+    dialog.annotated_mapping_combo.setCurrentIndex(2)  # 手动黑白点
+    dialog.black_spin.setValue(500.0)
+    dialog.white_spin.setValue(400.0)
+    assert not dialog.ok_button.isEnabled(), "白点小于黑点要拦住"
+    assert "白点必须大于黑点" in dialog.mapping_hint.text()
+    dialog.deleteLater()
+    close(window)
+
+
+def test_a_16bit_export_stays_16bit_and_brings_its_sidecar(qt_app, monkeypatch, tmp_path):
+    """干净版走线性全量程：16 位单通道、逐像素无损、旁边有说明文件。"""
+    import cv2
+
+    window = export_window(qt_app)
+    target = tmp_path / "blot_figure.tif"
+    exports = run_export(window, monkeypatch, target)
+    assert len(exports) == 1
+    export = exports[0]
+    assert export.path.exists() and export.bit_depth == 16 and export.channels == 1
+    assert export.info_path is not None and export.info_path.exists()
+    written = cv2.imread(str(target), cv2.IMREAD_UNCHANGED)
+    assert written.dtype == np.uint16
+    assert written.ndim == 2, "干净版要单通道灰度，不是 BGR"
+    info = export.info_path.read_text(encoding="utf-8-sig")
+    assert "线性全量程" in info and "未做插值缩放" in info
+    assert "dpi" in info
+    assert not (tmp_path / "blot_figure_annotated.tif").exists()
+    close(window)
+
+
+def test_the_annotated_copy_lands_beside_it_in_8bit_colour(qt_app, monkeypatch, tmp_path):
+    window = export_window(qt_app)
+    options = mw.FigureExportOptions(clean=True, annotated=True)
+    exports = run_export(window, monkeypatch, tmp_path / "blot_figure.tif", options)
+    assert len(exports) == 2
+    clean, annotated = exports
+    assert clean.bit_depth == 16 and clean.channels == 1
+    assert annotated.bit_depth == 8 and annotated.channels == 3
+    assert annotated.path.name == "blot_figure_annotated.tif"
+    assert annotated.mapping.mode == "auto", "标注版默认自动拉伸"
+    assert clean.mapping.mode == "linear", "干净版默认线性全量程"
+    assert set(annotated.layers) == set(options.layers)
+    close(window)
+
+
+def test_the_export_rotates_the_original_again_with_lanczos(qt_app, monkeypatch, tmp_path):
+    """画布那张是双线性转的（为了拖着流畅）；发表图值得那 4 倍代价。"""
+    window = export_window(qt_app, angle=2.5)
+    calls: list = []
+    real = mw.rotate_blot
+
+    def spy(blot, angle, **kwargs):
+        calls.append((blot is window._blot_original, angle, kwargs.get("interpolation")))
+        return real(blot, angle, **kwargs)
+
+    monkeypatch.setattr(mw, "rotate_blot", spy)
+    exports = run_export(window, monkeypatch, tmp_path / "blot_figure.tif")
+    assert calls == [(True, 2.5, mw.ROTATE_SHARP)], f"实际调用：{calls}"
+    assert exports[0].rotation_interpolation == mw.ROTATE_SHARP
+    info = exports[0].info_path.read_text(encoding="utf-8-sig")
+    assert "Lanczos-4" in info and "2.50" in info
+    close(window)
+
+
+def test_a_shape_mismatch_falls_back_instead_of_misplacing_the_roi(
+    qt_app, monkeypatch, tmp_path
+):
+    """ROI 坐标是按画布那张图量的。重转出来的尺寸一旦对不上，宁可用双线性那张
+    也不能把 ROI 裁到错的位置上——而且要如实报告用的是哪种插值。"""
+    window = export_window(qt_app)
+    window._angle = 2.5  # 刻意不同步 _blot：模拟核心层换了旋转实现
+    exports = run_export(window, monkeypatch, tmp_path / "blot_figure.tif")
+    assert exports[0].rotation_interpolation == mw.ROTATE_FAST
+    assert "双线性" in exports[0].info_path.read_text(encoding="utf-8-sig")
+    close(window)
+
+
+def test_no_rotation_means_no_needless_resample(qt_app, monkeypatch, tmp_path):
+    """角度是 0 时重转一遍纯属白烧 CPU，还会平白引入一次重采样。"""
+    window = export_window(qt_app)
+    calls: list = []
+    monkeypatch.setattr(
+        mw, "rotate_blot", lambda *a, **k: calls.append(a) or mw.rotate_blot(*a, **k)
+    )
+    run_export(window, monkeypatch, tmp_path / "blot_figure.tif")
+    assert calls == []
+    close(window)
+
+
+def test_overwrite_confirmation_covers_all_four_files(qt_app, monkeypatch, tmp_path):
+    """一次导出最多落 4 个文件，而保存对话框只替你确认其中一个。"""
+    window = export_window(qt_app)
+    for name in (
+        "blot_figure.tif",
+        "blot_figure_export_info.txt",
+        "blot_figure_annotated.tif",
+        "blot_figure_annotated_export_info.txt",
+    ):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    listed: list[str] = []
+
+    def fake_question(_parent, _title, text, *a, **k):
+        listed.append(text)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", fake_question)
+    options = mw.FigureExportOptions(clean=True, annotated=True)
+    exports = run_export(window, monkeypatch, tmp_path / "blot_figure.tif", options)
+    assert exports == [], "用户答了不覆盖，就一个字节都不许写"
+    assert len(listed) == 1
+    # 保存对话框已经替我们确认过 blot_figure.tif 本身，剩下三个必须自己问
+    for name in (
+        "blot_figure_export_info.txt",
+        "blot_figure_annotated.tif",
+        "blot_figure_annotated_export_info.txt",
+    ):
+        assert name in listed[0], f"{name} 会被覆盖却没提"
+    assert (tmp_path / "blot_figure_export_info.txt").read_text(encoding="utf-8") == "x"
+    close(window)
+
+
+def test_a_clean_folder_asks_nothing(qt_app, monkeypatch, tmp_path):
+    window = export_window(qt_app)
+    asked: list = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *a, **k: asked.append(a) or QMessageBox.StandardButton.Yes,
+    )
+    exports = run_export(window, monkeypatch, tmp_path / "blot_figure.tif")
+    assert asked == [], "没冲突就不该打扰"
+    assert len(exports) == 1
+    close(window)
+
+
+def test_the_save_dialog_no_longer_offers_a_lossy_format(qt_app, monkeypatch, tmp_path):
+    """JPEG 在真实膜上能把灰度挪 6–7 级，和真实的强度差别分不开。"""
+    window = export_window(qt_app)
+    seen: list[tuple] = []
+
+    def fake_save(*args, **kwargs):
+        seen.append(args)
+        return "", ""
+
+    monkeypatch.setattr(mw.FigureExportDialog, "exec", lambda self: mw.QDialog.DialogCode.Accepted)
+    monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", fake_save)
+    window._export_figure()
+    assert seen, "没弹保存对话框"
+    default_name, filters = seen[0][2], seen[0][3]
+    assert filters == "TIFF (*.tif);;PNG (*.png)"
+    assert "jpg" not in filters.lower() and "jpeg" not in filters.lower()
+    assert default_name.endswith("_figure.tif")
+    close(window)
+
+
+def test_a_typed_suffix_is_coerced_to_a_lossless_one(qt_app, monkeypatch, tmp_path):
+    """用户手打 .jpg 时不该抛异常，按选中的过滤器落成无损格式。"""
+    window = export_window(qt_app)
+    monkeypatch.setattr(
+        mw.FigureExportDialog, "exec", lambda self: mw.QDialog.DialogCode.Accepted
+    )
+    monkeypatch.setattr(mw.FigureExportDialog, "options", lambda self: mw.FigureExportOptions())
+    monkeypatch.setattr(
+        mw.QFileDialog,
+        "getSaveFileName",
+        lambda *a, **k: (str(tmp_path / "blot_figure.jpg"), "PNG (*.png)"),
+    )
+    seen: list = []
+    monkeypatch.setattr(MainWindow, "_show_figure_info", lambda self, e: seen.extend(e))
+    window._export_figure()
+    assert len(seen) == 1
+    assert seen[0].path.suffix == ".png"
+    assert not (tmp_path / "blot_figure.jpg").exists()
+    close(window)
+
+
+def test_the_sidecar_gets_shown_once(qt_app, monkeypatch, tmp_path):
+    """旁注里有一段能直接抄进方法学的话，但没人会主动去开图旁边那个 txt。"""
+    window = export_window(qt_app)
+    monkeypatch.setattr(
+        mw.FigureExportDialog, "exec", lambda self: mw.QDialog.DialogCode.Accepted
+    )
+    monkeypatch.setattr(mw.FigureExportDialog, "options", lambda self: mw.FigureExportOptions())
+    monkeypatch.setattr(
+        mw.QFileDialog,
+        "getSaveFileName",
+        lambda *a, **k: (str(tmp_path / "blot_figure.tif"), "TIFF (*.tif)"),
+    )
+    shown: list = []
+    monkeypatch.setattr(
+        mw.FigureInfoDialog, "exec", lambda self: shown.append(self.text()) or 0
+    )
+    window._export_figure()
+    assert len(shown) == 1
+    assert "未做插值缩放" in shown[0]
+    assert "线性全量程" in shown[0]
+    render(window._figure_info_dialog, qt_app)
+    close(window)
+
+
+def test_cancelling_the_options_dialog_writes_nothing(qt_app, monkeypatch, tmp_path):
+    window = export_window(qt_app)
+    monkeypatch.setattr(
+        mw.FigureExportDialog, "exec", lambda self: mw.QDialog.DialogCode.Rejected
+    )
+    called: list = []
+    monkeypatch.setattr(
+        mw.QFileDialog, "getSaveFileName", lambda *a, **k: called.append(1) or ("", "")
+    )
+    window._export_figure()
+    assert called == [], "选项都取消了还问文件名"
+    assert list(tmp_path.iterdir()) == []
+    close(window)
+
+
+# ------------------------------------------------------------------ U15 角度精度
+
+
+def test_the_angle_box_does_not_quantise_away_the_measurement(qt_app):
+    """自动测角到 0.01° 量级，微调框只有 1 位小数就等于白测。
+
+    端到端盯完整链路：测角 → 写标尺 → 点旋正 → 微调框 → 真正落到图上的 _angle。
+    中间任何一环做四舍五入，这里都会露出来。
+    """
+    window = tilt_window(qt_app, -1.47)
+    assert window.rotation_spin.decimals() == 2
+    measure_tilt(window)
+    measured = window._ruler_angle
+    assert measured == pytest.approx(-1.47, abs=0.25)
+    assert round(measured, 2) != round(measured, 1), (
+        f"这个角度在 1 位小数下看不出差别（{measured}），换不出结论"
+    )
+
+    window._apply_ruler("horizontal")
+    assert window.rotation_spin.value() == pytest.approx(round(measured, 2), abs=1e-9)
+    assert settle(window)
+    assert window._angle == pytest.approx(round(measured, 2), abs=1e-9), (
+        "微调框留住了 2 位小数，真正转到图上的却被抹回 1 位"
+    )
+    close(window)
+
+
+def test_the_coarse_slider_does_not_drag_the_fine_value_back(qt_app):
+    """滑杆仍是 0.1° 一格。它跟着走，但不许反过来把微调框的 0.01 位吃掉。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    window.rotation_spin.setValue(-0.28)
+    assert window.rotation_spin.value() == pytest.approx(-0.28)
+    assert window.rotation_slider.value() == -3, "滑杆按 0.1° 一格取整"
+    assert window.rotation_spin.value() == pytest.approx(-0.28), "取整不许回灌"
+    assert "-0.28" in window.rotation_spin.text()
+
+    window._set_rotation_controls(2.34)  # 旋转落地后的回写路径
+    assert window.rotation_spin.value() == pytest.approx(2.34)
+
+    window.rotation_slider.setValue(50)  # 手拖滑杆时接受 0.1° 的落点
+    assert window.rotation_spin.value() == pytest.approx(5.0)
+    assert settle(window)
+    close(window)
+
+
+def test_the_angle_box_is_wide_enough_for_two_decimals(qt_app):
+    """加一位小数最容易出的事故是数字被省略号吃掉，这是绘制层的问题。"""
+    window = make_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    spin = window.rotation_spin
+    spin.setValue(-MAX_STRAIGHTEN_ANGLE)
+    render(window, qt_app)
+    needed = spin.fontMetrics().horizontalAdvance(spin.text())
+    assert spin.width() > needed + 12, f"{spin.text()} 放不下（{spin.width()} px）"
+    close(window)
+
+
+# ------------------------------------------------------------------ U16 分隔线警示
+#
+# roi.py 给候选谷加了条带禁区之后，分隔线切进条带已经很少发生，这是兜底路径。
+
+
+def separator_pen(window: MainWindow, index: int):
+    return window.canvas._sep_items[index].pen()
+
+
+def cut_separator_window(qt_app, seps=(70.0, 165.0)) -> MainWindow:
+    """把第 1 条分隔线拖进条带里——ISSUE_SEPARATOR_IN_BAND 的触发条件。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 16000.0, 12000.0]))
+    set_roi_and_quantify(window)
+    window._on_profile_separators_changed(list(seps))
+    assert settle(window)
+    window._run_quantify(synchronous=True)
+    assert settle(window)
+    return window
+
+
+def test_the_named_separator_is_marked_on_the_canvas(qt_app):
+    """诊断说"第 1 道与第 2 道之间那条线"，画布上就得看得出是哪条。"""
+    window = cut_separator_window(qt_app)
+    window.resize(1400, 900)
+    window.show()
+    kinds = [i.kind for i in window._roi_report.issues]
+    assert "separator_in_band" in kinds, f"前置条件没成立：{kinds}"
+
+    assert window.canvas.flagged_separators() == [0]
+    flagged, normal = separator_pen(window, 0), separator_pen(window, 1)
+    assert flagged.color() == canvas_mod.SEPARATOR_FLAG_COLOR
+    assert normal.color() == canvas_mod.SEPARATOR_COLOR, "没被点名的线不许跟着变色"
+    assert flagged.width() > normal.width(), "加粗是给色觉障碍留的第二条通道"
+
+    tip = window.canvas._sep_items[0].toolTip()
+    assert "分隔线切在条带里" in tip
+    assert "拖到两条条带之间的空隙" in tip and "删掉" in tip
+    assert window.canvas._sep_items[1].toolTip() == ""
+    render(window.canvas, qt_app)
+    close(window)
+
+
+def test_the_mark_goes_away_once_the_separator_is_moved_out(qt_app):
+    """修好就该收掉——常驻的警示最后一定会被无视。"""
+    window = cut_separator_window(qt_app)
+    assert window.canvas.flagged_separators() == [0]
+    window._on_profile_separators_changed([107.0, 202.0])  # 拖回条带之间的空隙
+    assert settle(window)
+    window._run_quantify(synchronous=True)
+    assert settle(window)
+    assert window.canvas.flagged_separators() == []
+    assert separator_pen(window, 0).color() == canvas_mod.SEPARATOR_COLOR
+    assert window.canvas._sep_items[0].toolTip() == ""
+    close(window)
+
+
+def test_acknowledging_hides_the_separator_mark_too(qt_app):
+    """“我知道了”要把画布上的标注一并收起，不能只闭嘴留着满屏红线。"""
+    window = cut_separator_window(qt_app)
+    assert window.canvas.flagged_separators() == [0]
+    window.diagnostics.dismiss()
+    qt_app.processEvents()
+    assert window.canvas.flagged_separators() == []
+    window.diagnostics.dismiss()  # 「重新查看」走同一个开关
+    qt_app.processEvents()
+    assert window.canvas.flagged_separators() == [0]
+    close(window)
+
+
+def test_keyboard_focus_and_the_flag_stay_visible_together(qt_app):
+    """正在用方向键微调一条被点名的线时，两件事都得看得见。"""
+    window = cut_separator_window(qt_app)
+    window.canvas.set_nudge_target(("sep", 0))
+    pen = separator_pen(window, 0)
+    assert pen.color() == canvas_mod.SEPARATOR_FLAG_COLOR, "点名占颜色通道"
+    assert pen.style() == Qt.PenStyle.DashLine, "微调焦点占线型通道"
+    close(window)
+
+
+def test_deleting_a_separator_drops_the_stale_mark(qt_app):
+    """删掉一条线，后面的全往前挪一位——旧下标会指到一条画得好好的线上。"""
+    window = cut_separator_window(qt_app)
+    assert window.canvas.flagged_separators() == [0]
+    window.canvas.set_separators([165.0])  # 少了一条
+    assert window.canvas.flagged_separators() == [], "条数变了就不许拿旧下标继续描"
+    assert separator_pen(window, 0).color() == canvas_mod.SEPARATOR_COLOR
+    close(window)
+
+
+def test_gappy_lane_numbers_never_mismap_the_separator(qt_app):
+    """删过整道之后泳道保号、编号会出现空档，这时按 a-1 换算会指到别的线上。
+
+    宁可不画，也不能把一条画得好好的线描成红的——那比没有标记更糟。
+    """
+    window = cut_separator_window(qt_app)
+    assert window._separators_between((1, 2)) == [0]
+    assert window._separators_between((2, 3)) == [1]
+    # 核心层把成对的命中摊平成一个去重泳道集合，连号就一起描——宁可多一条也别漏
+    assert window._separators_between((1, 2, 3)) == [0, 1]
+    assert window._separators_between(()) == []
+    assert window._separators_between((3, 4)) == [], "只有 2 条线，第 4 道不存在"
+    assert window._separators_between((7, 8)) == []
+    close(window)

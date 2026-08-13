@@ -59,13 +59,25 @@ from ..analysis import (
     BandMeasurement,
     analyze_array,
 )
-from ..export import export_figure, export_result
-from ..imageio import load_blot, remap_rotation, rotate_blot, saturation_fraction
+from ..export import export_presentation_figures, export_result
+from ..imageio import (
+    ROTATE_FAST,
+    ROTATE_SHARP,
+    load_blot,
+    remap_rotation,
+    rotate_blot,
+    saturation_fraction,
+)
 from ..normalize import (
+    BAND_PICK_ALL,
     AnalysisSession,
     QuantEntry,
+    band_pick_label,
+    coerce_band_pick,
+    coerce_origin,
     export_normalized_csv,
     lane_series_from_measurements,
+    origin_label,
 )
 from ..roi import (
     MAX_STRAIGHTEN_ANGLE,
@@ -76,8 +88,23 @@ from ..roi import (
     normalize_angle,
     separators_from_profile,
 )
+from ..roi_check import (
+    ISSUE_BAND_COUNT,
+    ISSUE_EDGE_BOTTOM,
+    ISSUE_EDGE_TOP,
+    ISSUE_SEPARATOR_IN_BAND,
+    check_roi_quality,
+    check_roi_quality_from_measurements,
+)
+from ..tilt import estimate_tilt
 from . import errorlog
 from .canvas import BlotCanvas, Tool
+from .diagnostics_bar import DiagnosticsBar, Entry, entries_from_report
+from .figure_export_dialog import (
+    FigureExportDialog,
+    FigureExportOptions,
+    FigureInfoDialog,
+)
 from .normalize_panel import NormalizePanel
 from .profile_panel import ProfilePanel
 from .results_panel import ResultsPanel
@@ -99,6 +126,10 @@ CLOSE_WAIT_MS = 4000
 
 ORIGIN_ROI = "roi"  # 结果来自 quantify_lanes（橡皮筋基线）
 ORIGIN_DETECT = "detect"  # 结果来自自动检测（环形中值局部背景）
+# 两条路径用的是两套背景口径（README 方法学第 9 节），数值不可互相比较，所以
+# 界面上从不让它们同时存在：进入一条路径就把另一条的产物整套清掉。
+# 这两个字符串是 normalize.coerce_origin 直接认的别名，界面不再自备对照表——
+# 界面一份、核心一份，迟早会各自漂移。
 
 # 后台任务分两类，界面反馈完全不同：
 #   结果类（RESULT）——会产出定量数据，锁住参数区与画布、给取消按钮；
@@ -122,11 +153,21 @@ JOB_LABELS = {
 NUDGE_STEP = 1.0
 NUDGE_STEP_FAST = 10.0
 
+TILT_BUTTON_TIP = (
+    "在当前 ROI 里自动测条带的倾角，只给建议、不自动旋转。\n"
+    "ROI 要框在条带上，别贴着膜边：贯穿全宽的膜边或划痕会把结果整个带偏，"
+    "而算法测不出自己被骗了。\n"
+    "测完画布上会出现一条虚线参考线，确认它与条带平行后再点“旋正为水平”。"
+)
+
 _TOOL_TIPS = {
     Tool.ROI: "框选 ROI：按住左键拖出青色矩形（快捷键 1）",
     Tool.RULER: "标尺对齐：沿条带方向拖一条线，松手后就地选择“旋正为水平/垂直”（快捷键 2）",
     Tool.BAND: "补画条带：拖出绿色矩形添加单个条带（快捷键 3）",
-    Tool.ADJUST: "调整：拖动 ROI、手柄与橙色分隔线；双击 ROI 内空白添加分隔线，右键删除（快捷键 4）",
+    Tool.ADJUST: (
+        "调整：拖动 ROI、手柄与橙色分隔线；双击 ROI 内空白添加分隔线，右键删除；"
+        "在 ROI 外拖拽（或按住 Ctrl/Shift 拖拽）可框选多个条带，Delete 一次删完（快捷键 4）"
+    ),
 }
 
 _HELP_TEXT = (
@@ -134,14 +175,58 @@ _HELP_TEXT = (
     "1. 打开或拖入 WB 图片（支持 8/16 位 TIF，定量在原生位深上进行）。\n"
     "2. 图片歪斜时，用“标尺对齐”沿条带方向拖一条线，在弹出的小面板里点"
     "“旋正为水平/垂直”；横竖颠倒可用“编辑 → 旋转 90°”。\n"
+    "   框好 ROI 之后也可以点“调整”页的“自动测倾角”：它比肉眼准（干净的膜上到"
+    "0.02°），但被一条划痕或一道膜边骗到时会用同样自信的语气报一个错 4° 的角度，"
+    "而且它测不出自己被骗了。所以它只把角度写进标尺位、在画布上按该角度画一条"
+    "虚线参考线，绝不自动旋转——看着线与条带平行了，再点“旋正为水平”。"
+    "ROI 要框在条带上，别贴着膜边。测不准时（没框 ROI / 选区窄于 250 px / "
+    "倾角超出 ±10° / 看不到条带结构）状态栏会说明原因，此前手动量的标尺值不受影响。\n"
     "3. 用“框选 ROI”拖出定量区域，橙色分隔线会按剖面峰谷自动划分泳道；"
-    "可在画布或底部剖面图中拖动微调，“调整”模式下双击添加、右键删除分隔线。\n"
+    "画布与底部剖面图都能拖动微调、双击添加、右键删除——画布上这些操作需先切到"
+    "“调整”模式（其余模式的拖拽被框选 ROI / 补画条带占着），剖面图里任何模式都直接生效。\n"
     "4. 框好 ROI 后会自动定量（ImageJ 式基线扣除），微调分隔线也会自动刷新；"
     "或“自动检测”整图找条带，用“补画条带”补漏。误检条带可直接在图上点选"
-    "（Ctrl 多选），按 Delete 删除，或右键“删除此条带 / 删除整个泳道”。\n"
+    "（Ctrl 反选、Shift 加选），在“调整”模式下于 ROI 外拖拽、或按住 Ctrl/Shift 拖拽"
+    "还能框选一大片，按 Delete 一次删完（整批只算一步撤销），"
+    "也可右键“删除选中的 N 个条带 / 删除整个泳道”。\n"
+    "   每道上下叠着双条带、自动分段却只切出一条时，把“调整”页的“每道条带数”"
+    "填成 2（与“期望泳道数”同一处，0 = 自动）：它按最深的谷强制切到这么多条，"
+    "改完自动重新定量。刀数 = 这个数 − 当前连续段数：同一个连续段内它是双向的"
+    "（一段里有 3 个峰、填 2 就只切 1 刀、得到 2 条），但并不回被空白隔开的段"
+    "（已被空白分成 3 段的泳道，填 2 仍是 3 条）；"
+    "某道找不到足够的谷时按有几个切几个，不报错，但会在画布上方的诊断条里点名。\n"
+    "   每次 ROI 定量都会自检一遍 ROI 画得对不对，结论在画布上方那条里：绿色一行"
+    "“自检通过”是最常见的；橙色“警告”、红色“严重”会给出具体动作（“把 ROI 上边"
+    "往上挪至少 8 px”这种），点“详情”展开看全文。被点到的条带框右上角会挂一个"
+    "三角角标，ROI 那条边上会画出要求的留白（斜纹带）——把边拖到斜纹空出来即可；"
+    "分隔线切进条带时，那条线会变红加粗，把它拖到两条条带之间的空隙上，"
+    "或者右键删掉（没有空隙就说明两侧本是同一道）。"
+    "确有理由那样画时点“我知道了”，提示与角标一并收起，等 ROI、每道条带数或问题"
+    "本身变了再出现（自检从不阻断定量与导出）。\n"
+    "   为什么要管这个：橡皮筋基线只锚在 ROI 上下两端，边一旦越过膜边或切进条带，"
+    "整块膜本底会被当成蛋白积进去——实测最强泳道虚涨 60%、相对定量最差错 38%，"
+    "而条带数看上去完全正常。\n"
     "5. 在“归一化”页把内参与目标分别加入历史，同组自动配对计算 normalized 与 "
-    "fold change，并可导出 CSV 与展示图。\n\n"
-    "标注说明：图上 L=泳道（Lane）、B=条带（Band），例如 L2-B1 表示第 2 泳道第 1 条带。\n"
+    "fold change，并可导出 CSV 与展示图。上下叠的双条带可在“条带”下拉里选"
+    "“只取上面那条 / 只取下面那条”（按图像位置取，不按谁更亮）；没被采用的条带"
+    "在结果表里仍然列出、只是标成“未采用”并在画布上画成虚线框——它和“删除”是"
+    "两回事，删除才会让它彻底消失。历史表里的“条带”列可以随时改，只重新聚合、"
+    "不重新定量。\n"
+    "   “导出展示图”（Ctrl+Shift+E）先问一遍选项：干净版是无标注、可保持 16 位"
+    "无损的存档件，标注版是 8 位彩色、给人看的。两版各用各的灰度映射——干净版"
+    "默认“线性全量程”（不拉伸、不削波），标注版默认“自动对比度拉伸”，"
+    "因为真实膜的数据常挤在量程顶部不到 1% 的区间里，8 位图按线性映射会只剩"
+    "两百来个灰阶、屏幕上看不出条带。导出从原图按 Lanczos-4 重新旋正一次"
+    "（画布上那张是双线性的，为了拖动流畅），不做任何插值放大，dpi 是印刷宽度"
+    "算出来的结果而不是可以调大的设置。每张图旁边都会写一个 *_export_info.txt，"
+    "里面有黑白点、削波比例和一段可直接抄进方法学的话，导出完会弹出来给你看一眼。\n\n"
+    "标注说明：图上 L=泳道（Lane）、B=条带（Band），例如 L2-B1 表示第 2 泳道第 1 条带。"
+    "缩小时标签会自动简化为泳道号、再小就整批隐藏（悬停或选中仍可查看），"
+    "免得挤成一团看不清。\n"
+    "两条路径互斥：“ROI 定量”用橡皮筋基线，“自动检测”用环形中值局部背景，"
+    "两套数字不可比较。切到另一条路径时，上一条留下的框 / ROI 会被清掉（可 Ctrl+Z 撤回）。"
+    "历史记录会记住自己是哪套口径（“口径”列）；同一分组里混了两套时，归一化"
+    "直接拒绝给出比值——两侧原始数值照常显示，但那一行整行标红并在最左侧打 ⛔。\n"
     "删除操作都可用 Ctrl+Z 撤销、Ctrl+Y 重做；清除 ROI 与旋转也在撤销栈里。"
 )
 
@@ -175,9 +260,9 @@ _SHORTCUTS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "编辑",
         (
-            ("Ctrl+Z", "撤销（含删除、清 ROI、旋转）"),
+            ("Ctrl+Z", "撤销（含删除、清 ROI、旋转、切换定量路径）"),
             ("Ctrl+Y / Ctrl+Shift+Z", "重做"),
-            ("Delete", "删除选中条带（画布 / 结果表 / 历史表）；画布上 Backspace 同样生效"),
+            ("Delete", "删除选中条带（画布 / 结果表 / 历史表）；批量删除算一步撤销"),
             ("方向键", "微调 ROI 或最近动过的分隔线 1 px"),
             ("Shift+方向键", "同上，步长 10 px"),
             ("Ctrl+方向键", "微调 ROI 的宽 / 高"),
@@ -193,13 +278,82 @@ _SHORTCUTS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("Ctrl+1", "1:1"),
             ("Ctrl+2", "缩放到 ROI"),
             ("Ctrl+= / Ctrl+-", "放大 / 缩小"),
-            ("Ctrl+点击条带", "多选条带"),
+            ("Ctrl+点击条带", "反选（加选 / 取消该条带）"),
+            ("Shift+点击条带", "加选条带"),
+            ("调整模式下拖拽空白", "框选多个条带（ROI 内需按住 Ctrl/Shift）"),
             ("双击 ROI 内空白", "添加分隔线（调整模式）"),
             ("Esc", "取消当前拖动 / 取消选中"),
             ("F1", "打开本说明"),
         ),
     ),
+    (
+        "底部剖面图（不分工具模式）",
+        (
+            ("双击左图", "在该 X 处添加分隔线"),
+            ("右键分隔线", "删除这条分隔线"),
+            ("拖动橙线", "微调分隔线"),
+            ("左键框选", "放大到框内；退出请点“复位视图”"),
+        ),
+    ),
 )
+
+
+BAND_COUNT_TIP = (
+    "每个泳道上下叠着几条带。0 = 自动判断。\n"
+    "填了 N 就按“最深的谷”一路切到 N 条为止，自动判据整个让位——"
+    "两条带挨得极近（间距接近半高宽）时自动判据切不开，这是可靠的兜底。\n"
+    "刀数 = N − 当前连续段数。同一个连续段内它是双向的：一段连续信号里有 3 个峰、"
+    "填 2 就只切 1 刀、得到 2 条。但它并不回被空白隔开的段——已经被空白分成 3 段的"
+    "泳道，填 2 仍是 3 条。\n"
+    "可切的谷不够时按有几个切几个，不报错——切不够的泳道会在画布上方的诊断条里点名。\n"
+    "这个数也会交给 ROI 自检：填了它，「条带数 = 泳道数 × 每道条带数」就成了同义"
+    "反复，自检改用“不填这个数时自动分段会切出几条”来对照，替你把“强制切分掩盖了"
+    "ROI 画错”这种情况揪出来。"
+)
+
+
+def _single_band_warning(lanes: list[int], pick: object, expected: int | None = None) -> str:
+    """“这些泳道只检出一条带，策略在它们身上没生效”。
+
+    含糊的警告在这儿没用：用户选了“只取上面那条”，而这些泳道压根没被切成两
+    条，取上取下都是同一个数字，界面上看不出任何差别。这句话是用户发现"双条带
+    没被检出"的唯一线索，所以要把"只检出一条带"和"策略未生效"都说出来，再给出
+    下一步该按哪个控件。
+    """
+    numbers = "、".join(str(lane) for lane in lanes)
+    if expected and expected >= 2:
+        # 用户已经填过了，再劝他去填就是废话——真正的原因在上一句里
+        fix = f"「每道条带数」已填 {expected}，这几道仍没切开，说明那里找不到可切的谷。"
+    else:
+        fix = (
+            "若这些泳道本该是上下两条，去「调整」页把「每道条带数」填成 2 —— "
+            "两条带挨得太近时自动判据切不开，填了这个值就会强制切，改完自动重新定量。"
+        )
+    return (
+        f"⚠ 泳道 {numbers} 只检出 1 条带，“{band_pick_label(pick)}”在这些泳道未生效"
+        "（取到的就是那唯一一条，结果与“合并全部”完全相同）。" + fix
+    )
+
+
+def _shortfall_where(shortfall: dict[int, int], total_lanes: int = 0) -> str:
+    if total_lanes and len(shortfall) == total_lanes:
+        # 全军覆没时逐个点名只会刷出一长串，说清"全部"更有用
+        got = "、".join(str(count) for count in sorted(set(shortfall.values())))
+        return f"全部 {total_lanes} 个泳道都只切出 {got} 条"
+    detail = "、".join(f"{lane}（{count} 条）" for lane, count in sorted(shortfall.items()))
+    return f"泳道 {detail}没切够"
+
+
+def _under_split_warning(
+    shortfall: dict[int, int], expected: int, total_lanes: int = 0
+) -> str:
+    """填了“每道 N 条带”却切不出那么多——必须明说，别让用户以为强制生效了。"""
+    return (
+        f"⚠ 已要求每道 {expected} 条带，但{_shortfall_where(shortfall, total_lanes)}。"
+        "这个设置是“有几个谷切几个”，切不开时既不报错也不会硬切："
+        "多半是这几道的两条带挨得太近、连谷都没有，或者本来就只有一条。"
+        "请对着底部剖面图确认，必要时收紧 ROI 高度、或用“补画条带”手动补一条。"
+    )
 
 
 def _app_version() -> str:
@@ -237,15 +391,31 @@ def column_profile(blot, roi: RoiRect, dark_bands: bool) -> np.ndarray:
     )
 
 
-def quantify_roi(blot, roi: RoiRect, separators: list[float], dark_bands: bool):
-    """返回 (AnalysisResult, lanes)。
+def quantify_roi(
+    blot,
+    roi: RoiRect,
+    separators: list[float],
+    dark_bands: bool,
+    expected_bands: int | None = None,
+):
+    """返回 (AnalysisResult, lanes, RoiQualityReport)。
 
     剖面面板要画的 LaneProfile（剖面 / 基线 / 分段）先算出来，再交给
     quantify_lanes 换成测量值——图上画的基线和表里的数字出自同一份剖面。
+
+    ``expected_bands`` 只交给 compute_lane_profiles：分段结果已经固化在
+    lanes 里，quantify_lanes 拿到 lanes 后不会再分一次段，两处都传反而会让
+    人以为它们可以不一致。
+
+    ROI 自检也在这里做，而不是回到界面线程再补一刀：它要的 ``expected_bands``
+    与分段用的是同一个局部变量，物理上不可能对不上；而且它是纯 numpy，顺手在
+    后台线程里跑完，界面拿到的结果与诊断天生同源。
     """
     separators = list(separators)
     options = {"dark_bands": dark_bands, "white_level": blot.white_level}
-    lanes = quant.compute_lane_profiles(blot.raw, roi, separators, **options)
+    lanes = quant.compute_lane_profiles(
+        blot.raw, roi, separators, expected_bands=expected_bands, **options
+    )
     result = quant.quantify_lanes(
         blot.raw,
         roi,
@@ -254,7 +424,8 @@ def quantify_roi(blot, roi: RoiRect, separators: list[float], dark_bands: bool):
         lanes=lanes,
         **options,
     )
-    return result, lanes
+    report = check_roi_quality(lanes, expected_bands=expected_bands)
+    return result, lanes, report
 
 
 def measure_band(
@@ -509,13 +680,25 @@ class MainWindow(QMainWindow):
         self._separators: list[float] = []
         self._result: AnalysisResult | None = None
         self._result_origin = ""
+        # 最近一次“自动检测”有没有顺手清掉 ROI（用于回调里的状态栏说明）
+        self._detect_dropped_roi = False
+        # 背景口径与条带策略现在都由 QuantEntry 自己带着（normalize.py），界面
+        # 不再并行记一份账——两份记录迟早对不上，而对不上的后果正是这个字段要防的
         # 当前结果测自哪一版图像（见 _doc_version）。加载 / 旋转是异步的，
         # 加入历史前要拿它和 _doc_version 比对，别把旧朝向的数字记进去。
         self._result_doc_version = -1
         self._results_dirty = False
         self._lanes: list = []
+        # ROI 自检的结论，以及产出这批结果时实际用的「每道条带数」。后者跟着结果
+        # 走而不是读实时 SpinBox：防抖窗口里两者可能不一致，而自检的判据依赖它
+        self._roi_report = None
+        self._result_expected_bands: int | None = None
         self._session = AnalysisSession()
         self._ruler_angle: float | None = None
+        self._tilt_running = False
+        # 导出选项跨次记住：同一批图往往要用同样的设置导好几张
+        self._figure_options = FigureExportOptions()
+        self._figure_info_dialog = None
         self._cursor_pushed = False
         # 图像身份：self._blot 每换一次就 +1。定量 / 检测 / 剖面任务回来先比对，
         # 对不上整包丢弃。**只在图像真的换掉的那一刻递增**（任务完成时），提交
@@ -540,6 +723,7 @@ class MainWindow(QMainWindow):
         self._quant_was_manual = False
         self._quant_manual_pending = False
         self._quant_job_state: tuple | None = None
+        self._quant_job_expected: int | None = None
         self._syncing = False
         self._last_open_dir = ""
         self._last_export_dir = ""
@@ -565,7 +749,16 @@ class MainWindow(QMainWindow):
         self._quant_timer.timeout.connect(self._auto_quantify)
 
         self.canvas = BlotCanvas(self)
-        self.setCentralWidget(self.canvas)
+        # 诊断条横在画布正上方：ROI 自检要在用户改 ROI 的当下看得见，那会儿他
+        # 多半停在“调整”页而不是结果页。它只占一行，没有诊断时整条隐藏。
+        self.diagnostics = DiagnosticsBar(self, prefix="定量自检")
+        central = QWidget(self)
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self.diagnostics)
+        central_layout.addWidget(self.canvas, 1)
+        self.setCentralWidget(central)
         self.profile_panel = ProfilePanel(self)
         self.results_panel = ResultsPanel(self)
         self.normalize_panel = NormalizePanel(self)
@@ -681,7 +874,10 @@ class MainWindow(QMainWindow):
 
     def _build_adjust_tab(self) -> None:
         rotate_box = QGroupBox("旋转与对齐")
-        # 滑杆按 0.1° 一格，与微调框共用核心的 ±MAX_STRAIGHTEN_ANGLE 上限。
+        # 滑杆按 0.1° 一格（手拖的粗调），微调框保留 2 位小数（0.01°）：自动测角
+        # 与标尺量出来的都是 0.02° 量级的值，1 位小数会把 -0.28° 量化成 -0.30°，
+        # 白丢一位有效数字。两者不同步精度是有意的——滑杆改成 9000 格只会难拖，
+        # 而拖滑杆本来就没人指望 0.01° 的落点。
         self.rotation_slider = QSlider(Qt.Orientation.Horizontal)
         self.rotation_slider.setRange(
             -int(MAX_STRAIGHTEN_ANGLE * 10), int(MAX_STRAIGHTEN_ANGLE * 10)
@@ -689,9 +885,13 @@ class MainWindow(QMainWindow):
         self.rotation_slider.setValue(0)
         self.rotation_spin = QDoubleSpinBox()
         self.rotation_spin.setRange(-MAX_STRAIGHTEN_ANGLE, MAX_STRAIGHTEN_ANGLE)
-        self.rotation_spin.setDecimals(1)
-        self.rotation_spin.setSingleStep(0.1)
-        self.rotation_spin.setSuffix("°")
+        self.rotation_spin.setDecimals(2)
+        self.rotation_spin.setSingleStep(0.1)  # 键盘 / 按钮步进仍是 0.1°，手点 0.01 太慢
+        self.rotation_spin.setSuffix("°")  # sizeHint 会跟着 "-45.00°" 自己变宽
+        self.rotation_spin.setToolTip(
+            "微调角度，正值抬高右侧。保留 2 位小数：自动测倾角与标尺都能给到"
+            "0.01° 量级，左边的滑杆是 0.1° 一格的粗调。"
+        )
         zero_button = QPushButton("归零")
         zero_button.clicked.connect(lambda: self.rotation_spin.setValue(0.0))
         rotate_row = QHBoxLayout()
@@ -705,6 +905,19 @@ class MainWindow(QMainWindow):
         rotate_hint.setWordWrap(True)
         rotate_hint.setObjectName("dimHint")
         self.ruler_label = QLabel("标尺：未测量")
+        self.tilt_button = QPushButton("自动测倾角")
+        self.tilt_button.setToolTip(TILT_BUTTON_TIP)
+        self.tilt_button.clicked.connect(self._measure_tilt)
+        tilt_row = QHBoxLayout()
+        tilt_row.addWidget(self.tilt_button)
+        tilt_row.addStretch(1)
+        tilt_hint = QLabel(
+            "测出角度只画一条参考线、不自动旋转。ROI 要框在条带上，"
+            "别贴着膜边或划痕——那些是贯穿全宽的强直线，算法会锁到它们身上，"
+            "而且照样给一个很自信的数字。看着线确认平行后再点下面的旋正。"
+        )
+        tilt_hint.setWordWrap(True)
+        tilt_hint.setObjectName("dimHint")
         ruler_row = QHBoxLayout()
         horizontal_button = QPushButton("旋正为水平")
         vertical_button = QPushButton("旋正为垂直")
@@ -716,6 +929,8 @@ class MainWindow(QMainWindow):
         rotate_layout = QVBoxLayout(rotate_box)
         rotate_layout.addLayout(rotate_row)
         rotate_layout.addWidget(rotate_hint)
+        rotate_layout.addLayout(tilt_row)
+        rotate_layout.addWidget(tilt_hint)
         rotate_layout.addWidget(self.ruler_label)
         rotate_layout.addLayout(ruler_row)
 
@@ -754,6 +969,13 @@ class MainWindow(QMainWindow):
         self.lane_spin.setValue(0)
         self.lane_spin.setSpecialValueText("自动")
         self.lane_spin.setToolTip("0 = 按剖面峰自动判断泳道数")
+        # 与「期望泳道数」严格对称：一个管横向切几条泳道，一个管纵向切几条带，
+        # 所以用同一套写法（0 = 自动，走 setSpecialValueText，不另加复选框）
+        self.band_spin = QSpinBox()
+        self.band_spin.setRange(0, 10)
+        self.band_spin.setValue(0)
+        self.band_spin.setSpecialValueText("自动")
+        self.band_spin.setToolTip(BAND_COUNT_TIP)
         # ROI 数值框：鼠标拖动受缩放精度限制（20% 缩放时误差 ±2.5 图像像素），
         # 而 ROI 边界直接决定积分区间，需要能精确输入
         self.roi_spins: dict[str, QSpinBox] = {}
@@ -786,6 +1008,7 @@ class MainWindow(QMainWindow):
         roi_form = QFormLayout()
         roi_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         roi_form.addRow("期望泳道数", self.lane_spin)
+        roi_form.addRow("每道条带数", self.band_spin)
         roi_form.addRow("ROI 位置尺寸", roi_grid)
         roi_hint = QLabel("方向键微调 1 px，Shift+方向键 10 px（先点一下画布）。")
         roi_hint.setWordWrap(True)
@@ -797,13 +1020,17 @@ class MainWindow(QMainWindow):
         roi_layout.addWidget(peaks_button)
         roi_layout.addWidget(clear_roi_button)
 
-        display_box = QGroupBox("显示与导出")
+        display_box = QGroupBox("显示")
         self.guides_check = QCheckBox("显示参考线")
         self.guides_check.setChecked(True)
-        self.annotated_check = QCheckBox("导出展示图带检测标注")
+        display_hint = QLabel(
+            "展示图的位深、灰度映射、标注图层在“导出展示图”（Ctrl+Shift+E）里选。"
+        )
+        display_hint.setWordWrap(True)
+        display_hint.setObjectName("dimHint")
         display_layout = QVBoxLayout(display_box)
         display_layout.addWidget(self.guides_check)
-        display_layout.addWidget(self.annotated_check)
+        display_layout.addWidget(display_hint)
 
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -828,6 +1055,7 @@ class MainWindow(QMainWindow):
             self.weak_slider,
             self.bg_combo,
             self.lane_spin,
+            self.band_spin,
         ):
             widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             widget.installEventFilter(self._wheel_guard)
@@ -978,6 +1206,8 @@ class MainWindow(QMainWindow):
         self.profile_panel.separatorsChanged.connect(self._on_profile_separators_changed)
         self.profile_panel.editCommitted.connect(self._on_separators_committed)
 
+        self.diagnostics.dismissedChanged.connect(self._on_diagnostics_dismissed)
+
         self.results_panel.deleteRequested.connect(self._on_delete_rows)
         self.results_panel.laneSelected.connect(self._on_lane_selected)
         self.results_panel.selectionChanged.connect(self._on_table_selection)
@@ -985,6 +1215,10 @@ class MainWindow(QMainWindow):
         self.normalize_panel.addRequested.connect(self._on_add_to_history)
         self.normalize_panel.deleteHistoryRequested.connect(self._on_delete_history)
         self.normalize_panel.historyEdited.connect(self._on_history_edited)
+        self.normalize_panel.historyBandPickChanged.connect(
+            self._on_history_band_pick_changed
+        )
+        self.normalize_panel.bandPickChanged.connect(self._on_band_pick_changed)
         self.normalize_panel.exportLcRequested.connect(self._on_export_lc)
         self.normalize_panel.importLcRequested.connect(self._on_import_lc)
         self.normalize_panel.exportNormalizedRequested.connect(self._on_export_normalized)
@@ -996,6 +1230,7 @@ class MainWindow(QMainWindow):
         self.rotation_spin.valueChanged.connect(self._on_spin_rotation)
         self.weak_slider.valueChanged.connect(self._update_weak_hint)
         self.lane_spin.valueChanged.connect(self._on_lane_count_changed)
+        self.band_spin.valueChanged.connect(self._on_band_count_changed)
         self.guides_check.toggled.connect(self.act_guides.setChecked)
 
         self.act_open.triggered.connect(self._choose_image)
@@ -1291,7 +1526,7 @@ class MainWindow(QMainWindow):
         self._pending_restore = restore
         if message is None:
             spun = f"{turns * 90}° + " if turns else ""
-            message = f"正在旋转（{spun}{angle:+.1f}°）……"
+            message = f"正在旋转（{spun}{angle:+.2f}°）……"
         token = self._begin_job(JOB_ORIENT, message)
         self._submit_job(
             token,
@@ -1460,6 +1695,63 @@ class MainWindow(QMainWindow):
         self._show_ruler_popup(end_x, end_y)
         self._set_status("标尺已测量：就地点“旋正为水平/垂直”，或按 ✕ 取消。")
 
+    # -------------------------------------------------------------- 自动测倾角
+
+    def _measure_tilt(self) -> None:
+        """在当前 ROI 里自动测一次倾角。只写标尺位、画参考线，不旋转。
+
+        6–25 ms（实测 1.5 MPx 图 5 ms、整图 25 ms），但耗时随原图面积线性涨，
+        大幅面扫描件会到几百毫秒，所以照样丢线程池。不注册成 JOB_*：它不产出
+        结果、不换图，登记进 VIEW_JOBS 只会平白挡住定量的调度。重入靠按钮禁用，
+        过期结果靠回来时比对 doc 版本。
+        """
+        if self._blot is None or self._tilt_running:
+            return
+        blot, roi, dark = self._blot, self._roi, self._current_dark_bands()
+        version = self._doc_version
+        self._tilt_running = True
+        self._update_action_states()
+        self._set_status("正在自动测倾角……")
+        run_async(
+            self._pool,
+            partial(estimate_tilt, blot.raw, roi=roi, dark_bands=dark),
+            partial(self._on_tilt_done, version, roi),
+            partial(self._on_tilt_failed, version),
+        )
+
+    def _on_tilt_done(self, version: int, roi, estimate: object) -> None:
+        self._tilt_running = False
+        self._update_action_states()
+        if version != self._doc_version:
+            errorlog.log_message("丢弃过期的自动测倾角结果")
+            return
+        raw = getattr(estimate, "raw_angle_deg", None)
+        errorlog.log_message(
+            f"自动测倾角：code={getattr(estimate, 'reason_code', '?')} "
+            f"raw={raw} width={getattr(estimate, 'crop_width_px', '?')}"
+        )
+        if not getattr(estimate, "trusted", False):
+            # 拒答不动 _ruler_angle：那里可能存着用户刚手动量出来的值，
+            # 清成 None 等于替他把测量结果扔了。画布也不动，同理。
+            self._set_status("⚠ " + estimate.message)
+            return
+        angle = float(estimate.angle_deg)
+        self._ruler_angle = angle
+        self.ruler_label.setText(f"标尺倾角：{angle:.2f}°（相对水平·自动）")
+        self._ruler_popup.hide()
+        drawn = self.canvas.show_tilt_guide(angle, roi)
+        message = estimate.message
+        if drawn:
+            message += "画布上的虚线就是这个角度，与条带平行才可用。"
+        self._set_status(message)
+
+    def _on_tilt_failed(self, version: int, message: str) -> None:
+        self._tilt_running = False
+        self._update_action_states()
+        if version != self._doc_version:
+            return
+        self._set_status(f"⚠ 自动测倾角失败：{message}" + errorlog.hint())
+
     def _show_ruler_popup(self, scene_x: float, scene_y: float) -> None:
         if self._ruler_angle is None:
             return
@@ -1556,6 +1848,9 @@ class MainWindow(QMainWindow):
         ).clipped(self._blot.raw)
         created = self._roi is None
         canvas_seps = self.canvas.separators()
+        # 画了 ROI 就等于选了 ROI 定量这条路：上一轮自动检测的框现在就得下画布，
+        # 不能等定量算完（那期间两套标记会一起挂在图上）
+        self._drop_detect_overlay()
         self._roi = rect
         self._sync_roi_fields()
         if rect.width < 3 or rect.height < 3:
@@ -1763,6 +2058,26 @@ class MainWindow(QMainWindow):
         if self._roi is not None and self._blot is not None:
             self._reset_separators()
 
+    def _expected_bands(self) -> int | None:
+        """“每道条带数”，0（自动）折成 None。"""
+        return int(self.band_spin.value()) or None
+
+    def _on_band_count_changed(self, value: int) -> None:
+        """改“每道条带数”只影响纵向分段，横向分隔线一根都不能动。
+
+        所以走 _schedule_quantify 而不是 _on_lane_count_changed 那条
+        _reset_separators 路径——后者会按剖面峰谷重划泳道，把用户手调过的
+        分隔线全冲掉。
+        """
+        if self._roi is None or self._blot is None:
+            return
+        self._schedule_quantify()
+        self._set_status(
+            "每道条带数：自动判断，正在重新定量……"
+            if value == 0
+            else f"每道条带数：{value}，正在按最深的谷重新分段并定量……"
+        )
+
     def _reset_separators(self) -> None:
         if self._blot is None or self._roi is None:
             self._set_status("请先框选 ROI。")
@@ -1842,7 +2157,8 @@ class MainWindow(QMainWindow):
             self._session.entries[:] = list(payload)
             self._refresh_normalize()
             self._update_action_states()
-            self._set_status("已恢复删除的历史记录（Ctrl+Shift+Z 可再删）。")
+            # 压进这一格的可能是删除，也可能是改条带策略，别写死成"恢复删除"
+            self._set_status("历史记录已回到上一步（Ctrl+Shift+Z 可重做）。")
             return
         self._redo.append(("state", self._committed))
         self._apply_state(payload, "已撤销")
@@ -1984,6 +2300,7 @@ class MainWindow(QMainWindow):
             self._doc_version,
             roi_t,
             tuple(round(float(s), 3) for s in self._separators),
+            self._expected_bands(),
         )
 
     # ---------------------------------------------------------- 后台任务身份
@@ -2100,6 +2417,50 @@ class MainWindow(QMainWindow):
             return True
         return False
 
+    # ---------------------------------------------------------- 两条口径互斥
+
+    def _drop_detect_overlay(self) -> bool:
+        """进入 ROI 定量口径：先把自动检测留下的条带框与结果表清干净。
+
+        不清的话，从画 ROI 到定量落地这段时间（剖面任务 + 400 ms 防抖，大图能到
+        几秒）画布上是"ROI + 分隔线 + 上一轮自动检测的框"混在一起；定量失败或
+        ROI 太小时它们更会一直留着。两套框长得一模一样，用户没法分辨手里的数字
+        出自哪套背景口径。
+        """
+        if self._result_origin != ORIGIN_DETECT:
+            return False
+        self._clear_result()
+        self._result_stale = False
+        return True
+
+    def _drop_roi_overlay(self) -> bool:
+        """进入自动检测口径：把 ROI、分隔线、剖面与 ROI 定量结果整套清掉。
+
+        自动检测按整图算，产不出分隔线；ROI 框和橙色分隔线留在画布上只会让人
+        以为这组数字还是按 ROI 基线算的。这一步是一次真正的状态变更，因此压进
+        撤销栈——Ctrl+Z 能把 ROI 连同它的定量结果一起找回来。
+        """
+        had_roi = self._roi is not None or bool(self._separators)
+        had_roi_result = self._result is not None and self._result_origin == ORIGIN_ROI
+        if not had_roi and not had_roi_result:
+            return False
+        self._quant_timer.stop()
+        self._roi_timer.stop()
+        self._invalidate_jobs({JOB_PROFILE})
+        self._quant_manual_pending = False
+        self._roi = None
+        self._separators = []
+        self._column_profile = None
+        self.canvas.clear_roi()
+        self.canvas.set_snap_targets([])
+        self.profile_panel.clear()
+        self._sync_roi_fields()
+        if had_roi_result:
+            self._clear_result()
+        self._result_stale = False
+        self._commit_snapshot()  # 压的是清理前那一格，Ctrl+Z 整步回去
+        return True
+
     def _run_quantify(self, synchronous: bool = False, auto: bool = False) -> None:
         if self._blot is None:
             return
@@ -2121,9 +2482,21 @@ class MainWindow(QMainWindow):
             return
         self._quant_was_manual = not auto
         self._quant_manual_pending = False
+        if self._drop_detect_overlay():
+            self._commit_snapshot()
         self._quant_job_state = self._quant_input_state()
         dark = self._current_dark_bands()
-        job = partial(quantify_roi, self._blot, self._roi, list(self._separators), dark)
+        # 记下这次任务用的值，落地时连同结果一起生效：自检与提示都读结果自带的
+        # 那份，不读实时 SpinBox
+        self._quant_job_expected = self._expected_bands()
+        job = partial(
+            quantify_roi,
+            self._blot,
+            self._roi,
+            list(self._separators),
+            dark,
+            self._quant_job_expected,
+        )
         token = self._begin_job(JOB_QUANTIFY, "正在 ROI 定量……")
         if synchronous:
             try:
@@ -2145,8 +2518,9 @@ class MainWindow(QMainWindow):
             self._discard_stale_job(token, "ROI 定量")
             return
         self._finish_job(token)
-        result, lanes = payload
-        self._set_result(result, lanes, origin=ORIGIN_ROI)
+        result, lanes, report = payload
+        self._result_expected_bands = self._quant_job_expected
+        self._set_result(result, lanes, origin=ORIGIN_ROI, report=report)
         if self._quant_job_state == self._quant_input_state():
             self._result_stale = False
         else:
@@ -2160,11 +2534,27 @@ class MainWindow(QMainWindow):
         lane_count = (
             len(lanes) if lanes else len({m.lane for m in result.measurements}) or 1
         )
-        text = f"ROI 定量完成：{len(result.measurements)} 个条带 / {lane_count} 个泳道。"
+        expected = self._roi_expected_bands()
+        if expected:
+            text = (
+                f"ROI 定量完成：{len(result.measurements)} 个条带 / {lane_count} 个泳道"
+                f"（按“每道 {expected} 条带”分段）。"
+            )
+        else:
+            text = f"ROI 定量完成：{len(result.measurements)} 个条带 / {lane_count} 个泳道。"
         if result.saturated_band_count:
             text += f" ⚠ {result.saturated_band_count} 个条带饱和。"
+        # 自检的完整结论在画布上方的诊断条上；状态栏只给"严重"再补一路，
+        # 因为那一档意味着这批数字多半已经错了，值得占两个通道
+        if self.diagnostics.severity() == "error":
+            fatal = next(
+                (e.title for e in self.diagnostics.entries() if e.severity == "error"),
+                "",
+            )
+            text += f" ⛔ 自检严重：{fatal}（详情见画布上方的诊断条）。"
         self._set_status(
-            text + " 微调分隔线会自动刷新；点选条带 Delete 可删除（可撤销）。"
+            text + " 剖面图上双击可加分隔线、右键线上可删除，改完自动重新定量；"
+            "点选条带 Delete 可删除（可撤销）。"
         )
 
     def _run_auto(self, synchronous: bool = False) -> None:
@@ -2173,6 +2563,7 @@ class MainWindow(QMainWindow):
         if self._view_pending():
             self._set_status("⚠ 图片还在加载 / 旋转，请稍候再点“自动检测”。")
             return
+        self._detect_dropped_roi = self._drop_roi_overlay()
         job = partial(auto_detect, self._blot, self._current_config())
         token = self._begin_job(JOB_DETECT, "正在自动检测……")
         if synchronous:
@@ -2201,15 +2592,25 @@ class MainWindow(QMainWindow):
         self._absorb_result_state()
         self._update_action_states()
         count = len(result.measurements)
+        switched = (
+            "已清除 ROI 与分隔线：自动检测按整图的局部背景口径测量，"
+            "与 ROI 定量的基线口径不可混用（Ctrl+Z 可撤回）。"
+            if self._detect_dropped_roi
+            else ""
+        )
+        self._detect_dropped_roi = False
         if count:
             if self._tabs.currentWidget() is self._adjust_tab:
                 self._tabs.setCurrentWidget(self.results_panel)
             self._set_status(
-                f"自动检测到 {count} 个条带。可直接在图上点选条带，Delete 删除；"
-                "不准可框选 ROI 定量，或调整“弱条带检出”。"
+                switched
+                + f"自动检测到 {count} 个条带。可直接在图上点选条带（拖拽可框选多个），"
+                "Delete 批量删除；不准可框选 ROI 定量，或调整“弱条带检出”。"
             )
         else:
-            self._set_status("未检出条带。试试调高“弱条带检出”，或改用 ROI 定量。")
+            self._set_status(
+                switched + "未检出条带。试试调高“弱条带检出”，或改用 ROI 定量。"
+            )
 
     def _on_worker_error(self, token: object, message: str) -> None:
         if not self._job_is_current(token):
@@ -2250,12 +2651,19 @@ class MainWindow(QMainWindow):
             self._set_status(message)
 
     def _set_result(
-        self, result: AnalysisResult, lanes: list, origin: str | None = None
+        self,
+        result: AnalysisResult,
+        lanes: list,
+        origin: str | None = None,
+        report: object | None = None,
     ) -> None:
         self._result = result
         if origin is not None:
             self._result_origin = origin
         self._result_doc_version = self._doc_version
+        if origin == ORIGIN_DETECT:
+            self._result_expected_bands = None  # 自动检测那条路径不认这个参数
+        self._roi_report = report if report is not None else self._recheck_roi(result)
         self._lanes = list(lanes or [])
         measurements = result.measurements if result is not None else []
         self._results_dirty = bool(measurements)
@@ -2263,6 +2671,8 @@ class MainWindow(QMainWindow):
         self.canvas.clear_result_boxes()
         if measurements:
             self.canvas.show_result_boxes(measurements)
+        # 结果换了一批，"当前策略采用哪些"要跟着重算
+        self._refresh_band_usage()
         # 带上 measurements：删条带后 lanes 不重算，右图的积分填充区得按现存
         # 条带重画，否则被删掉那条的填充还留在图上
         self.profile_panel.set_lane_profiles(self._lanes, list(measurements))
@@ -2274,9 +2684,13 @@ class MainWindow(QMainWindow):
         self._result_doc_version = -1
         self._results_dirty = False
         self._lanes = []
+        self._roi_report = None
+        self._result_expected_bands = None
         self.results_panel.set_measurements([])
+        self.results_panel.set_band_usage([])
         self.canvas.clear_result_boxes()
         self.profile_panel.set_lane_profiles([], [])
+        self._refresh_diagnostics()
         self._update_action_states()
 
     # ------------------------------------------------------------------ 条带增删
@@ -2312,20 +2726,26 @@ class MainWindow(QMainWindow):
             else self._current_dark_bands()
         )
         existing = list(self._result.measurements) if self._result else []
-        note = ""
+        roi_style = self._roi is not None and self._result_origin in ("", ORIGIN_ROI)
         try:
-            added = None
-            if self._roi is not None and self._result_origin in ("", ORIGIN_ROI):
+            if roi_style:
                 # 与 ROI 定量同一条路径（橡皮筋基线），数值才和其它条带可比
                 added = measure_band_roi_style(self._blot, self._roi, x, y, w, h, dark)
-            if added is None:
+                if added is None:
+                    # 以前这里会退回环形中值局部背景，于是同一张结果表里混进了
+                    # 两套背景口径的数字——宁可不加，也不能给一个不可比的值
+                    self._set_status(
+                        "⚠ 这个框太窄或落在图外，无法按 ROI 定量的基线口径测量，"
+                        "已放弃添加。请在 ROI 范围内画一个至少 3 px 宽的框"
+                        "（不会改用另一套背景口径凑数）。"
+                    )
+                    return
+                if not existing:
+                    self._result_origin = ORIGIN_ROI
+            else:
                 added = measure_band(self._blot, x, y, w, h, dark)
-                if self._result_origin == ORIGIN_ROI:
-                    note = " ⚠ 该条带按局部背景口径测量，与 ROI 定量结果不可直接比较。"
                 if not existing:
                     self._result_origin = ORIGIN_DETECT
-            elif not existing:
-                self._result_origin = ORIGIN_ROI
             lane, band = self._numbers_for_new_band(added, existing)
             added = replace(added, lane=lane, band=band)
             result = result_from_measurements(
@@ -2344,7 +2764,7 @@ class MainWindow(QMainWindow):
         self._commit_snapshot()
         self._set_status(
             f"已添加条带 L{lane}-B{band}，当前共 {len(result.measurements)} 个"
-            f"（Ctrl+Z 可撤销）。{note}"
+            "（Ctrl+Z 可撤销）。"
         )
 
     def _on_delete_rows(self, indices: list) -> None:
@@ -2392,7 +2812,8 @@ class MainWindow(QMainWindow):
             self._on_delete_rows(selected)
         else:
             self._set_status(
-                "⚠ 没有选中的条带：先在画布点选（Ctrl 可多选）或在结果表选行。"
+                "⚠ 没有选中的条带：先在画布点选（Ctrl/Shift 加选，“调整”模式下拖拽"
+                "可框选一片），或在结果表里选中若干行。"
             )
 
     def _on_canvas_band_selection(self, indices: list) -> None:
@@ -2405,6 +2826,11 @@ class MainWindow(QMainWindow):
             and indices[0] < len(self._result.measurements)
         ):
             self.profile_panel.show_lane(int(self._result.measurements[indices[0]].lane))
+        if len(indices) > 1:
+            self._set_status(
+                f"已选中 {len(indices)} 个条带：按 Delete 一次全删（整批只算一步，"
+                "Ctrl+Z 可一次恢复）。"
+            )
 
     def _on_table_selection(self, indices: list) -> None:
         """表格选行 → 画布对应条带框进入选中态。"""
@@ -2440,7 +2866,10 @@ class MainWindow(QMainWindow):
         # 删掉一个误检条带后，该泳道的强度是剩余条带的合计；整条泳道被删空
         # 时泳道号会留下空档，没有泳道号的话归一化只能按位置配对，后面每个
         # 泳道都会错位到内参的邻居上。
-        series = lane_series_from_measurements(self._result.measurements)
+        pick = self.normalize_panel.band_pick()
+        series = lane_series_from_measurements(
+            self._result.measurements, band_pick=pick
+        )
         source = ""
         for blot in (self._blot, self._blot_original):
             if blot is not None and blot.path:
@@ -2462,6 +2891,8 @@ class MainWindow(QMainWindow):
                     group=group,
                     source=source,
                     doc_version=self._result_doc_version,
+                    # 界面的 "roi" / "detect" 是 coerce_origin 认的别名
+                    origin=self._result_origin,
                 )
             )
         except ValueError as exc:
@@ -2487,15 +2918,106 @@ class MainWindow(QMainWindow):
                 f" ⚠ 泳道 {'、'.join(weak)} 低于检出限（S/N < 3），"
                 "这些泳道的比值不可信。"
             )
+        if pick != BAND_PICK_ALL:
+            text += f" 条带策略：{band_pick_label(pick)}。"
+            single = self._single_band_lanes(self._result.measurements)
+            if single:
+                text += " " + _single_band_warning(single, pick, self._roi_expected_bands())
+        current_group = group.strip() or "默认"
+        if current_group in self._mixed_origin_groups():
+            text += (
+                f" ⛔ 分组“{current_group}”里同时存在 ROI 基线与局部背景两套口径的"
+                "数据，归一化已拒绝给出比值——请统一用同一条路径重测。"
+            )
         if kind == "loading_control":
             # 典型流程是“先内参、再目标”：自动切类型，防止下一条忘切
             self.normalize_panel.set_kind("target")
             text += " 类型已自动切到“目标蛋白”，测好目标膜后直接加入即可。"
         self._set_status(text)
 
+    def _mixed_origin_groups(self) -> list[str]:
+        """哪些分组里混进了两套背景口径——归一化会直接拒绝给出比值。
+
+        核心层在 normalize() 里已经拦了，这里是更早的一层提醒：还没配上对的
+        分组（只有内参、还没加目标）也能立刻看出口径不一致。
+        """
+        seen: dict[str, set[str]] = {}
+        for entry in self._session.entries:
+            origin = coerce_origin(entry.origin, strict=False)
+            if origin != "unknown":
+                seen.setdefault(entry.group, set()).add(origin)
+        return sorted(group for group, kinds in seen.items() if len(kinds) > 1)
+
+    def _single_band_lanes(self, measurements) -> list[int]:
+        """只检出一条带的泳道号（升序）。"""
+        counts: dict[int, int] = {}
+        for m in measurements or []:
+            counts[int(m.lane)] = counts.get(int(m.lane), 0) + 1
+        return sorted(lane for lane, count in counts.items() if count == 1)
+
+    def _roi_expected_bands(self) -> int | None:
+        """产出当前这批结果时用的“每道条带数”。
+
+        读的是结果自带的那份，不是实时 SpinBox：改完到重算落地之间有 400 ms
+        防抖窗口，读实时值会让提示和表里的数字短暂对不上。只有 ROI 定量走
+        compute_lane_profiles，自动检测那条路径不认这个值。
+        """
+        if self._result_origin != ORIGIN_ROI:
+            return None
+        return self._result_expected_bands
+
+    def _under_split_lanes(self, measurements) -> dict[int, int]:
+        """填了“每道 N 条带”却没切够的泳道 → 实际切出几条。
+
+        核心层是饱和的：候选谷不够就有几个切几个，不报错。不点名的话用户会
+        以为自己填的数强制生效了。
+        """
+        expected = self._roi_expected_bands()
+        if not expected or expected < 2:
+            return {}
+        counts: dict[int, int] = {}
+        for m in measurements or []:
+            counts[int(m.lane)] = counts.get(int(m.lane), 0) + 1
+        return {lane: count for lane, count in counts.items() if count < expected}
+
+    @staticmethod
+    def _lane_count(measurements) -> int:
+        return len({int(m.lane) for m in measurements or []})
+
+    def _entry_single_band_lanes(self, entry) -> list[int]:
+        """历史记录里只有一条带的泳道号——策略在这些泳道形同虚设。"""
+        if coerce_band_pick(entry.band_pick, strict=False) == BAND_PICK_ALL:
+            return []
+        return sorted(
+            lane for lane in entry.lane_numbers if len(entry.bands_of(lane)) == 1
+        )
+
+    def _history_pick_tips(self) -> list[str]:
+        expected = self._roi_expected_bands()
+        tips: list[str] = []
+        for entry in self._session.entries:
+            lanes = self._entry_single_band_lanes(entry)
+            tips.append(
+                _single_band_warning(lanes, entry.band_pick, expected) if lanes else ""
+            )
+        return tips
+
     def _normalize_diagnosis(self, rows: list) -> str | None:
         """归一化结果下方那行提示：没结果时说为什么，有结果时说哪儿没对上。"""
         warnings = list(self._session.last_warnings)
+        for entry, tip in zip(self._session.entries, self._history_pick_tips(), strict=False):
+            if tip:
+                warnings.append(f"“{entry.name}”：{tip}")
+        mixed = self._mixed_origin_groups()
+        if mixed:
+            # 口径混用比"某个泳道没配上"严重得多：数字看着都在，比值压根算不出来
+            warnings.insert(
+                0,
+                "分组 "
+                + "、".join(f"“{g}”" for g in mixed)
+                + " 里混用了 ROI 基线与局部背景两套口径，归一化已拒绝给出比值；"
+                "请用同一条路径重新定量后再加入历史。",
+            )
         if rows:
             return ("⚠ " + " ".join(warnings)) if warnings else None
         if not self._session.entries:
@@ -2518,10 +3040,277 @@ class MainWindow(QMainWindow):
         return text
 
     def _refresh_normalize(self) -> None:
-        self.normalize_panel.set_history(self._session.entries)
+        origins = [origin_label(e.origin) for e in self._session.entries]
+        self.normalize_panel.set_history(
+            self._session.entries, origins, self._history_pick_tips()
+        )
         rows = normalize_rows(self._session, self.normalize_panel.control_lane())
         self.normalize_panel.set_rows(rows)
         self.normalize_panel.set_diagnosis(self._normalize_diagnosis(rows))
+
+    def _on_history_band_pick_changed(self, row: int, pick: str) -> None:
+        """历史表里改条带策略：只重新聚合，不重新定量，且可撤销。"""
+        entries = self._session.entries
+        if not 0 <= row < len(entries):
+            return
+        if coerce_band_pick(entries[row].band_pick, strict=False) == coerce_band_pick(
+            pick, strict=False
+        ):
+            return
+        snapshot = list(entries)
+        try:
+            updated = self._session.set_band_pick(row, pick)  # type: ignore[arg-type]
+        except (ValueError, IndexError) as exc:
+            # CSV 导入的记录没有逐条带明细，改不了；把表格刷回原样再说明原因
+            QMessageBox.warning(self, "无法改条带策略", str(exc))
+            self._refresh_normalize()
+            return
+        self._undo.append(("history", snapshot))
+        del self._undo[:-MAX_UNDO]
+        self._refresh_normalize()
+        self._update_action_states()
+        text = (
+            f"“{updated.name}”的条带策略已改为“{band_pick_label(updated.band_pick)}”"
+            "（只重新聚合，没有重新定量；Ctrl+Z 可撤销）。"
+        )
+        lanes = self._entry_single_band_lanes(updated)
+        if lanes:
+            text += " " + _single_band_warning(lanes, updated.band_pick, self._roi_expected_bands())
+        self._set_status(text)
+
+    def _on_band_pick_changed(self, pick: str) -> None:
+        """录入区改条带策略：只影响“下一次加入历史”与结果表的采用标记。"""
+        self._refresh_band_usage()
+        measurements = self._result.measurements if self._result is not None else []
+        if not measurements:
+            return
+        if coerce_band_pick(pick, strict=False) == BAND_PICK_ALL:
+            self._set_status("条带策略：合并全部——每个泳道的所有条带加在一起。")
+            return
+        unused = len(measurements) - len(self._adopted_bands(measurements, pick))
+        text = (
+            f"条带策略：{band_pick_label(pick)}（结果表里 {unused} 个条带标为未采用，"
+            "仍然显示、只是不计入合计）。"
+        )
+        lanes = self._single_band_lanes(measurements)
+        if lanes:
+            text += " " + _single_band_warning(lanes, pick, self._roi_expected_bands())
+        self._set_status(text)
+
+    def _adopted_bands(self, measurements, pick: str) -> set[int]:
+        """当前策略下会被计入合计的条带下标。
+
+        谁上谁下由核心层的 ``lane_series_from_measurements`` 说了算，界面只按
+        结果反查——在这儿另写一套 y 排序，迟早和聚合用的那套对不上。
+        """
+        if not measurements:
+            return set()
+        series = lane_series_from_measurements(measurements, band_pick=pick)
+        used = {
+            (int(lane), int(band))
+            for lane, bands in zip(series.lanes, series.used_bands, strict=False)
+            for band in bands
+        }
+        return {
+            index
+            for index, m in enumerate(measurements)
+            if (int(m.lane), int(m.band)) in used
+        }
+
+    def _refresh_band_usage(self) -> None:
+        """把“当前策略采不采用”同步到结果表与画布。"""
+        measurements = list(self._result.measurements) if self._result is not None else []
+        pick = self.normalize_panel.band_pick()
+        adopted = self._adopted_bands(measurements, pick)
+        unused = [i for i in range(len(measurements)) if i not in adopted]
+        self.results_panel.set_band_usage(unused)
+        self.canvas.set_unused_bands(unused)
+        self._refresh_diagnostics()
+
+    # -------------------------------------------------------------- 定量自检
+
+    def _recheck_roi(self, result) -> object | None:
+        """删条带 / 补画之后重算自检。
+
+        这条路径只有 measurements、没有剖面，所以 ``expected_bands`` 下的对照
+        诊断会退化成一条提示——但"条带贴着 ROI 边"那条判据照常有效，而它正是
+        删掉几个误检之后最值得复查的一条。
+        """
+        if self._result_origin != ORIGIN_ROI or self._roi is None or self._blot is None:
+            return None
+        measurements = list(result.measurements) if result is not None else []
+        if not measurements:
+            return None
+        try:
+            return check_roi_quality_from_measurements(
+                measurements,
+                self._roi.clipped(self._blot.raw),
+                expected_bands=self._result_expected_bands,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 自检是诊断，坏了也绝不能连累定量结果本身
+            errorlog.log_exception("ROI 自检失败", exc)
+            return None
+
+    def _diagnostic_entries(self) -> list[Entry]:
+        """三路提示汇成一份列表：ROI 自检 + 条带数没切够 + 策略未生效。
+
+        去重是这里的重点：自检的「条带数与泳道数对不上」和界面自己的「没切够」
+        讲的常常是同一批泳道，自检那条写得更细（还点出"多出来的段多半是越过膜
+        边的背景"），所以它在场时界面这条就闭嘴，不把同一件事说两遍。
+        """
+        entries = entries_from_report(self._roi_report)
+        covered = {i.kind for i in (self._roi_report.issues if self._roi_report else ())}
+        measurements = list(self._result.measurements) if self._result is not None else []
+        if not measurements:
+            return entries
+        expected = self._roi_expected_bands()
+        shortfall = self._under_split_lanes(measurements)
+        # 自检的「条带数与泳道数对不上」在 source="expected" 时已经把这件事说全了
+        # （"你指定了每道 N 条带"＋"强制切分是有几个谷切几个"＋切不开的两种成因），
+        # 它在场时这里一个字都不说。没有自检结论时（自动检测那条路径、或自检自己
+        # 抛了异常）才由界面兜底——那时用户是彻底听不到这句话的。
+        if shortfall and ISSUE_BAND_COUNT not in covered:
+            total = self._lane_count(measurements)
+            entries.append(
+                Entry(
+                    severity="warning",
+                    title=f"「每道 {expected} 条带」没切够（这个参数是饱和的）",
+                    detail=_under_split_warning(shortfall, int(expected or 0), total),
+                )
+            )
+        pick = self.normalize_panel.band_pick()
+        if coerce_band_pick(pick, strict=False) != BAND_PICK_ALL:
+            lanes = self._single_band_lanes(measurements)
+            if lanes:
+                entries.append(
+                    Entry(
+                        severity="warning",
+                        title=f"“{band_pick_label(pick)}”在部分泳道未生效",
+                        detail=_single_band_warning(lanes, pick, expected),
+                    )
+                )
+        return entries
+
+    def _diagnostic_key(self, entries: list[Entry]) -> tuple:
+        """这批诊断的指纹：「我知道了」记的就是它。
+
+        含 ROI、每道条带数与每条诊断的标题——三者任何一个变了，说明用户已经
+        动过手或者问题本身变了，提示必须重新出现。不含文档版本以外的时间戳，
+        所以对同一个 ROI 反复重新定量不会把已忽略的提示又翻出来。
+        """
+        roi = (
+            (self._roi.x, self._roi.y, self._roi.width, self._roi.height)
+            if self._roi is not None
+            else None
+        )
+        return (
+            self._doc_version,
+            roi,
+            self._result_expected_bands,
+            tuple((e.severity, e.title) for e in entries),
+        )
+
+    def _refresh_diagnostics(self) -> None:
+        entries = self._diagnostic_entries()
+        report = self._roi_report
+        if not entries and report is None:
+            self.diagnostics.clear()
+        else:
+            actionable = [e for e in entries if e.severity != "info"]
+            summary = (
+                report.summary()
+                if report is not None and not actionable
+                else ""  # 有问题时交给诊断条按条目自动拼，计数才和列表对得上
+            )
+            self.diagnostics.set_entries(
+                entries, summary=summary, key=self._diagnostic_key(entries)
+            )
+        self._refresh_roi_marks()
+
+    def _on_diagnostics_dismissed(self, dismissed: bool) -> None:
+        self._refresh_roi_marks()
+        self._set_status(
+            "已忽略本次自检提示：画布上的角标与斜纹带一并收起。"
+            "改动 ROI、每道条带数，或问题本身变了，它会自己回来；"
+            "点“重新查看”也能立刻翻回去。"
+            if dismissed
+            else "已恢复显示本次自检提示。"
+        )
+
+    def _refresh_roi_marks(self) -> None:
+        """把自检结论画到画布上：条带角标 + ROI 边上的斜纹留白带 + 分隔线警示。
+
+        角标是形状、斜纹带是纹理，都不新增颜色（条带框的红 / 橙 / 钢蓝 / 虚线
+        四种状态已经占满色相与线型两个通道）。分隔线是唯一换色的：它本来就只有
+        橙和聚焦色两种状态，换成诊断条 error 级的同一个红，看到红线就知道去
+        哪读原因。
+        """
+        report = self._roi_report
+        measurements = list(self._result.measurements) if self._result is not None else []
+        flagged: list[int] = []
+        seps: list[int] = []
+        tip = ""
+        sep_tip = ""
+        top = bottom = 0.0
+        # 「我知道了」要把画布上的标注一起收掉：角标和斜纹带是最吵的那部分，
+        # 只闭掉文字、留着满屏角标，等于没让用户忽略成
+        if report is not None and measurements and not self.diagnostics.is_dismissed():
+            index = {
+                (int(m.lane), int(m.band)): i for i, m in enumerate(measurements)
+            }
+            wanted: set[tuple[int, int]] = set()
+            titles: list[str] = []
+            for issue in report.issues:
+                if issue.severity == "info":
+                    continue
+                if issue.kind == ISSUE_SEPARATOR_IN_BAND:
+                    hits = self._separators_between(issue.lanes)
+                    if hits:
+                        seps = hits
+                        sep_tip = (
+                            f"⛔ {issue.title}：这条线从一整条条带中间穿了过去，"
+                            "两侧泳道的数都不能用。把它拖到两条条带之间的空隙上；"
+                            "那里根本没有空隙就说明这两个“泳道”本是同一道，"
+                            "右键删掉这条线。详情见画布上方的诊断条。"
+                        )
+                    continue
+                if not issue.bands:
+                    continue
+                wanted.update((int(lane), int(band)) for lane, band in issue.bands)
+                titles.append(issue.title)
+                if issue.kind == ISSUE_EDGE_TOP:
+                    top = float(report.required_clearance)
+                elif issue.kind == ISSUE_EDGE_BOTTOM:
+                    bottom = float(report.required_clearance)
+            flagged = sorted(index[key] for key in wanted if key in index)
+            if flagged:
+                tip = (
+                    "ROI 自检：" + "；".join(dict.fromkeys(titles))
+                    + "。详情见画布上方的诊断条。"
+                )
+        self.canvas.set_flagged_bands(flagged, tip)
+        self.canvas.set_flagged_separators(seps, sep_tip)
+        self.canvas.set_clearance_strips(top, bottom)
+
+    def _separators_between(self, lanes) -> list[int]:
+        """把 ``ISSUE_SEPARATOR_IN_BAND`` 的泳道号翻成分隔线下标。
+
+        第 k 条分隔线（0 基）夹在第 k+1 与第 k+2 道之间，所以泳道号里每一对
+        相邻的 ``(a, a+1)`` 就对应下标 ``a-1``。核心层把成对的命中摊平成了一个
+        去重泳道集合，所以 ``(1,2)`` 和 ``(3,4)`` 两处命中会得到 ``1,2,3,4``，
+        这里会连带把第 2、3 道之间那条也描红——宁可多描一条，也别把真正切错的
+        那条漏掉；精确的成对说明在诊断条正文里。
+        """
+        numbers = sorted({int(n) for n in lanes})
+        # 只在泳道号连续编到分隔线条数对得上时才映射：删过整道之后泳道保号，
+        # 编号会出现空档，那时按 a-1 换算就指到别的线上去了
+        total = len(self.canvas.separators())
+        if not numbers or numbers[-1] > total + 1:
+            return []
+        return sorted(
+            {a - 1 for a, b in zip(numbers, numbers[1:]) if b == a + 1 and a >= 1}
+        )
 
     def _on_delete_history(self, rows: list) -> None:
         rows = [int(r) for r in rows]
@@ -2590,8 +3379,16 @@ class MainWindow(QMainWindow):
         except (ValueError, OSError) as exc:
             QMessageBox.critical(self, "导入失败", str(exc))
             return
+        # 导入自己的警告要先抄走：_refresh_normalize 会跑一遍归一化，
+        # last_warnings 随即被那一轮的结果顶掉
+        problems = list(self._session.last_warnings)
+        # 口径由 CSV 的 origin 列自己带（没有该列的旧文件读作“未知”），界面
+        # 不再猜；归一化遇到“未知”会明说无法确认同源
         self._refresh_normalize()
-        self._set_status(f"已导入 {count} 组内参数据。")
+        text = f"已导入 {count} 组内参数据。"
+        if problems:
+            text += " ⚠ " + " ".join(problems)
+        self._set_status(text)
 
     def _on_export_normalized(self) -> None:
         rows = normalize_rows(self._session, self.normalize_panel.control_lane())
@@ -2650,6 +3447,9 @@ class MainWindow(QMainWindow):
 
     def _confirm_overwrite(self, folder: str, stem: str) -> bool:
         existing = self._existing_exports(folder, stem)
+        return self._confirm_overwrite_names(existing)
+
+    def _confirm_overwrite_names(self, existing: list[str]) -> bool:
         if not existing:
             return True
         answer = QMessageBox.question(
@@ -2679,7 +3479,9 @@ class MainWindow(QMainWindow):
             self._set_status("已取消导出（未覆盖已有文件）。")
             return
         try:
-            csv_path, preview_path = export_result(self._result, image_path, selected)
+            csv_path, preview_path = export_result(
+                self._result, image_path, selected, origin=self._result_origin
+            )
         except Exception as exc:  # noqa: BLE001 - cv2 / 权限错误都要给出提示
             errorlog.log_exception("导出数据失败", exc)
             QMessageBox.critical(self, "导出失败", str(exc) + errorlog.hint())
@@ -2691,36 +3493,193 @@ class MainWindow(QMainWindow):
             selected,
         )
 
+    FIGURE_SUFFIXES = (".tif", ".tiff", ".png")
+
+    @staticmethod
+    def _restore_figure_options(settings) -> FigureExportOptions:
+        """导出选项跨会话记住。任何一项读坏了就整体退回默认，不半信半疑地拼。"""
+        base = FigureExportOptions()
+        try:
+            annotated = str(settings.value("params/export_annotated", "false")).lower()
+            depth = settings.value("params/export_bit_depth", "")
+            width = settings.value("params/export_print_width_mm", "")
+            layers = settings.value("params/export_layers", None)
+            if isinstance(layers, str):
+                layers = [name for name in layers.split(",") if name]
+            return FigureExportOptions(
+                clean=True,
+                annotated=annotated in ("true", "1"),
+                clean_mapping=str(
+                    settings.value("params/export_clean_mapping", base.clean_mapping)
+                ),
+                annotated_mapping=str(
+                    settings.value(
+                        "params/export_annotated_mapping", base.annotated_mapping
+                    )
+                ),
+                bit_depth=int(depth) if str(depth).strip() else None,
+                print_width_mm=float(width) if str(width).strip() else None,
+                layers=tuple(layers) if layers else base.layers,
+            )
+        except (TypeError, ValueError):
+            return base
+
+    @staticmethod
+    def _store_figure_options(settings, options: FigureExportOptions) -> None:
+        settings.setValue("params/export_annotated", options.annotated)
+        settings.setValue("params/export_clean_mapping", options.clean_mapping)
+        settings.setValue("params/export_annotated_mapping", options.annotated_mapping)
+        settings.setValue(
+            "params/export_bit_depth", "" if options.bit_depth is None else options.bit_depth
+        )
+        settings.setValue(
+            "params/export_print_width_mm",
+            "" if options.print_width_mm is None else options.print_width_mm,
+        )
+        settings.setValue("params/export_layers", ",".join(options.layers))
+
+    def _figure_output_names(self, base: Path, options) -> list[str]:
+        """这次导出会落哪些文件。最多 4 个：两张图各带一个旁注。"""
+        names: list[str] = []
+        if options.clean:
+            names.append(base.name)
+            names.append(f"{base.stem}_export_info.txt")
+        if options.annotated:
+            annotated = f"{base.stem}_annotated"
+            names.append(annotated + base.suffix)
+            names.append(f"{annotated}_export_info.txt")
+        return names
+
+    def _blot_for_export(self) -> tuple[object, int]:
+        """导出用的图：从原件按 Lanczos-4 重转一次，别复用画布那张。
+
+        ``self._blot`` 是给屏幕和定量用的，双线性插值只保留 ~63% 的高频；发表图
+        值得那 4 倍代价换 ~95%。画布尺寸只取决于角度与原图形状、与插值核无关，
+        所以 ``self._roi`` 和分隔线坐标原样可用——万一形状真的对不上（核心层换
+        了实现），宁可退回画布那张，也不能把 ROI 画到错的位置上。
+        """
+        blot = self._blot
+        if self._blot_original is None or abs(self._angle) <= 1e-6:
+            return blot, ROTATE_SHARP
+        sharp = rotate_blot(
+            self._blot_original, float(self._angle), interpolation=ROTATE_SHARP
+        )
+        if sharp.raw.shape[:2] != blot.raw.shape[:2]:
+            errorlog.log_message(
+                f"Lanczos 重转后形状 {sharp.raw.shape[:2]} 与画布图 "
+                f"{blot.raw.shape[:2]} 不一致，退回双线性图导出"
+            )
+            return blot, ROTATE_FAST
+        return sharp, ROTATE_SHARP
+
     def _export_figure(self) -> None:
-        if self._blot is None and self._result is None:
+        if self._blot is None:
+            self._set_status("⚠ 还没有图片可导出。")
             return
-        stem = "figure"
-        if self._blot is not None and self._blot.path:
-            stem = self._blot.path.stem
+        blot = self._blot
+        dialog = FigureExportDialog(
+            self,
+            width_px=blot.width,
+            height_px=blot.height,
+            source_bit_depth=blot.bit_depth,
+            white_level=blot.white_level,
+            has_result=self._result is not None and bool(self._result.measurements),
+            options=self._figure_options,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.options()
+        self._figure_options = options
+
+        stem = blot.path.stem if blot.path else "figure"
         start_dir = Path(self._last_export_dir or self._last_open_dir or ".")
-        filename, _ = QFileDialog.getSaveFileName(
+        filename, selected_filter = QFileDialog.getSaveFileName(
             self,
             "导出展示图",
-            str(start_dir / f"{stem}_figure.png"),
-            "PNG (*.png);;JPEG (*.jpg);;TIFF (*.tif)",
+            str(start_dir / f"{stem}_figure.tif"),
+            "TIFF (*.tif);;PNG (*.png)",
         )
         if not filename:
             return
-        if self.annotated_check.isChecked() and self._result is not None:
-            image = self._result.annotated_image
-        elif self._blot is not None:
-            image = self._blot.display_bgr
-        else:
-            image = self._result.annotated_image
+        base = Path(filename)
+        if base.suffix.lower() not in self.FIGURE_SUFFIXES:
+            base = base.with_suffix(".png" if "png" in selected_filter.lower() else ".tif")
+
+        # getSaveFileName 只替我们确认它返回的那一个名字，旁注和标注版它管不着
+        folder = base.parent
+        already_confirmed = base.name if base == Path(filename) else ""
+        pending = [
+            name
+            for name in self._figure_output_names(base, options)
+            if name != already_confirmed and (folder / name).exists()
+        ]
+        if not self._confirm_overwrite_names(pending):
+            self._set_status("已取消导出（未覆盖已有文件）。")
+            return
+
+        measurements = self._result.measurements if self._result is not None else ()
+        common = {
+            "roi": self._roi,
+            "pad": 12,
+            "bit_depth": options.bit_depth,
+            "print_width_mm": options.print_width_mm,
+            "measurements": measurements,
+            "separators": tuple(self._separators),
+            "rotation_deg": float(self._angle),
+        }
+        if options.needs_manual_points():
+            common["black_point"] = options.black_point
+            common["white_point"] = options.white_point
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            saved = export_figure(image, filename, roi=self._roi, pad=12)
-        except Exception as exc:  # noqa: BLE001
+            source, interpolation = self._blot_for_export()
+            common["rotation_interpolation"] = interpolation
+            exports = []
+            if options.clean:
+                exports += list(
+                    export_presentation_figures(
+                        source,
+                        base,
+                        clean=True,
+                        annotated=False,
+                        mapping=options.clean_mapping,
+                        **common,
+                    )
+                )
+            if options.annotated:
+                exports += list(
+                    export_presentation_figures(
+                        source,
+                        base,
+                        clean=False,
+                        annotated=True,
+                        mapping=options.annotated_mapping,
+                        layers=options.layers,
+                        **common,
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 - cv2 / 权限 / 参数错误都要给提示
             errorlog.log_exception("导出展示图失败", exc)
             QMessageBox.critical(self, "导出失败", str(exc) + errorlog.hint())
             return
-        self._last_export_dir = str(Path(filename).parent)
-        suffix = "（按当前 ROI 裁切）" if self._roi is not None else "（整图）"
-        self._notify_exported(f"展示图已保存：{saved} {suffix}", Path(filename).parent)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._last_export_dir = str(folder)
+        crop = "（按当前 ROI 裁切）" if self._roi is not None else "（整图）"
+        saved = "、".join(export.path.name for export in exports)
+        self._notify_exported(f"展示图已保存：{saved} {crop}", folder)
+        self._show_figure_info(exports)
+
+    def _show_figure_info(self, exports) -> None:
+        """把旁注内容摆一次给用户看：没人会主动去开图旁边的那个 txt。"""
+        if not exports:
+            return
+        text = "\n\n".join(export.info_text() for export in exports)
+        dialog = FigureInfoDialog(self, text=text)
+        self._figure_info_dialog = dialog
+        dialog.exec()
 
     # ------------------------------------------------------------------ 工具 / 视图 / 状态
 
@@ -2783,6 +3742,7 @@ class MainWindow(QMainWindow):
         self.act_delete.setEnabled(has_result and not self._busy)
         self.act_rot_left.setEnabled(has_image and not self._busy)
         self.act_rot_right.setEnabled(has_image and not self._busy)
+        self.tilt_button.setEnabled(has_image and not self._tilt_running)
         self.act_undo.setEnabled(bool(self._undo) and not self._busy)
         self.act_redo.setEnabled(bool(self._redo) and not self._busy)
         for spin in self.roi_spins.values():
@@ -2884,6 +3844,10 @@ class MainWindow(QMainWindow):
             self.lane_spin.setValue(int(float(settings.value("params/lane_count", 0))))
         except (TypeError, ValueError):
             pass
+        try:
+            self.band_spin.setValue(int(float(settings.value("params/band_count", 0))))
+        except (TypeError, ValueError):
+            pass
         bg_mode = str(settings.value("params/bg_mode", "auto") or "auto")
         for index, (_label, value) in enumerate(BG_MODES):
             if value == bg_mode:
@@ -2901,8 +3865,7 @@ class MainWindow(QMainWindow):
             )
         except (TypeError, ValueError):
             pass
-        annotated = str(settings.value("params/export_annotated", "false")).lower()
-        self.annotated_check.setChecked(annotated in ("true", "1"))
+        self._figure_options = self._restore_figure_options(settings)
         snap = str(settings.value("params/snap_separators", "true")).lower()
         self.snap_check.setChecked(snap in ("true", "1"))
         self._snap_enabled = self.snap_check.isChecked()
@@ -2961,11 +3924,12 @@ class MainWindow(QMainWindow):
         settings.setValue("paths/recent", self._recent)
         settings.setValue("params/weak_band", int(self.weak_slider.value()))
         settings.setValue("params/lane_count", int(self.lane_spin.value()))
+        settings.setValue("params/band_count", int(self.band_spin.value()))
         settings.setValue("params/bg_mode", self._bg_mode())
         settings.setValue("params/protein", self.normalize_panel.protein_name())
         settings.setValue("params/group", self.normalize_panel.group_name())
         settings.setValue("params/control_lane", self.normalize_panel.control_lane())
-        settings.setValue("params/export_annotated", self.annotated_check.isChecked())
+        self._store_figure_options(settings, self._figure_options)
         settings.setValue("params/show_guides", self.act_guides.isChecked())
         settings.setValue("params/snap_separators", self.snap_check.isChecked())
         super().closeEvent(event)

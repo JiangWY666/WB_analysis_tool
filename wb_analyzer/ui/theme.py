@@ -22,6 +22,8 @@ TEXT_BRIGHT = "#dfe3e8"
 TEXT_DISABLED = "#5f6469"
 TEXT_FAINT = "#6a6f76"
 WARN = "#ffb74d"
+ERROR = "#ff6e6e"
+OK = "#81c784"
 
 # ---------------------------------------------------------------- 画布 / 图表配色
 # 画布（canvas.py）与剖面图（profile_panel.py）以前各自抄了一份颜色，改主题

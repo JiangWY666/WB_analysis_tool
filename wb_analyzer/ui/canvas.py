@@ -54,12 +54,51 @@ GUIDE_COLOR = QColor(*theme.GUIDE_RGBA)
 CANVAS_BG_COLOR = QColor(theme.CANVAS_BG)
 EMPTY_HINT_COLOR = QColor(theme.TEXT_FAINT)
 EMPTY_HINT = "打开或拖入 WB 图片（PNG / JPG / BMP / TIF）"
+LABEL_PLATE_COLOR = QColor(18, 20, 23, 215)
+LABELS_HIDDEN_HINT = "条带标签已隐藏（放大、悬停或选中可查看）"
+LABELS_COMPACT_HINT = "标签已简化为泳道号（放大可看条带号）"
+UNUSED_BAND_TIP = (
+    "当前条带策略未采用（虚线框）：它仍是真实测量，只是不计入该泳道合计。"
+    "删除才会让它从图上和表里消失。"
+)
+CLEARANCE_FILL = QColor(theme.ROI_LINE)
+CLEARANCE_FILL.setAlpha(70)
+CLEARANCE_TIP = (
+    "斜纹带 = ROI 自检要求的边缘留白。条带框伸进这条带子，"
+    "说明这一侧没有干净背景可以锚基线——把 ROI 这条边往外挪到斜纹空出来为止。"
+)
+
+# 被自检点名的分隔线：与诊断条 error 级用同一个红，两处才对得上号
+SEPARATOR_FLAG_COLOR = QColor(theme.ERROR)
+SEPARATOR_FLAG_WIDTH = 5
+
+# ROI 自检角标：屏幕像素，随缩放恒定
+FLAG_PX = 11.0
+FLAG_FONT_PT = 7
+
+# 自动测角的参考线：图像像素（要跟着缩放走，否则"平不平行"就看不出来了）
+TILT_GUIDE_OVERHANG = 12.0
+TILT_GUIDE_CAP = 6.0
 
 HANDLE_PX = 8.0
 HIT_PX = 7.0
 MIN_ROI_PX = 3.0
 SEP_MARGIN = 2.0
 EMIT_INTERVAL = 0.03
+
+# 条带标签排布（全部是设备像素：标签用 ItemIgnoresTransformations，屏幕尺寸恒定）
+LABEL_FONT_PT = 8
+LABEL_PAD_X = 3.0
+LABEL_PAD_Y = 1.0
+LABEL_MARGIN = 4.0  # 标签与条带框之间的空隙
+LABEL_ROW_GAP = 3.0  # 错行时上下两行标签之间留的空隙（行距 = 标签高 + 它）
+MAX_LABEL_ROWS = 2  # 最多错两行，再挤就整批隐藏
+LABEL_GAP = 3.0  # 同一行相邻标签之间的最小间隙
+# 图元 Z 序：条带框 8 < ROI 10 < 分隔线 11 < 标签 11.5 < 手柄 12 < 强制显示的标签 13
+LABEL_Z = 11.5
+LABEL_Z_FORCED = 13.0
+# 橡皮筋框选：拖过这么多设备像素才算"框选"而不是"点了一下空白"
+RUBBER_MIN_PX = 3.0
 # 分隔线吸附：只有落到谷底 SNAP_PX 图像像素以内才吸，明显想放别处时不硬拽
 SNAP_PX = 6.0
 
@@ -110,6 +149,114 @@ def _handle_anchor(rect: QRectF, handle_id: str) -> QPointF:
     }[handle_id]
 
 
+class BandLabelItem(QGraphicsSimpleTextItem):
+    """条带标签：深色底板 + 彩色文字，缩放时屏幕尺寸恒定。
+
+    没有底板的裸文字压在条带、分隔线和 ROI 填充上根本读不出来；底板还让
+    "标签是否互相压住"变成一个可以量出来的矩形问题（见
+    :meth:`BlotCanvas.band_label_rects`）。
+    """
+
+    def __init__(self, text: str, compact_text: str, color: QColor, font: QFont) -> None:
+        super().__init__(text)
+        self._full_text = text
+        self._compact_text = compact_text
+        self.compact = False
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setBrush(QBrush(color))
+        self.setFont(font)
+        self.setZValue(LABEL_Z)
+        self._border = QColor(color)
+        self._border.setAlpha(160)
+        self._forced = False
+        self.shown = False
+        """这一轮排布是否给它找到了不与别人相交的位置——可见性只看这一个字段。"""
+
+    def set_compact(self, compact: bool) -> None:
+        """缩小到放不下"L2-B1"时，退化成只写泳道号"L2"。"""
+        compact = bool(compact)
+        if compact == self.compact:
+            return
+        self.compact = compact
+        self.setText(self._compact_text if compact else self._full_text)
+
+    def plate_rect(self) -> QRectF:
+        """底板矩形（item 坐标 == 设备像素）。"""
+        return (
+            QGraphicsSimpleTextItem.boundingRect(self)
+            .adjusted(-LABEL_PAD_X, -LABEL_PAD_Y, LABEL_PAD_X, LABEL_PAD_Y)
+        )
+
+    def boundingRect(self) -> QRectF:  # noqa: N802 - Qt API
+        return self.plate_rect()
+
+    def set_forced(self, forced: bool) -> None:
+        """悬停 / 选中的条带：优先显示，并抬到手柄之上。"""
+        self._forced = bool(forced)
+        self.setZValue(LABEL_Z_FORCED if forced else LABEL_Z)
+
+    def is_forced(self) -> bool:
+        return self._forced
+
+    def paint(self, painter, option, widget=None) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(self._border, 1))
+        painter.setBrush(QBrush(LABEL_PLATE_COLOR))
+        painter.drawRoundedRect(self.plate_rect(), 2.5, 2.5)
+        painter.restore()
+        super().paint(painter, option, widget)
+
+
+class BandFlagItem(QGraphicsItem):
+    """条带框右上角的三角警示角标——ROI 自检点到的那些条带。
+
+    刻意**不引入第五种颜色**：角标用所属条带框自己的描边色（正常红 / 饱和橙 /
+    低于检出限钢蓝），区分靠的是"多了一个三角形"这个形状通道。画布上已有的四
+    种状态各占一个别的通道——色相（红 / 橙 / 钢蓝）、线型与透明度（未采用是半
+    透明虚线）——所以一个条带完全可以既是"饱和"又是"未采用"又"被自检点名"，
+    三件事各说各的，不会互相盖掉。角标画在框外的右上角，避开左上角的标签锚点。
+    """
+
+    def __init__(self, color: QColor) -> None:
+        super().__init__()
+        self._color = QColor(color)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setZValue(LABEL_Z - 0.1)
+
+    def set_color(self, color: QColor) -> None:
+        self._color = QColor(color)
+        self.update()
+
+    def boundingRect(self) -> QRectF:  # noqa: N802 - Qt API
+        return QRectF(-FLAG_PX, -FLAG_PX, FLAG_PX + 1.0, FLAG_PX + 1.0)
+
+    def paint(self, painter, option, widget=None) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        path_points = [
+            QPointF(0.0, -FLAG_PX),
+            QPointF(-FLAG_PX, -FLAG_PX),
+            QPointF(0.0, 0.0),
+        ]
+        painter.setPen(QPen(LABEL_PLATE_COLOR, 1))
+        painter.setBrush(QBrush(self._color))
+        painter.drawPolygon(path_points)
+        font = QFont(painter.font())
+        font.setPointSize(FLAG_FONT_PT)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QPen(LABEL_PLATE_COLOR))
+        painter.drawText(
+            QRectF(-FLAG_PX + 1.0, -FLAG_PX + 0.5, FLAG_PX - 2.0, FLAG_PX - 2.0),
+            Qt.AlignmentFlag.AlignCenter,
+            "!",
+        )
+        painter.restore()
+
+
 class BandBoxItem(QGraphicsRectItem):
     """可直接操纵的条带结果框：悬停高亮、点击/Ctrl 多选、Delete 删除。"""
 
@@ -119,10 +266,58 @@ class BandBoxItem(QGraphicsRectItem):
         self.lane = int(lane)
         self._base = QColor(base_color)
         self._hover = False
+        self._adopted = True
+        self._flag_tip = ""
+        self.flag: BandFlagItem | None = None
+        self.base_tooltip = ""
+        self.label: BandLabelItem | None = None
+        self.owner: BlotCanvas | None = None
         self.setZValue(8)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
         self._apply_style()
+
+    def is_flagged(self) -> bool:
+        return self.flag is not None
+
+    def set_flagged(self, flagged: bool, tip: str = "") -> None:
+        """ROI 自检点到了这一条：右上角挂个三角角标。"""
+        self._flag_tip = str(tip or "")
+        if flagged and self.flag is None:
+            self.flag = BandFlagItem(self._base)
+            self.flag.setParentItem(self)
+            self.flag.setPos(self.rect().right(), self.rect().top())
+        elif not flagged and self.flag is not None:
+            self.flag.setParentItem(None)
+            if self.scene() is not None:
+                self.scene().removeItem(self.flag)
+            self.flag = None
+        self._refresh_tooltip()
+
+    def is_hovered(self) -> bool:
+        return self._hover
+
+    def is_adopted(self) -> bool:
+        return self._adopted
+
+    def set_adopted(self, adopted: bool) -> None:
+        """当前条带策略采不采用这一条。不采用 = 虚线框，**不是**删除。"""
+        adopted = bool(adopted)
+        if adopted == self._adopted:
+            return
+        self._adopted = adopted
+        self._apply_style()
+        if self.label is not None:
+            self.label.setOpacity(1.0 if adopted else 0.55)
+        self._refresh_tooltip()
+
+    def _refresh_tooltip(self) -> None:
+        text = self.base_tooltip
+        if not self._adopted:
+            text += "\n⚠ " + UNUSED_BAND_TIP
+        if self._flag_tip:
+            text += "\n⚠ " + self._flag_tip
+        self.setToolTip(text)
 
     def hoverEnterEvent(self, event) -> None:
         self._hover = True
@@ -154,9 +349,20 @@ class BandBoxItem(QGraphicsRectItem):
         else:
             pen = QPen(self._base, 1.5)
             brush = QBrush(Qt.BrushStyle.NoBrush)
+        if not self._adopted:
+            # 虚线 = "还在，只是不计入合计"。删除是框直接消失，两者一眼可分。
+            pen.setStyle(Qt.PenStyle.DashLine)
+            color = QColor(pen.color())
+            color.setAlpha(150)
+            pen.setColor(color)
         pen.setCosmetic(True)
         self.setPen(pen)
         self.setBrush(brush)
+        # 缩小到标签整批隐藏时，选中 / 悬停的这一个仍要能看清是谁
+        if self.label is not None:
+            self.label.set_forced(self.isSelected() or self._hover)
+        if self.owner is not None:
+            self.owner.request_label_relayout()
 
 
 class BlotCanvas(QGraphicsView):
@@ -225,6 +431,20 @@ class BlotCanvas(QGraphicsView):
         self._roi_item.setVisible(False)
         self._scene.addItem(self._roi_item)
 
+        # ROI 自检的"边缘留白不足"提示：贴着 ROI 上 / 下边的斜纹带
+        self._clearance: tuple[float, float] = (0.0, 0.0)
+        self._clearance_items: list[QGraphicsRectItem] = []
+        for _ in range(2):
+            strip = QGraphicsRectItem()
+            strip.setPen(QPen(Qt.PenStyle.NoPen))
+            strip.setBrush(QBrush(CLEARANCE_FILL, Qt.BrushStyle.BDiagPattern))
+            strip.setZValue(9.5)  # 压在条带框之上、ROI 边框之下
+            strip.setVisible(False)
+            strip.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            strip.setToolTip(CLEARANCE_TIP)
+            self._scene.addItem(strip)
+            self._clearance_items.append(strip)
+
         self._handles: dict[str, QGraphicsRectItem] = {}
         for handle_id in _HANDLE_IDS:
             handle = QGraphicsRectItem(
@@ -241,6 +461,8 @@ class BlotCanvas(QGraphicsView):
         self._roi: QRectF | None = None
         self._separators: list[float] = []
         self._sep_items: list[QGraphicsLineItem] = []
+        self._flagged_seps: set[int] = set()
+        self._flagged_sep_tip = ""
         # 键盘微调的目标：None / ("roi", -1) / ("sep", 序号)。最后一次鼠标操作
         # 决定它，方向键就作用在"刚才动过的那个"上
         self._nudge_target: tuple[str, int] | None = None
@@ -254,7 +476,12 @@ class BlotCanvas(QGraphicsView):
         self._temp_item: QGraphicsRectItem | QGraphicsLineItem | None = None
         self._ruler_items: list[QGraphicsLineItem] = []
         self._band_items: list[BandBoxItem] = []
-        self._band_labels: list[QGraphicsSimpleTextItem] = []
+        self._band_labels: list[BandLabelItem] = []
+        self._labels_packed = True
+        self._labels_compact = False
+        self._label_roi_key: tuple | None = None
+        self._suspend_label_relayout = False
+        self._label_relayout_pending = False
         self._updating_selection = False
         self._scene.selectionChanged.connect(self._on_scene_selection_changed)
         self._apply_tool_cursor()
@@ -336,11 +563,11 @@ class BlotCanvas(QGraphicsView):
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         else:
             self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
-        self.zoomChanged.emit(self.current_scale())
+        self._on_scale_changed()
 
     def zoom_100(self) -> None:
         self.setTransform(QTransform())
-        self.zoomChanged.emit(1.0)
+        self._on_scale_changed()
 
     def zoom_in(self) -> None:
         self._zoom_by(1.25)
@@ -355,7 +582,7 @@ class BlotCanvas(QGraphicsView):
         target = min(max(current * factor, self.MIN_SCALE), self.MAX_SCALE)
         if abs(target - current) > 1e-9:
             self.scale(target / current, target / current)
-            self.zoomChanged.emit(self.current_scale())
+            self._on_scale_changed()
 
     def zoom_to_roi(self) -> None:
         """把视图缩放定位到当前 ROI（带少量留白）。"""
@@ -366,6 +593,11 @@ class BlotCanvas(QGraphicsView):
             self._roi.adjusted(-margin, -margin, margin, margin),
             Qt.AspectRatioMode.KeepAspectRatio,
         )
+        self._on_scale_changed()
+
+    def _on_scale_changed(self) -> None:
+        """缩放变了：条带标签的屏幕尺寸不变、条带间距变了，必须重排一次。"""
+        self._relayout_band_labels()
         self.zoomChanged.emit(self.current_scale())
 
     def current_scale(self) -> float:
@@ -419,6 +651,8 @@ class BlotCanvas(QGraphicsView):
 
     def set_separators(self, separators: list[float]) -> None:
         values = sorted(float(s) for s in separators)
+        if len(values) != len(self._separators):
+            self._flagged_seps.clear()  # 条数变了，旧下标不再指着同一条线
         if self._roi is not None:
             lo = self._roi.left() + 1.0
             hi = self._roi.right() - 1.0
@@ -539,10 +773,15 @@ class BlotCanvas(QGraphicsView):
             for item in self._sep_items:
                 self._scene.removeItem(item)
             self._sep_items.clear()
+            self._sync_clearance_items()
+            if self._label_roi_key is not None:
+                self._label_roi_key = None
+                self._relayout_band_labels()
             return
         rect = self._roi
         self._roi_item.setRect(rect)
         self._roi_item.setVisible(True)
+        self._sync_clearance_items()
         for handle_id, handle in self._handles.items():
             handle.setPos(_handle_anchor(rect, handle_id))
             handle.setVisible(True)
@@ -557,21 +796,33 @@ class BlotCanvas(QGraphicsView):
         focus = self._nudge_target
         focused = focus[1] if focus is not None and focus[0] == "sep" else None
         for index, (item, sep) in enumerate(zip(self._sep_items, self._separators)):
-            # 键盘微调的目标要看得出来，否则按方向键不知道动的是哪根
+            # 三种状态可以叠加：自检点名决定颜色（红），键盘微调决定线型（虚线）。
+            # 分开走两个通道，正在微调一条被点名的线时两件事都还看得见。
+            flagged = index in self._flagged_seps
+            color = SEPARATOR_FLAG_COLOR if flagged else SEPARATOR_COLOR
             if index == focused:
-                pen = QPen(SEPARATOR_FOCUS_COLOR, 4, Qt.PenStyle.DashLine)
+                color = SEPARATOR_FLAG_COLOR if flagged else SEPARATOR_FOCUS_COLOR
+                pen = QPen(color, SEPARATOR_FLAG_WIDTH if flagged else 4)
+                pen.setStyle(Qt.PenStyle.DashLine)
             else:
-                pen = QPen(SEPARATOR_COLOR, 3)
+                pen = QPen(color, SEPARATOR_FLAG_WIDTH if flagged else 3)
             pen.setCosmetic(True)
             item.setPen(pen)
+            item.setToolTip(self._flagged_sep_tip if flagged else "")
             x = min(max(sep, rect.left()), rect.right())
             item.setLine(x, rect.top(), x, rect.bottom())
+        # ROI 手柄挪了位置，标签得重新让路。只在 ROI 真的变了、且不在拖动中时重排：
+        # 拖分隔线也会走到这里，每个 move 事件重排几十个标签太贵（松手时补一次）
+        key = (rect.x(), rect.y(), rect.width(), rect.height())
+        if self._drag is None and key != self._label_roi_key:
+            self._label_roi_key = key
+            self._relayout_band_labels()
 
     # ------------------------------------------------------------------ 结果叠加
 
     def show_result_boxes(self, measurements) -> None:
         self.clear_result_boxes()
-        label_font = QFont(self.font().family(), 8)
+        label_font = QFont(self.font().family(), LABEL_FONT_PT)
         self._updating_selection = True
         try:
             for index, m in enumerate(measurements):
@@ -598,23 +849,85 @@ class BlotCanvas(QGraphicsView):
                     + ("\n⚠ 饱和比例偏高，定量可能失真" if saturated else "")
                     + "\n（点击选中，Delete 删除；右键更多操作）"
                 )
+                box.base_tooltip = box.toolTip()
                 self._scene.addItem(box)
                 self._band_items.append(box)
 
-                label = QGraphicsSimpleTextItem(f"L{m.lane}-B{m.band}")
-                label.setFlag(
-                    QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True
+                label = BandLabelItem(
+                    f"L{m.lane}-B{m.band}", f"L{m.lane}", color, label_font
                 )
-                label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                label.setBrush(QBrush(color))
-                label.setFont(label_font)
                 label.setPos(float(m.x), float(m.y))
-                label.setTransform(QTransform.fromTranslate(1.0, -15.0))
-                label.setZValue(9)
+                label.setVisible(False)
+                box.label = label
+                box.owner = self
                 self._scene.addItem(label)
                 self._band_labels.append(label)
         finally:
             self._updating_selection = False
+        self._relayout_band_labels()
+
+    def set_unused_bands(self, indices) -> None:
+        """把这些条带画成虚线框：当前条带策略不采用它们，但它们仍然存在。"""
+        unused = {int(i) for i in (indices or [])}
+        for item in self._band_items:
+            item.set_adopted(item.index not in unused)
+
+    def unused_bands(self) -> list[int]:
+        return sorted(item.index for item in self._band_items if not item.is_adopted())
+
+    def set_flagged_bands(self, indices, tip: str = "") -> None:
+        """ROI 自检点名的条带挂上角标（形状通道，不新增颜色）。"""
+        flagged = {int(i) for i in (indices or [])}
+        for item in self._band_items:
+            item.set_flagged(item.index in flagged, tip)
+
+    def flagged_bands(self) -> list[int]:
+        return sorted(item.index for item in self._band_items if item.is_flagged())
+
+    def set_flagged_separators(self, indices, tip: str = "") -> None:
+        """把自检点名的分隔线画成警示红并加粗（索引 = ``separators()`` 的下标）。
+
+        ``ISSUE_SEPARATOR_IN_BAND`` 说的是"这条线切在条带里"，而线本身就是用户
+        要拖的东西——所以提示直接落在线上，不另起图元。这里换的是**已有元素的
+        状态色**（橙 → 红），不是给条带框加第五种颜色；红与诊断条 error 级同色，
+        看到红线就知道去哪读原因。
+
+        这条判据在 ``roi.py`` 给候选谷加了条带禁区之后已经很少触发，是兜底而非
+        常态路径，所以不做角标、不做动画。
+        """
+        self._flagged_seps = {int(i) for i in indices}
+        self._flagged_sep_tip = str(tip)
+        self._sync_roi_items()
+
+    def flagged_separators(self) -> list[int]:
+        return sorted(self._flagged_seps)
+
+    def set_clearance_strips(self, top: float = 0.0, bottom: float = 0.0) -> None:
+        """在 ROI 内侧沿上 / 下边画一条斜纹留白带（0 = 不画）。
+
+        它把"这一侧要留多少干净背景"直接画在用户要拖的那条边上：条带框只要还
+        压在斜纹里就是不合格，往外拖到斜纹空出来即可。用的是 ROI 自己的青色 +
+        斜纹填充——纹理通道，条带框的四种状态一个也没动。
+        """
+        self._clearance = (max(0.0, float(top)), max(0.0, float(bottom)))
+        self._sync_clearance_items()
+
+    def clearance_strips(self) -> tuple[float, float]:
+        return self._clearance
+
+    def _sync_clearance_items(self) -> None:
+        rect = self._roi
+        for item, height, at_top in (
+            (self._clearance_items[0], self._clearance[0], True),
+            (self._clearance_items[1], self._clearance[1], False),
+        ):
+            if rect is None or height <= 0.0 or rect.height() <= 0.0:
+                item.setVisible(False)
+                continue
+            band = min(height, rect.height())
+            top = rect.top() if at_top else rect.bottom() - band
+            item.setRect(QRectF(rect.left(), top, rect.width(), band))
+            item.setVisible(True)
 
     def clear_result_boxes(self) -> None:
         self._updating_selection = True
@@ -625,6 +938,218 @@ class BlotCanvas(QGraphicsView):
             self._band_labels.clear()
         finally:
             self._updating_selection = False
+        self._labels_packed = True
+        self._labels_compact = False
+
+    # ------------------------------------------------------------------ 标签排布
+
+    def request_label_relayout(self) -> None:
+        """选中 / 悬停变了：标签的显示优先级跟着变，重排一次。"""
+        if self._suspend_label_relayout:
+            self._label_relayout_pending = True
+            return
+        self._relayout_band_labels()
+
+    def _label_baselines(self, indices) -> dict[int, float]:
+        """每个条带的标签挂在哪条基准线上（图像 y 坐标）。
+
+        同一排条带共用一条基准线，标签才能排成整齐的一两行——各挂各的框顶时，
+        高低差不到一个标签高度的两个框会互相卡住，错行反而处处相交。纵向差得
+        远（超过一个条带高度）的条带自成一排，标签不会被拽到很远的地方。
+        """
+        order = sorted(indices, key=lambda i: self._band_items[i].rect().top())
+        if not order:
+            return {}
+        heights = [self._band_items[i].rect().height() for i in order]
+        tolerance = max(1.0, float(np.median(heights)))
+        baselines: dict[int, float] = {}
+        anchor = self._band_items[order[0]].rect().top()
+        for i in order:
+            top = self._band_items[i].rect().top()
+            if top - anchor > tolerance:
+                anchor = top
+            baselines[i] = anchor
+        return baselines
+
+    def _label_obstacles(self) -> list[QRectF]:
+        """标签**尽量**绕开的东西：ROI 的 8 个缩放手柄。
+
+        手柄画在标签之上（它们要用鼠标去抓，不能被底板压住），标签压在下面就会
+        被啃掉半个字（"L5-B1" 显示成 "L▉B1"）。这是软约束：绕不开时宁可让它压在
+        手柄下面，也不能因为一个手柄把整批标签都判成"摆不开"。
+        """
+        if self._roi is None or not self._roi_item.isVisible():
+            return []
+        scale = self.current_scale()
+        half = HANDLE_PX / 2.0 + 2.0
+        return [
+            QRectF(
+                _handle_anchor(self._roi, handle_id).x() * scale - half,
+                _handle_anchor(self._roi, handle_id).y() * scale - half,
+                half * 2.0,
+                half * 2.0,
+            )
+            for handle_id in _HANDLE_IDS
+        ]
+
+    def _pack_labels(self, indices) -> tuple[dict[int, tuple[float, float]], bool, set]:
+        """给这批标签在条带框上方找互不相交的位置（相对框左上角的设备像素偏移）。
+
+        最多错 ``MAX_LABEL_ROWS`` 行；判定用的是完整矩形（含底板与左右间隙）。
+        返回 (偏移表, 是否全放下, 躲不开手柄的那些序号)——放不下的那个也会拿到一个
+        贴着框顶的兜底位置，只是不会被显示。
+        """
+        indices = list(indices)
+        scale = self.current_scale()
+        image_right = float(self._image_w) * scale
+        baselines = self._label_baselines(indices)
+        # 从左到右放，同一列（纵向叠放的条带）按从上到下
+        order = sorted(
+            indices,
+            key=lambda i: (
+                self._band_items[i].rect().left(),
+                self._band_items[i].rect().top(),
+            ),
+        )
+        placed: list[QRectF] = []
+        obstacles = self._label_obstacles()
+        offsets: dict[int, tuple[float, float]] = {}
+        over_handles: set[int] = set()
+        ok = True
+        for i in order:
+            box_rect = self._band_items[i].rect()
+            plate = self._band_labels[i].plate_rect()
+            box_left = box_rect.left() * scale
+            box_top = box_rect.top() * scale
+            box_w = box_rect.width() * scale
+            box_h = box_rect.height() * scale
+            base_top = baselines[i] * scale
+            # 水平居中对齐条带框，但不许探出图像左右边界
+            left = box_left + (box_w - plate.width()) / 2.0
+            left = min(max(left, 0.0), max(0.0, image_right - plate.width()))
+            spot: tuple[float, float] | None = None
+            # 行距必须大于标签自身高度，否则错开的那一行反而压住下一行
+            row_step = plate.height() + LABEL_ROW_GAP
+            # 第一轮连手柄一起躲，躲不掉再退一步只保证标签之间不重叠
+            for dodge_handles in (True, False):
+                for row in range(MAX_LABEL_ROWS):
+                    top = base_top - LABEL_MARGIN - plate.height() - row * row_step
+                    if top < 0.0:  # 顶到图外就翻到框下方
+                        top = box_top + box_h + LABEL_MARGIN + row * row_step
+                    probe = QRectF(
+                        left - LABEL_GAP,
+                        top,
+                        plate.width() + 2 * LABEL_GAP,
+                        plate.height(),
+                    )
+                    if any(probe.intersects(r) for r in placed):
+                        continue
+                    if dodge_handles and any(probe.intersects(r) for r in obstacles):
+                        continue
+                    placed.append(probe)
+                    spot = (left, top)
+                    if not dodge_handles:
+                        over_handles.add(i)
+                    break
+                if spot is not None:
+                    break
+            if spot is None:
+                ok = False
+                spot = (left, base_top - LABEL_MARGIN - plate.height())
+            offsets[i] = (spot[0] - box_left, spot[1] - box_top)
+        return offsets, ok, over_handles
+
+    def _set_label_texts(self, compact: bool) -> None:
+        for label in self._band_labels:
+            label.set_compact(compact)
+
+    def _relayout_band_labels(self) -> None:
+        """按当前缩放重排条带标签：逐级降级，绝不允许"糊成一团"的中间态。
+
+        标签的屏幕尺寸恒定，条带间距却随缩放线性变化——51% 时条带只剩 20 设备
+        像素宽，"L1-B1" 却要 38 像素，相邻标签必然叠在一起。降级顺序：
+
+        1. 完整文案 ``L2-B1``，最多错 ``MAX_LABEL_ROWS`` 行；
+        2. 放不下就退化成只写泳道号 ``L2``，同样允许错行；
+        3. 还放不下就整批隐藏，只留用户自己选中 / 悬停的那几个（完整文案）；
+        4. 选中的也摆不开时，只留鼠标正指着的那一个。
+
+        只显示"能摆开的一部分"是不做的：用户没法预期哪几个会留下。
+        """
+        if not self._band_labels:
+            self._labels_packed = True
+            self._labels_compact = False
+            return
+        every = list(range(len(self._band_labels)))
+        for compact in (False, True):
+            self._set_label_texts(compact)
+            offsets, ok, over = self._pack_labels(every)
+            if ok:
+                self._apply_label_layout(offsets, set(every), over)
+                self._labels_packed = True
+                self._labels_compact = compact
+                return
+        self._set_label_texts(False)
+        offsets, _, over = self._pack_labels(every)
+        visible: set[int] = set()
+        forced = [i for i in every if self._band_labels[i].is_forced()]
+        if forced:
+            sub, sub_ok, sub_over = self._pack_labels(forced)
+            offsets.update(sub)
+            if sub_ok:
+                visible = set(forced)
+                over = sub_over
+            else:
+                hovered = [i for i in forced if self._band_items[i].is_hovered()]
+                extra, _, extra_over = self._pack_labels(hovered)
+                offsets.update(extra)
+                visible = set(hovered)
+                over = extra_over
+        self._apply_label_layout(offsets, visible, over)
+        self._labels_packed = False
+        self._labels_compact = False
+
+    def _apply_label_layout(self, offsets: dict, visible: set, over_handles: set) -> None:
+        for i, label in enumerate(self._band_labels):
+            plate = label.plate_rect()
+            dx, dy = offsets[i]
+            label.setTransform(
+                QTransform.fromTranslate(dx - plate.left(), dy - plate.top())
+            )
+            # 躲不开手柄的那几个改画在手柄之上：手柄的命中判定走的是坐标计算
+            # （见 _handle_at），被盖住照样能抓，但字被啃掉就真的读不出来了
+            label.setZValue(
+                LABEL_Z_FORCED if (label.is_forced() or i in over_handles) else LABEL_Z
+            )
+            label.shown = i in visible
+            label.setVisible(label.shown)
+
+    def labels_packed(self) -> bool:
+        """当前缩放下条带标签是不是整批可读地铺开了。"""
+        return bool(self._labels_packed)
+
+    def labels_compact(self) -> bool:
+        """整批显示的是不是简化文案（只有泳道号）。"""
+        return bool(self._labels_compact)
+
+    def band_label_rects(self) -> list[QRectF]:
+        """可见条带标签在视口里的矩形（设备像素），供重叠检查使用。"""
+        rects: list[QRectF] = []
+        for label in self._band_labels:
+            if not label.isVisible():
+                continue
+            origin = self.mapFromScene(label.pos())
+            transform = label.transform()
+            plate = label.plate_rect()
+            rects.append(
+                QRectF(
+                    origin.x() + transform.dx() + plate.left(),
+                    origin.y() + transform.dy() + plate.top(),
+                    plate.width(),
+                    plate.height(),
+                )
+            )
+        return rects
 
     # ------------------------------------------------------------------ 条带选中
 
@@ -634,13 +1159,7 @@ class BlotCanvas(QGraphicsView):
 
     def select_bands(self, indices) -> None:
         """程序化设置选中（不发 bandSelectionChanged，供表格→画布同步）。"""
-        wanted = {int(i) for i in indices}
-        self._updating_selection = True
-        try:
-            for item in self._band_items:
-                item.setSelected(item.index in wanted)
-        finally:
-            self._updating_selection = False
+        self._set_selection(indices)
 
     def clear_band_selection(self) -> None:
         self.select_bands([])
@@ -658,6 +1177,92 @@ class BlotCanvas(QGraphicsView):
             if isinstance(item, BandBoxItem):
                 return item
         return None
+
+    def _set_selection(self, indices) -> None:
+        """一次性设置选中集合，只发一次 bandSelectionChanged。
+
+        逐个 setSelected 会让 scene 的 selectionChanged 发 N 次，每次都去刷一遍
+        结果表——批量框选几十个条带时这一串同步足够把界面卡住。
+        """
+        wanted = {int(i) for i in indices}
+        self._updating_selection = True
+        self._suspend_label_relayout = True
+        self._label_relayout_pending = False
+        try:
+            for item in self._band_items:
+                item.setSelected(item.index in wanted)
+        finally:
+            self._updating_selection = False
+            self._suspend_label_relayout = False
+        if self._label_relayout_pending:
+            self._label_relayout_pending = False
+            self._relayout_band_labels()
+
+    def _click_select_band(self, band: BandBoxItem, modifiers) -> None:
+        """点选条带：Ctrl 反选（可减选）、Shift 加选、无修饰键单选。"""
+        selected = set(self.selected_bands())
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            selected.symmetric_difference_update({band.index})
+        elif modifiers & Qt.KeyboardModifier.ShiftModifier:
+            selected.add(band.index)
+        else:
+            selected = {band.index}
+        self._set_selection(selected)
+        self.bandSelectionChanged.emit(self.selected_bands())
+
+    # ------------------------------------------------------------------ 橡皮筋框选
+
+    def _begin_rubber_band(self, scene_pos: QPointF, additive: bool) -> None:
+        start = self._clamp_to_image(scene_pos)
+        base = set(self.selected_bands()) if additive else set()
+        pen = QPen(BAND_SELECT_COLOR, 1, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self._temp_item = QGraphicsRectItem(QRectF(start, start))
+        self._temp_item.setPen(pen)
+        self._temp_item.setBrush(QBrush(BAND_SELECT_FILL))
+        self._temp_item.setZValue(25)
+        self._scene.addItem(self._temp_item)
+        self._drag = {
+            "kind": "rubber",
+            "start": start,
+            "additive": additive,
+            "base": base,
+            "before": set(self.selected_bands()),
+        }
+        if not additive and self._band_items:
+            self._set_selection(base)
+
+    def _rubber_selection(self, rect: QRectF, base: set) -> set:
+        """与框相交（不必完全框住）的条带都算选中——小框太难完整套住。"""
+        hit = {item.index for item in self._band_items if item.rect().intersects(rect)}
+        return hit | base
+
+    def _drag_rubber_band(self, scene_pos: QPointF) -> None:
+        drag = self._drag
+        rect = QRectF(drag["start"], self._clamp_to_image(scene_pos)).normalized()
+        if self._temp_item is not None:
+            self._temp_item.setRect(rect)
+        # 拖动过程中只改画布上的选中样式，不往结果表发信号（松手时统一发一次）
+        self._set_selection(self._rubber_selection(rect, drag["base"]))
+
+    def _finish_rubber_band(self, drag: dict, scene_pos: QPointF) -> None:
+        if self._temp_item is not None:
+            self._scene.removeItem(self._temp_item)
+            self._temp_item = None
+        start: QPointF = drag["start"]
+        end = self._clamp_to_image(scene_pos)
+        scale = max(self.current_scale(), 1e-6)
+        moved = max(abs(end.x() - start.x()), abs(end.y() - start.y())) * scale
+        if moved < RUBBER_MIN_PX:
+            # 只是点了一下空白：非加选时等于清空选中
+            self._set_selection(drag["base"])
+        else:
+            self._set_selection(
+                self._rubber_selection(QRectF(start, end).normalized(), drag["base"])
+            )
+        selected = self.selected_bands()
+        if set(selected) != drag["before"]:
+            self.bandSelectionChanged.emit(selected)
 
     # ------------------------------------------------------------------ 坐标 / 命中测试
 
@@ -755,10 +1360,29 @@ class BlotCanvas(QGraphicsView):
                 event.accept()
                 return
 
-        # 任何工具模式下，按在条带框上优先做选中（交给场景处理 Ctrl 多选）
-        if self._band_at(event.position().toPoint()) is not None:
-            super().mousePressEvent(event)
+        # 任何工具模式下，按在条带框上优先做选中（Ctrl 反选、Shift 加选）
+        band = self._band_at(event.position().toPoint())
+        if band is not None:
+            self._click_select_band(band, event.modifiers())
+            event.accept()
             return
+
+        # 调整模式下按在空白处 = 橡皮筋框选多个条带。ROI 内的空白默认还是整体
+        # 拖动 ROI（那是这个模式的主业），按住 Ctrl / Shift 才改成框选加选——
+        # 其余三个工具的拖拽各有各的用途（画 ROI / 量角 / 补画条带），不能抢。
+        if self._tool is Tool.ADJUST:
+            additive = bool(
+                event.modifiers()
+                & (
+                    Qt.KeyboardModifier.ControlModifier
+                    | Qt.KeyboardModifier.ShiftModifier
+                )
+            )
+            inside_roi = self._roi is not None and self._roi.contains(scene_pos)
+            if additive or not inside_roi:
+                self._begin_rubber_band(scene_pos, additive)
+                event.accept()
+                return
 
         # 按在空白处：取消条带选中，再进入各工具的绘制/拖动
         if self._band_items and self.selected_bands():
@@ -837,6 +1461,8 @@ class BlotCanvas(QGraphicsView):
         elif kind in ("new_roi", "new_band") and self._temp_item is not None:
             end = self._clamp_to_image(scene_pos)
             self._temp_item.setRect(QRectF(self._drag["start"], end).normalized())
+        elif kind == "rubber":
+            self._drag_rubber_band(scene_pos)
         elif kind == "move_roi":
             self._drag_move_roi(scene_pos)
         elif kind == "resize_roi":
@@ -862,6 +1488,8 @@ class BlotCanvas(QGraphicsView):
             self._finish_ruler(drag, scene_pos)
         elif kind in ("new_roi", "new_band"):
             self._finish_new_rect(kind, drag, scene_pos)
+        elif kind == "rubber":
+            self._finish_rubber_band(drag, scene_pos)
         elif kind in ("move_roi", "resize_roi"):
             self._apply_tool_cursor()
             if self._roi is not None:
@@ -871,6 +1499,12 @@ class BlotCanvas(QGraphicsView):
         elif kind == "sep":
             self.separatorsChanged.emit(list(self._separators))
             self.separatorsEditFinished.emit()
+        if kind in ("move_roi", "resize_roi", "sep"):
+            # 拖动期间跳过的那一次，在这里补上
+            if self._roi is not None:
+                r = self._roi
+                self._label_roi_key = (r.x(), r.y(), r.width(), r.height())
+            self._relayout_band_labels()
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
@@ -993,6 +1627,52 @@ class BlotCanvas(QGraphicsView):
         angle = float(np.degrees(np.arctan2(dy, dx)))
         self.rulerMeasured.emit(angle, scene_pos.x(), scene_pos.y())
 
+    def show_tilt_guide(self, angle_deg: float, roi=None) -> bool:
+        """按给定角度画一条横穿 ROI 的参考线，让用户**看着线**判断角度对不对。
+
+        自动测角在干净的膜上能到 0.02°，但被一条划痕或一道膜边骗到时会用同样
+        自信的语气给出错 4° 的答案，且算法无法自省（见 :mod:`wb_analyzer.tilt`
+        模块文档）。所以界面绝不能只报一个数字——画出来，让人一眼看出它是不是
+        平行于条带行。线足够长（横跨整个 ROI 再各伸 12 px），0.3° 的偏差在 550
+        px 上就是 3 px 的漂移，肉眼分得出来。
+
+        复用 ``_ruler_items``：它与手动标尺线互斥（``_ruler_angle`` 本来就是同
+        一个位子），``clear_ruler()`` 一并清掉。用虚线 + 两端短横杠与手动拖出的
+        实线区分——那条是用户自己画的，这条是机器建议的。
+        """
+        self.clear_ruler()
+        if self._image_ref is None:
+            return False
+        if roi is not None:
+            cx = float(roi.x) + float(roi.width) / 2.0
+            cy = float(roi.y) + float(roi.height) / 2.0
+            half = float(roi.width) / 2.0 + TILT_GUIDE_OVERHANG
+        else:
+            cx, cy = self._image_w / 2.0, self._image_h / 2.0
+            half = self._image_w / 2.0
+        if half <= 0.0:
+            return False
+        slope = float(np.tan(np.radians(float(angle_deg))))
+        dx, dy = half, half * slope
+        pen = QPen(RULER_COLOR, 2, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        cap_pen = QPen(RULER_COLOR, 2)
+        cap_pen.setCosmetic(True)
+        spine = QGraphicsLineItem(cx - dx, cy - dy, cx + dx, cy + dy)
+        spine.setPen(pen)
+        spine.setZValue(20)
+        self._scene.addItem(spine)
+        self._ruler_items.append(spine)
+        # 两端的短横杠：线本身是虚的，端点在哪要能一眼看到
+        for sign in (-1.0, 1.0):
+            ex, ey = cx + sign * dx, cy + sign * dy
+            cap = QGraphicsLineItem(ex, ey - TILT_GUIDE_CAP, ex, ey + TILT_GUIDE_CAP)
+            cap.setPen(cap_pen)
+            cap.setZValue(20)
+            self._scene.addItem(cap)
+            self._ruler_items.append(cap)
+        return True
+
     def clear_ruler(self) -> None:
         """移除画布上的标尺参考线。"""
         for line in self._ruler_items:
@@ -1022,6 +1702,9 @@ class BlotCanvas(QGraphicsView):
         action = menu.addAction("删除此分隔线")
         if menu.exec(global_pos) is action and 0 <= index < len(self._separators):
             self._separators.pop(index)
+            # 后面的线全部往前挪一位，旧下标会指到别的线上。等重新定量后由
+            # 自检重新点名，在那之前宁可一条都不描
+            self._flagged_seps.clear()
             self._sync_roi_items()
             self.separatorsChanged.emit(list(self._separators))
             self.separatorsEditFinished.emit()
@@ -1073,7 +1756,9 @@ class BlotCanvas(QGraphicsView):
         if self._temp_item is not None:
             self._scene.removeItem(self._temp_item)
             self._temp_item = None
-        if drag["kind"] in ("move_roi", "resize_roi"):
+        if drag["kind"] == "rubber":
+            self._set_selection(drag["before"])
+        elif drag["kind"] in ("move_roi", "resize_roi"):
             self._roi = QRectF(drag["orig_rect"])
             self._separators = list(drag["orig_seps"])
             self._sync_roi_items()
@@ -1107,6 +1792,10 @@ class BlotCanvas(QGraphicsView):
         ):
             self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
             return
+        if self._tool is Tool.ADJUST and self._image_ref is not None:
+            # ROI 之外的空白：这里一拖就是橡皮筋框选，给个十字光标提示
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+            return
         self._apply_tool_cursor()
 
     # ------------------------------------------------------------------ 缩放 / 键盘 / 绘制
@@ -1124,7 +1813,7 @@ class BlotCanvas(QGraphicsView):
         target = min(max(current * factor, self.MIN_SCALE), self.MAX_SCALE)
         if abs(target - current) > 1e-9:
             self.scale(target / current, target / current)
-            self.zoomChanged.emit(self.current_scale())
+            self._on_scale_changed()
         event.accept()
 
     _ARROW_DELTAS = {
@@ -1193,3 +1882,24 @@ class BlotCanvas(QGraphicsView):
                 self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, EMPTY_HINT
             )
             painter.end()
+            return
+        if not self._band_items:
+            return
+        # 标签被隐藏 / 简化时要说一声，否则用户以为标注丢了或者编号变了
+        if not self._labels_packed:
+            hint = LABELS_HIDDEN_HINT
+        elif self._labels_compact:
+            hint = LABELS_COMPACT_HINT
+        else:
+            return
+        painter = QPainter(self.viewport())
+        painter.setPen(EMPTY_HINT_COLOR)
+        font = QFont(self.font().family())
+        font.setPointSizeF(9.0)
+        painter.setFont(font)
+        painter.drawText(
+            self.viewport().rect().adjusted(8, 0, -8, -6),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
+            hint,
+        )
+        painter.end()
