@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QKeySequence,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -61,7 +62,13 @@ from ..analysis import (
     BandMeasurement,
     analyze_array,
 )
-from ..export import export_presentation_figures, export_result
+from ..export import (
+    export_presentation_figures,
+    export_selected_data,
+    normalization_export_available,
+    planned_data_export_names,
+    summary_export_available,
+)
 from ..imageio import (
     ROTATE_FAST,
     ROTATE_SHARP,
@@ -80,6 +87,7 @@ from ..normalize import (
     export_normalized_csv,
     lane_series_from_measurements,
     origin_label,
+    source_key,
 )
 from ..roi import (
     MAX_STRAIGHTEN_ANGLE,
@@ -104,6 +112,9 @@ from . import prefs as prefs_mod
 from . import theme
 from .canvas import BlotCanvas, Tool
 from .diagnostics_bar import DiagnosticsBar, Entry, entries_from_report
+from .doc_tab_bar import DocumentTabBar
+from .data_export_dialog import DataExportDialog
+from .document import MAX_RESIDENT_DOCS, Document
 from .figure_export_dialog import (
     FigureExportDialog,
     FigureExportOptions,
@@ -201,7 +212,9 @@ _TOOL_TIPS = {
 
 _HELP_TEXT = (
     "五步流程：\n\n"
-    "1. 打开或拖入 WB 图片（支持 8/16 位 TIF，定量在原生位深上进行）。\n"
+    "1. 打开或拖入 WB 图片（支持 8/16 位 TIF，定量在原生位深上进行）。"
+    "可以同时开多张，工具栏下方是文档标签，和浏览器一样切换、关闭、拖动排序；"
+    "重复打开同一个文件会切到已有标签。\n"
     "2. 图片歪斜时，用“标尺对齐”沿条带方向拖一条线，在弹出的小面板里点"
     "“旋正为水平/垂直”；横竖颠倒可用“编辑 → 旋转 90°”。\n"
     "   框好 ROI 之后也可以点“调整”页的“自动测倾角”：它比肉眼准（干净的膜上到"
@@ -241,6 +254,12 @@ _HELP_TEXT = (
     "在结果表里仍然列出、只是标成“未采用”并在画布上画成虚线框——它和“删除”是"
     "两回事，删除才会让它彻底消失。历史表里的“条带”列可以随时改，只重新聚合、"
     "不重新定量。\n"
+    "   “导出数据”（Ctrl+E）先问这次要写哪些表：默认勾选原始灰度统计"
+    "（精简 6 列：来源 / 泳道 / 条带 / 样品名 / 积分灰度 / 检出限标记；"
+    "每次测量一行，同名样品重复上样会留下多行，不求平均）。"
+    "「包含完整统计列」与「同时导出历史所有膜的原始长表」默认不勾；"
+    "归一化结果与跨膜汇总也是可选项，未做归一化时对应项不可用。"
+    "重复上样的膜建议只导原始灰度，在 Excel / R 里自行合并。\n"
     "   “导出展示图”（Ctrl+Shift+E）先问一遍选项：干净版是无标注、可保持 16 位"
     "无损的存档件，标注版是 8 位彩色、给人看的。两版各用各的灰度映射——干净版"
     "默认“线性全量程”（不拉伸、不削波），标注版默认“自动对比度拉伸”，"
@@ -264,11 +283,20 @@ _SHORTCUTS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "文件与导出",
         (
-            ("Ctrl+O", "打开图片"),
-            ("Ctrl+W", "关闭当前图片（归一化历史保留）"),
-            ("Ctrl+E", "导出数据（CSV + 标注图）"),
+            ("Ctrl+O", "打开图片（新标签）"),
+            ("Ctrl+W", "关闭当前标签（归一化历史保留）"),
+            ("Ctrl+E", "导出数据（先选原始灰度 / 完整列 / 归一化 / 跨膜汇总）"),
             ("Ctrl+Shift+E", "导出展示图"),
             ("Ctrl+Q", "退出"),
+        ),
+    ),
+    (
+        "文档标签",
+        (
+            ("Ctrl+Tab", "下一个标签"),
+            ("Ctrl+Shift+Tab", "上一个标签"),
+            ("Ctrl+1 … Ctrl+8", "跳到第 N 个标签"),
+            ("Ctrl+9", "跳到最后一个标签"),
         ),
     ),
     (
@@ -306,8 +334,8 @@ _SHORTCUTS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("滚轮", "以光标为中心缩放"),
             ("空格+拖动 / 中键拖动", "平移"),
             ("Ctrl+0", "适应窗口"),
-            ("Ctrl+1", "1:1"),
-            ("Ctrl+2", "缩放到 ROI"),
+            ("工具栏「1:1」", "按原始像素显示"),
+            ("视图菜单「缩放到 ROI」", "把视图对准当前 ROI"),
             ("Ctrl+= / Ctrl+-", "放大 / 缩小"),
             ("Ctrl+点击条带", "反选（加选 / 取消该条带）"),
             ("Shift+点击条带", "加选条带"),
@@ -602,11 +630,23 @@ def measure_band_roi_style(blot, roi, x, y, w, h, dark_bands: bool):
     density = max(0.0, raw_density - float(lane.noise_floor) * (stop - start))
     limit = quant.detection_limit(lane.noise_sigma, stop - start)
     box = blot.raw[y0 + start : y0 + stop, x1:x2]
-    per_pixel = float(baseline[start:stop].mean()) / max(x2 - x1, 1)
+    width_px = max(x2 - x1, 1)
+    per_pixel = float(baseline[start:stop].mean()) / width_px
     background = (blot.white_level - per_pixel) if dark_bands else per_pixel
     saturated = float(
         saturation_fraction(box, dark_bands=dark_bands, white_level=blot.white_level)
     )
+    # 与 quantify_lanes 同一口径：剖面减基线后再除以宽度，得到每像素峰值。
+    # 再按局部背景那条路夹到 ≥ 0，避免噪声段写出负的假峰值。
+    seg_profile = profile[start:stop]
+    seg_base = baseline[start:stop]
+    if seg_profile.size and width_px > 0:
+        peak = round(
+            float(max(((seg_profile - seg_base) / width_px).max(), 0.0)),
+            3,
+        )
+    else:
+        peak = 0.0
     return BandMeasurement(
         lane=0,
         band=0,
@@ -621,6 +661,7 @@ def measure_band_roi_style(blot, roi, x, y, w, h, dark_bands: bool):
         saturated_fraction=round(saturated, 4),
         detection_limit=round(limit, 3),
         snr=round(density / limit * quant.LOD_SIGMA, 3) if limit > 0.0 else 0.0,
+        peak=peak,
     )
 
 
@@ -641,6 +682,13 @@ def orient_blot(loaded, quarter_turns: int, angle: float):
     base = rotate_blot(loaded, -90.0 * turns) if turns else loaded
     blot = rotate_blot(base, float(angle)) if abs(float(angle)) > 1e-6 else base
     return base, blot
+
+
+def _reload_oriented(path, quarter_turns: int, angle: float):
+    """从磁盘重读原件，再按标签记下的朝向转到同一姿态。"""
+    loaded = load_blot(path)
+    base, blot = orient_blot(loaded, quarter_turns, angle)
+    return loaded, base, blot
 
 
 def profile_valleys(profile: np.ndarray, roi_x: float) -> list[float]:
@@ -789,6 +837,20 @@ class MainWindow(QMainWindow):
         self._prefs = prefs_mod.DEFAULTS
         self._applied_font_scale = 1.0
         self._settings_dialog = None
+        self._docs: list[Document] = []
+        self._active_id: int | None = None
+        self._doc_id_seq = 0
+        self._syncing_tabs = False
+        self._applying_document = False
+        self._open_queue: list[Path] = []
+        self._pending_load_path: Path | None = None
+        self._pending_load_abandoned = False
+        self._pending_reload: tuple[int, int] | None = None  # (doc_id, generation)
+        self._pixel_lru: list[int] = []
+        self._max_resident_docs = MAX_RESIDENT_DOCS
+        self._tilt_epoch = 0
+        self._job_doc: dict[str, int | None] = {}
+        self._tilt_guide_angle: float | None = None
 
         self._rotate_timer = QTimer(self)
         self._rotate_timer.setSingleShot(True)
@@ -809,10 +871,13 @@ class MainWindow(QMainWindow):
         # 诊断条横在画布正上方：ROI 自检要在用户改 ROI 的当下看得见，那会儿他
         # 多半停在“调整”页而不是结果页。它只占一行，没有诊断时整条隐藏。
         self.diagnostics = DiagnosticsBar(self, prefix="定量自检")
+        self.doc_tabs = DocumentTabBar(self)
+        self.doc_tabs.hide()
         central = QWidget(self)
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.setSpacing(0)
+        central_layout.addWidget(self.doc_tabs)
         central_layout.addWidget(self.diagnostics)
         central_layout.addWidget(self.canvas, 1)
         self.setCentralWidget(central)
@@ -856,13 +921,12 @@ class MainWindow(QMainWindow):
         # 关掉当前图之前只能"换一张"或"退出程序"，中间那一步一直是缺的
         self.act_close = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton),
-            "关闭当前图片",
+            "关闭当前标签",
             self,
         )
         self.act_close.setShortcut(QKeySequence("Ctrl+W"))
         self.act_close.setToolTip(
-            "关闭当前图片（Ctrl+W），回到空白工作区。"
-            "归一化历史会保留，可以接着开下一张膜"
+            "关闭当前标签（Ctrl+W）。归一化历史会保留，可以接着开下一张膜"
         )
 
         self._tool_group = QActionGroup(self)
@@ -900,6 +964,11 @@ class MainWindow(QMainWindow):
             style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "导出数据", self
         )
         self.act_export_data.setShortcut("Ctrl+E")
+        self.act_export_data.setToolTip(
+            "导出数据（Ctrl+E）。先选这次要写哪些表：默认只导精简原始灰度"
+            "（积分灰度 + 检出限标记，每次测量一行，不合并重复上样）；"
+            "完整统计列、历史长表、归一化与跨膜汇总都是可选项"
+        )
         self.act_export_figure = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_FileIcon), "导出展示图", self
         )
@@ -907,13 +976,11 @@ class MainWindow(QMainWindow):
         self.act_fit = QAction("适应窗口", self)
         self.act_fit.setShortcut("Ctrl+0")
         self.act_100 = QAction("1:1", self)
-        self.act_100.setShortcut("Ctrl+1")
         self.act_zoom_in = QAction("放大", self)
         self.act_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
         self.act_zoom_out = QAction("缩小", self)
         self.act_zoom_out.setShortcut("Ctrl+-")
         self.act_zoom_roi = QAction("缩放到 ROI", self)
-        self.act_zoom_roi.setShortcut("Ctrl+2")
         self.act_undo = QAction("撤销", self)
         self.act_undo.setShortcut(QKeySequence.StandardKey.Undo)
         self.act_redo = QAction("重做", self)
@@ -947,6 +1014,25 @@ class MainWindow(QMainWindow):
         self.act_exit.setShortcut("Ctrl+Q")
         self.act_help = QAction("使用说明", self)
         self.act_help.setShortcut("F1")
+
+        self.act_next_doc = QAction("下一个标签", self)
+        self.act_next_doc.setShortcut(QKeySequence("Ctrl+Tab"))
+        self.act_next_doc.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.addAction(self.act_next_doc)
+        self.act_prev_doc = QAction("上一个标签", self)
+        self.act_prev_doc.setShortcut(QKeySequence("Ctrl+Shift+Tab"))
+        self.act_prev_doc.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.addAction(self.act_prev_doc)
+        for number in range(1, 9):
+            action = QAction(self)
+            action.setShortcut(QKeySequence(f"Ctrl+{number}"))
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+            action.triggered.connect(partial(self._activate_tab_number, number))
+            self.addAction(action)
+        self.act_last_doc = QAction("最后一个标签", self)
+        self.act_last_doc.setShortcut(QKeySequence("Ctrl+9"))
+        self.act_last_doc.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.addAction(self.act_last_doc)
 
     def _build_adjust_tab(self) -> None:
         rotate_box = QGroupBox("旋转与对齐")
@@ -1157,6 +1243,13 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.results_panel, "结果")
         tabs.addTab(self.normalize_panel, "归一化")
         tabs.setMinimumWidth(CONTROL_DOCK_MIN_PX)
+        # 默认 Ctrl+Tab 会切「调整 / 结果 / 归一化」，抢掉文档标签的浏览器式切换
+        for shortcut in tabs.findChildren(QShortcut):
+            sequence = shortcut.key()
+            if sequence.matches(QKeySequence.StandardKey.NextChild) or sequence.matches(
+                QKeySequence.StandardKey.PreviousChild
+            ):
+                shortcut.setEnabled(False)
         self._tabs = tabs
 
         self._control_dock = QDockWidget("控制面板", self)
@@ -1402,6 +1495,12 @@ class MainWindow(QMainWindow):
         self.act_settings.triggered.connect(self._show_settings)
         self.act_exit.triggered.connect(self.close)
         self.act_help.triggered.connect(self._show_help)
+        self.act_next_doc.triggered.connect(lambda: self._cycle_tab(1))
+        self.act_prev_doc.triggered.connect(lambda: self._cycle_tab(-1))
+        self.act_last_doc.triggered.connect(self._activate_last_tab)
+        self.doc_tabs.currentChanged.connect(self._on_tab_current_changed)
+        self.doc_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
+        self.doc_tabs.tabMoved.connect(self._on_tab_moved)
 
     # ------------------------------------------------------------------ 界面设置
 
@@ -1541,7 +1640,7 @@ class MainWindow(QMainWindow):
             about.setPlainText(
                 f"WB 灰度分析工具\n版本 {_app_version()}\n\n"
                 "Western Blot 条带灰度定量：ImageJ 式基线扣除、原生位深（8/16 位 "
-                "TIF）定量、内参归一化与 fold change。\n\n"
+                "TIF）定量；可选内参归一化与 fold change。\n\n"
                 f"日志文件：{errorlog.log_path() or '未启用'}\n"
                 "遇到崩溃或异常时，请把该日志一并提供。"
             )
@@ -1567,33 +1666,48 @@ class MainWindow(QMainWindow):
         if self._reject_while_busy("打开图片"):
             return
         start = self._last_open_dir or str(Path.home())
-        filename, _ = QFileDialog.getOpenFileName(
+        filenames, _ = QFileDialog.getOpenFileNames(
             self,
             "选择 Western Blot 图片",
             start,
             "图片 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;所有文件 (*.*)",
         )
-        if filename:
+        for filename in filenames:
             self.open_path(Path(filename))
 
     def open_path(self, path: Path | str, synchronous: bool = False) -> bool:
-        """提交一次图片加载（后台线程）。
+        """提交一次图片加载（后台线程）。成功时在**新标签**打开。
 
         返回值表示"这次请求已受理"，而不是"图片已经读好了"——真正的成败在
-        :meth:`_on_load_done` / :meth:`_on_load_error` 里揭晓。大图 load_blot
-        要几百毫秒到几秒，摆在 UI 线程里会整窗卡死。
+        :meth:`_on_load_done` / :meth:`_on_load_error` 里揭晓。已经打开过的文件
+        会切到已有标签，不会再开一份。
         """
         path = Path(path)
+        existing = self._index_by_source(path)
+        if existing is not None:
+            self._switch_to_index(existing)
+            self._set_status(f"{path.name} 已经打开，已切到该标签。")
+            return True
         if self._reject_while_busy("打开图片"):
             return False
-        # 换图会作废在跑的定量 / 检测 / 旋转 / 剖面；两次加载之间后者顶掉前者
+        if JOB_LOAD in self._running:
+            if self._pending_load_path is None or source_key(self._pending_load_path) != source_key(path):
+                queued = {source_key(item) for item in self._open_queue}
+                if source_key(path) not in queued:
+                    self._open_queue.append(path)
+            return True
         abandoned = self._invalidate_jobs(
             {JOB_QUANTIFY, JOB_DETECT, JOB_ORIENT, JOB_PROFILE}
         )
-        self._rotate_timer.stop()
-        self._roi_timer.stop()
-        self._quant_timer.stop()
-        self._quant_manual_pending = False
+        self._stop_doc_timers()
+        return self._start_load(path, abandoned=abandoned, synchronous=synchronous)
+
+    def _start_load(
+        self, path: Path, *, abandoned: bool = False, synchronous: bool = False
+    ) -> bool:
+        self._pending_load_path = path
+        self._pending_load_abandoned = abandoned
+        self._pending_reload = None
         token = self._begin_job(JOB_LOAD, f"正在加载 {path.name}……")
         job = partial(load_blot, path)
         if synchronous:
@@ -1617,6 +1731,7 @@ class MainWindow(QMainWindow):
             errorlog.log_message(f"忽略过期的加载报错：{path} {message}")
             return
         self._finish_job(token)
+        self._pending_load_path = None
         errorlog.log_message(f"打开图片失败：{path} {message}")
         QMessageBox.critical(
             self,
@@ -1624,34 +1739,27 @@ class MainWindow(QMainWindow):
             f"{path.name} 读取失败：\n{message}" + errorlog.hint(),
         )
         self._set_status(f"⚠ 无法打开 {path.name}：{message}")
+        self._drain_open_queue()
 
     # ------------------------------------------------------------------ 文档复位 / 关闭
 
-    def _reset_document(
+    def _clear_live_document_ui(
         self, *, drop_jobs: bool = True, clear_canvas: bool = True
     ) -> None:
-        """把窗口复位到"当前没有任何图"的状态。**归一化历史不动。**
+        """清掉窗口上「当前这一张膜」的痕迹，不碰标签列表与归一化历史。
 
-        这是"打开新图"和"关闭当前图片"共用的那一半动作，也是多文档改造要复用的
-        入口——切换文档时先用它把当前文档的一切痕迹清干净，再装上另一份。所以它
-        只管"当前这张图及其派生物"，不碰跨文档的东西：
-
-        * 清掉：三层图像、朝向、ROI 与分隔线、撤销 / 重做栈、剖面、结果、诊断
-          条、标尺、窗口标题、工具模式；
-        * 不碰：归一化历史（``self._session``）、最近文件、界面偏好、布局。
-
-        归一化历史留着是**必需**而不是方便：内参和目标蛋白常常分开拍在不同的膜
-        上，用户的流程就是"开 A 膜 → 定量 → 加为内参 → 关掉 → 开 B 膜 → …"，
-        关一次丢一次历史的话跨膜归一化根本做不成。
-
-        参数都是给复用方留的开关：
-        * ``drop_jobs``：作废在跑的后台任务。从加载回调里调用时要关掉——那次加载
-          自己就是当前任务，已经由 ``_finish_job`` 收过尾了。
-        * ``clear_canvas``：把画布也退回空白。紧接着要 ``set_image`` 的调用方关掉
-          它，省掉一次"清空再铺上"的闪烁。
+        打开新标签时装上空白活状态、关掉最后一个标签退回空工作区，都走这里。
+        检测参数（泳道数 / 背景模式）故意不动：那是用户的工作习惯，不是某张膜
+        的分析结果。
         """
         if drop_jobs:
-            self._invalidate_jobs()
+            skip_load = JOB_LOAD in self._running or self._pending_load_path is not None
+            kinds = None
+            if skip_load:
+                kinds = (RESULT_JOBS | VIEW_JOBS) - {JOB_LOAD}
+            self._invalidate_jobs(kinds)
+        self._stop_doc_timers()
+        self._tilt_guide_angle = None
         self._blot_loaded = None
         self._blot_original = None
         self._blot = None
@@ -1659,11 +1767,14 @@ class MainWindow(QMainWindow):
         self._quarter_turns = 0
         self._orient_target = (0, 0.0)
         self._pending_restore = None
-        # 图像换了：doc / source 版本双双 +1，此前提交的任何任务都作废
         self._bump_document()
         self._source_version += 1
         self._result_stale = False
         self._detect_dropped_roi = False
+        self._quant_was_manual = False
+        self._quant_manual_pending = False
+        self._quant_job_state = None
+        self._quant_job_expected = None
         self._set_rotation_controls(0.0)
         self._ruler_angle = None
         self.ruler_label.setText("标尺：未测量")
@@ -1682,9 +1793,19 @@ class MainWindow(QMainWindow):
             self.canvas.clear_roi()
             self.canvas.clear_result_boxes()
         self.profile_panel.clear()
-        # _clear_result 里会顺手刷诊断条与动作可用性
         self._clear_result()
         self._sync_roi_fields()
+
+    def _reset_document(
+        self, *, drop_jobs: bool = True, clear_canvas: bool = True
+    ) -> None:
+        """回到空白工作区。**归一化历史不动。**"""
+        self._clear_live_document_ui(drop_jobs=drop_jobs, clear_canvas=clear_canvas)
+        self._docs.clear()
+        self._active_id = None
+        self._pixel_lru.clear()
+        self._pending_reload = None
+        self._rebuild_tab_bar()
 
     def _unhistoried_band_count(self) -> int:
         """当前这批结果里还没进过归一化历史的条带数。
@@ -1705,12 +1826,10 @@ class MainWindow(QMainWindow):
         return len(self._result.measurements)
 
     def _close_document(self) -> bool:
-        """关闭当前图片，回到空白工作区。返回是否真的关掉了。"""
-        if self._blot is None:
+        """关闭当前标签。最后一个关掉后回到空白工作区。返回是否真的关掉了。"""
+        if not self._docs and self._blot is None:
             self._set_status("当前没有打开的图片。")
             return False
-        # "没加入历史"排在"没导出"前面：跨膜流程里历史是唯一把这张膜和别的膜连
-        # 起来的东西，丢了得重新定量；结果表重跑一次就有。
         pending = self._unhistoried_band_count()
         extra = (
             [f"这张膜的 {pending} 个条带还没加入归一化历史，关掉后要重新定量。"]
@@ -1723,10 +1842,17 @@ class MainWindow(QMainWindow):
             extra=extra,
         ):
             return False
-        self._reset_document()
-        self._set_status(
-            "已关闭当前图片；归一化历史保留着，可以直接打开下一张膜继续。"
-        )
+        index = self._index_of(self._active_id) if self._active_id is not None else 0
+        if not self._docs:
+            self._reset_document()
+        else:
+            self._remove_doc_at(max(0, index), confirmed=True)
+        if self._docs:
+            self._set_status("已关闭当前标签；归一化历史保留着。")
+        else:
+            self._set_status(
+                "已关闭当前图片；归一化历史保留着，可以直接打开下一张膜继续。"
+            )
         return True
 
     def _on_load_done(
@@ -1736,70 +1862,612 @@ class MainWindow(QMainWindow):
             self._discard_stale_job(token, "图片加载")
             return
         self._finish_job(token)
-        # 同尺寸、未做微调旋转时沿用 ROI / 分隔线（同膜 strip 重探是标准流程）
-        reuse = (
-            self._roi is not None
-            and self._blot is not None
-            and abs(self._angle) < 1e-6
-            and self._quarter_turns == 0
-            and blot.width == self._blot.width
-            and blot.height == self._blot.height
-        )
-        prev_roi = self._roi
-        prev_seps = list(self._separators)
-        # 复位与"关闭当前图片"是同一套动作，只是这里紧接着装上新图。任务不用再
-        # 作废一遍：走到这儿说明本次加载就是当前任务，_finish_job 已经收过尾了。
-        self._reset_document(drop_jobs=False, clear_canvas=False)
+        self._pending_load_path = None
+        existing = self._index_by_source(path)
+        if existing is not None:
+            self._switch_to_index(existing)
+            self._set_status(f"{path.name} 已经打开，已切到该标签。")
+            self._drain_open_queue()
+            return
+        self._open_blot_in_new_tab(blot, path=path, abandoned=abandoned)
+        self._drain_open_queue()
+
+    def _open_blot_in_new_tab(
+        self, blot, *, path: Path | str | None = None, abandoned: bool = False
+    ) -> None:
+        """把一张已解码的膜放进新标签（加载完成 / 测试装数组）。"""
+        path = Path(path) if path is not None else getattr(blot, "path", None)
+        if self._docs:
+            self._invalidate_jobs({JOB_QUANTIFY, JOB_DETECT, JOB_ORIENT, JOB_PROFILE})
+            self._stop_doc_timers()
+            self._harvest_current()
+        self._clear_live_document_ui(drop_jobs=False, clear_canvas=False)
+        doc = self._make_document(path)
+        self._docs.append(doc)
+        self._active_id = doc.doc_id
+        self._install_blot_pixels(blot, path, abandoned=abandoned)
+        self._harvest_current()
+        self._append_tab(doc)
+        self._touch_resident(doc.doc_id)
+
+    def _install_blot_pixels(
+        self, blot, path: Path | None, *, abandoned: bool = False
+    ) -> None:
         self._blot_loaded = blot
         self._blot_original = blot
         self._blot = blot
         shown = self.canvas.set_image(blot.display_bgr)
         self.canvas.fit_view()
-        self._last_open_dir = str(path.parent)
-        self._add_recent(path)
-        self.setWindowTitle(f"{APP_TITLE} — {path.name}")
-        # 加载完立刻把焦点给画布：Space 平移 / Delete 删条带 / 方向键微调
-        # 都是画布的按键，否则用户得先点一下画布才生效
+        if path is not None:
+            self._last_open_dir = str(path.parent)
+            self._add_recent(path)
+        self._update_window_title()
         self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
-        loaded = f"已加载 {path.name}（{blot.width}×{blot.height}，{blot.bit_depth} 位）。"
+        name = path.name if path is not None else "未命名"
+        loaded = f"已加载 {name}（{blot.width}×{blot.height}，{blot.bit_depth} 位）。"
         if abandoned:
             loaded = "⚠ 已放弃上一张图正在进行的计算。" + loaded
+        self._select_tool(Tool.ROI)
+        self._sync_roi_fields()
+        self._update_action_states()
         if not shown:
-            self._update_action_states()
             self._set_status(
                 loaded + "⚠ 图片过大，画布无法显示预览；定量仍按原始数据进行。"
             )
             return
-        if reuse and prev_roi is not None:
-            rect = prev_roi.clipped(blot.raw)
-            self._roi = rect
-            self._separators = prev_seps
-            self.canvas.set_roi(rect.x, rect.y, rect.width, rect.height)
-            self.canvas.set_separators(self._separators)
-            self._sync_roi_fields()
-            self._refresh_column_profile()
-            self._commit_snapshot()
-            self._select_tool(Tool.ADJUST)
-            self._schedule_quantify()
-            self._set_status(
-                loaded + "尺寸相同，已沿用上一张的 ROI 与分隔线并自动定量；"
-                "不需要可点“清除 ROI”重画。"
+        self._set_status(loaded + "拖拽画出 ROI 框，或点“自动检测”。")
+
+    def _ensure_document_tab(self) -> None:
+        """测试装数组：没有标签就建一个，有就把当前标签跟活状态对齐。"""
+        path = None
+        if self._blot is not None and getattr(self._blot, "path", None):
+            path = Path(self._blot.path)
+        if not self._docs:
+            doc = self._make_document(path)
+            doc.doc_version = self._doc_version
+            doc.source_version = self._source_version
+            self._docs.append(doc)
+            self._active_id = doc.doc_id
+            self._append_tab(doc)
+            self._harvest_current()
+            self._touch_resident(doc.doc_id)
+            self._update_window_title()
+            return
+        doc = self._current_doc()
+        if doc is None:
+            return
+        if path is not None:
+            doc.path = path
+            doc.title = path.name
+            index = self._index_of(doc.doc_id)
+            if index is not None:
+                self._set_tab_label(index, doc)
+        self._harvest_current()
+        self._update_window_title()
+
+    # ------------------------------------------------------------------ 多文档标签
+
+    def _make_document(self, path: Path | None, title: str | None = None) -> Document:
+        self._doc_id_seq += 1
+        name = title or (path.name if path is not None else "未命名")
+        return Document(
+            doc_id=self._doc_id_seq,
+            path=path,
+            title=name,
+            committed=self._EMPTY_STATE,
+            bg_index=max(0, self.bg_combo.currentIndex()),
+            lane_count=int(self.lane_spin.value()),
+            band_count=int(self.band_spin.value()),
+            weak_value=int(self.weak_slider.value()),
+            tool=self.canvas.tool(),
+        )
+
+    def _current_doc(self) -> Document | None:
+        return self._doc_by_id(self._active_id)
+
+    def _doc_by_id(self, doc_id: int | None) -> Document | None:
+        if doc_id is None:
+            return None
+        for doc in self._docs:
+            if doc.doc_id == doc_id:
+                return doc
+        return None
+
+    def _index_of(self, doc_id: int | None) -> int | None:
+        if doc_id is None:
+            return None
+        for index, doc in enumerate(self._docs):
+            if doc.doc_id == doc_id:
+                return index
+        return None
+
+    def _index_by_source(self, path: Path | str) -> int | None:
+        key = source_key(path)
+        if not key:
+            return None
+        for index, doc in enumerate(self._docs):
+            if doc.source() == key:
+                return index
+        return None
+
+    def _stop_doc_timers(self) -> None:
+        self._rotate_timer.stop()
+        self._roi_timer.stop()
+        self._quant_timer.stop()
+        self._quant_manual_pending = False
+        self._tilt_epoch += 1
+        self._tilt_running = False
+
+    def _harvest_current(self) -> None:
+        doc = self._current_doc()
+        if doc is None:
+            return
+        doc.blot_loaded = self._blot_loaded
+        doc.blot_original = self._blot_original
+        doc.blot = self._blot
+        doc.pixels_resident = self._blot is not None
+        doc.angle = float(self._angle)
+        doc.quarter_turns = int(self._quarter_turns)
+        doc.orient_target = tuple(self._orient_target)
+        doc.pending_restore = self._pending_restore
+        doc.roi = self._roi
+        doc.separators = list(self._separators)
+        doc.result = self._result
+        doc.result_origin = self._result_origin
+        doc.result_doc_version = int(self._result_doc_version)
+        doc.results_dirty = bool(self._results_dirty)
+        doc.lanes = list(self._lanes)
+        doc.roi_report = self._roi_report
+        doc.result_expected_bands = self._result_expected_bands
+        doc.detect_dropped_roi = bool(self._detect_dropped_roi)
+        doc.ruler_angle = self._ruler_angle
+        doc.ruler_text = self.ruler_label.text()
+        doc.tilt_guide_angle = self._tilt_guide_angle
+        doc.doc_version = int(self._doc_version)
+        doc.source_version = int(self._source_version)
+        doc.dark_cache = self._dark_cache
+        doc.column_profile = (
+            None if self._column_profile is None else np.asarray(self._column_profile)
+        )
+        doc.undo = list(self._undo)
+        doc.redo = list(self._redo)
+        doc.undo_verb = self._undo_verb
+        doc.committed = self._committed
+        doc.result_stale = bool(self._result_stale)
+        doc.quant_was_manual = bool(self._quant_was_manual)
+        doc.quant_job_state = self._quant_job_state
+        doc.quant_job_expected = self._quant_job_expected
+        doc.view_state = self.canvas.view_state() if self.canvas.has_image() else None
+        doc.tool = self.canvas.tool()
+        doc.bg_index = max(0, self.bg_combo.currentIndex())
+        doc.lane_count = int(self.lane_spin.value())
+        doc.band_count = int(self.band_spin.value())
+        doc.weak_value = int(self.weak_slider.value())
+        doc.diagnostics_state = self.diagnostics.dismiss_state()
+        doc.selected_bands = list(self.canvas.selected_bands())
+        doc.current_lane = self.profile_panel.current_lane()
+
+    def _apply_document(self, doc: Document) -> None:
+        self._applying_document = True
+        self._syncing = True
+        try:
+            self._active_id = doc.doc_id
+            self._blot_loaded = doc.blot_loaded
+            self._blot_original = doc.blot_original
+            self._blot = doc.blot
+            self._angle = float(doc.angle)
+            self._quarter_turns = int(doc.quarter_turns)
+            self._orient_target = tuple(doc.orient_target)
+            self._pending_restore = doc.pending_restore
+            self._roi = doc.roi
+            self._separators = list(doc.separators)
+            self._result = doc.result
+            self._result_origin = doc.result_origin
+            self._result_doc_version = int(doc.result_doc_version)
+            self._results_dirty = bool(doc.results_dirty)
+            self._lanes = list(doc.lanes)
+            self._roi_report = doc.roi_report
+            self._result_expected_bands = doc.result_expected_bands
+            self._detect_dropped_roi = bool(doc.detect_dropped_roi)
+            self._ruler_angle = doc.ruler_angle
+            self._tilt_guide_angle = doc.tilt_guide_angle
+            self._doc_version = int(doc.doc_version)
+            self._source_version = int(doc.source_version)
+            self._dark_cache = doc.dark_cache
+            self._column_profile = doc.column_profile
+            self._undo = list(doc.undo)
+            self._redo = list(doc.redo)
+            self._undo_verb = doc.undo_verb
+            self._committed = (
+                doc.committed if doc.committed is not None else self._EMPTY_STATE
             )
+            self._result_stale = bool(doc.result_stale)
+            self._quant_was_manual = bool(doc.quant_was_manual)
+            self._quant_manual_pending = False
+            self._quant_job_state = doc.quant_job_state
+            self._quant_job_expected = doc.quant_job_expected
+            self.bg_combo.blockSignals(True)
+            self.lane_spin.blockSignals(True)
+            self.band_spin.blockSignals(True)
+            self.weak_slider.blockSignals(True)
+            try:
+                self.bg_combo.setCurrentIndex(int(doc.bg_index))
+                self.lane_spin.setValue(int(doc.lane_count))
+                self.band_spin.setValue(int(doc.band_count))
+                self.weak_slider.setValue(int(doc.weak_value))
+            finally:
+                self.bg_combo.blockSignals(False)
+                self.lane_spin.blockSignals(False)
+                self.band_spin.blockSignals(False)
+                self.weak_slider.blockSignals(False)
+            self._set_rotation_controls(float(doc.angle))
+            self.ruler_label.setText(doc.ruler_text)
+            self._ruler_popup.hide()
+            if not doc.pixels_resident or self._blot is None:
+                self.canvas.clear_image()
+                self.profile_panel.clear()
+                self.results_panel.set_measurements([])
+            else:
+                self._paint_live_view(doc)
+            self._update_window_title()
+            self._update_action_states()
+        finally:
+            self._roi_timer.stop()
+            self._quant_timer.stop()
+            self._syncing = False
+            self._applying_document = False
+        if not doc.pixels_resident or self._blot is None:
+            if doc.path is not None:
+                self._start_reload(doc)
+            else:
+                self._set_status(
+                    f"⚠ {doc.display_name()} 的像素已不在内存，且没有文件可重载。"
+                )
+
+    def _paint_live_view(self, doc: Document | None = None) -> None:
+        doc = doc if doc is not None else self._current_doc()
+        blot = self._blot
+        if blot is None:
+            return
+        self.canvas.set_image(blot.display_bgr)
+        if doc is not None and doc.view_state is not None:
+            self.canvas.restore_view_state(doc.view_state)
+        else:
+            self.canvas.fit_view()
+        tool = doc.tool if doc is not None else Tool.ROI
+        if isinstance(tool, Tool):
+            self._select_tool(tool)
         else:
             self._select_tool(Tool.ROI)
-            self._sync_roi_fields()
-            self._set_status(loaded + "拖拽画出 ROI 框，或点“自动检测”。")
+        if self._roi is not None:
+            self.canvas.set_roi(
+                self._roi.x, self._roi.y, self._roi.width, self._roi.height
+            )
+            self.canvas.set_separators(self._separators)
+        else:
+            self.canvas.clear_roi()
+        self._sync_roi_fields()
+        if self._column_profile is not None and self._roi is not None:
+            self.profile_panel.set_column_profile(
+                self._column_profile,
+                self._roi.x,
+                self._roi.width,
+                self._separators,
+            )
+            self._push_snap_targets()
+        else:
+            self.profile_panel.clear_column_profile()
+            self.canvas.set_snap_targets([])
+        dirty = self._results_dirty
+        stale = self._result_stale
+        origin = self._result_origin
+        version = self._result_doc_version
+        if self._result is not None:
+            self._set_result(
+                self._result, self._lanes, origin=origin, report=self._roi_report
+            )
+            self._result_doc_version = version
+            self._results_dirty = dirty
+            self._result_stale = stale
+            self._update_action_states()
+        else:
+            self._clear_result()
+            self._result_stale = stale
+        if doc is not None:
+            self.diagnostics.restore_dismiss_state(doc.diagnostics_state)
+            self._refresh_roi_marks()
+            if doc.current_lane is not None:
+                self.profile_panel.show_lane(doc.current_lane)
+            if doc.selected_bands:
+                self.canvas.select_bands(doc.selected_bands)
+            if doc.tilt_guide_angle is not None:
+                self.canvas.show_tilt_guide(doc.tilt_guide_angle, self._roi)
+        self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _switch_to_index(self, index: int) -> None:
+        if not 0 <= index < len(self._docs):
+            return
+        target = self._docs[index]
+        if target.doc_id == self._active_id:
+            self._sync_tab_current(index)
+            return
+        self._invalidate_jobs({JOB_QUANTIFY, JOB_DETECT, JOB_ORIENT, JOB_PROFILE})
+        self._stop_doc_timers()
+        self._harvest_current()
+        self._apply_document(target)
+        self._sync_tab_current(index)
+        self._touch_resident(target.doc_id)
+
+    def _on_tab_current_changed(self, index: int) -> None:
+        if self._syncing_tabs or index < 0:
+            return
+        self._switch_to_index(index)
+
+    def _on_tab_close_requested(self, index: int) -> None:
+        if self._syncing_tabs or not 0 <= index < len(self._docs):
+            return
+        current = self.doc_tabs.currentIndex()
+        if index == current:
+            self._close_document()
+            return
+        doc = self._docs[index]
+        if not self._confirm_discard_stored(doc):
+            return
+        self._remove_doc_at(index, confirmed=True)
+
+    def _on_tab_moved(self, src: int, dst: int) -> None:
+        if self._syncing_tabs:
+            return
+        if not (0 <= src < len(self._docs) and 0 <= dst < len(self._docs)):
+            return
+        self._docs.insert(dst, self._docs.pop(src))
+
+    def _confirm_discard_stored(self, doc: Document) -> bool:
+        pending = self._unhistoried_count(doc.result, doc.result_doc_version)
+        extra = (
+            [f"这张膜的 {pending} 个条带还没加入归一化历史，关掉后要重新定量。"]
+            if pending
+            else []
+        )
+        lines = list(extra)
+        result = doc.result
+        if (
+            doc.results_dirty
+            and result is not None
+            and getattr(result, "measurements", None)
+        ):
+            lines.append(
+                f"当前有 {len(result.measurements)} 个条带的定量结果尚未导出。"
+            )
+        if not lines:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "关闭当前图片",
+            "\n".join([*lines, "确定要关闭这张图片吗？"]),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _unhistoried_count(self, result, result_doc_version: int) -> int:
+        if result is None or not getattr(result, "measurements", None):
+            return 0
+        if int(result_doc_version) < 0:
+            return 0
+        if any(
+            int(getattr(entry, "doc_version", -1)) == int(result_doc_version)
+            for entry in self._session.entries
+        ):
+            return 0
+        return len(result.measurements)
+
+    def _remove_doc_at(self, index: int, *, confirmed: bool = False) -> None:
+        if not 0 <= index < len(self._docs):
+            return
+        closing = self._docs[index]
+        closing_current = closing.doc_id == self._active_id
+        if closing_current:
+            self._invalidate_jobs({JOB_QUANTIFY, JOB_DETECT, JOB_ORIENT, JOB_PROFILE})
+            self._stop_doc_timers()
+        self._docs.pop(index)
+        if closing.doc_id in self._pixel_lru:
+            self._pixel_lru.remove(closing.doc_id)
+        if not self._docs:
+            self._reset_document()
+            return
+        if closing_current:
+            neighbor = min(index, len(self._docs) - 1)
+            self._apply_document(self._docs[neighbor])
+        self._rebuild_tab_bar()
+        current = self._index_of(self._active_id)
+        if current is not None:
+            self._sync_tab_current(current)
+
+    def _cycle_tab(self, delta: int) -> None:
+        if len(self._docs) < 2:
+            return
+        current = self.doc_tabs.currentIndex()
+        if current < 0:
+            current = 0
+        self._switch_to_index((current + delta) % len(self._docs))
+
+    def _activate_tab_number(self, number: int) -> None:
+        index = int(number) - 1
+        if 0 <= index < len(self._docs):
+            self._switch_to_index(index)
+
+    def _activate_last_tab(self) -> None:
+        if self._docs:
+            self._switch_to_index(len(self._docs) - 1)
+
+    def _append_tab(self, doc: Document) -> None:
+        self._syncing_tabs = True
+        try:
+            index = self.doc_tabs.addTab(doc.display_name())
+            self.doc_tabs.setTabToolTip(index, doc.tooltip())
+            self.doc_tabs.setCurrentIndex(index)
+            self.doc_tabs.setVisible(True)
+        finally:
+            self._syncing_tabs = False
+
+    def _set_tab_label(self, index: int, doc: Document) -> None:
+        self.doc_tabs.setTabText(index, doc.display_name())
+        self.doc_tabs.setTabToolTip(index, doc.tooltip())
+
+    def _sync_tab_current(self, index: int) -> None:
+        self._syncing_tabs = True
+        try:
+            if self.doc_tabs.currentIndex() != index:
+                self.doc_tabs.setCurrentIndex(index)
+            self.doc_tabs.setVisible(bool(self._docs))
+        finally:
+            self._syncing_tabs = False
+
+    def _rebuild_tab_bar(self) -> None:
+        self._syncing_tabs = True
+        try:
+            self.doc_tabs.blockSignals(True)
+            while self.doc_tabs.count():
+                self.doc_tabs.removeTab(0)
+            for doc in self._docs:
+                index = self.doc_tabs.addTab(doc.display_name())
+                self.doc_tabs.setTabToolTip(index, doc.tooltip())
+            current = self._index_of(self._active_id)
+            if current is not None:
+                self.doc_tabs.setCurrentIndex(current)
+            self.doc_tabs.setVisible(bool(self._docs))
+            self.doc_tabs.blockSignals(False)
+        finally:
+            self._syncing_tabs = False
+
+    def _update_window_title(self) -> None:
+        doc = self._current_doc()
+        if not self._docs or doc is None:
+            self.setWindowTitle(APP_TITLE)
+            return
+        self.setWindowTitle(f"{APP_TITLE} — {doc.display_name()}")
+
+    def _drain_open_queue(self) -> None:
+        while self._open_queue:
+            path = self._open_queue.pop(0)
+            if self._index_by_source(path) is not None:
+                continue
+            self._start_load(path, abandoned=False)
+            return
+
+    def _touch_resident(self, doc_id: int) -> None:
+        if doc_id in self._pixel_lru:
+            self._pixel_lru.remove(doc_id)
+        self._pixel_lru.append(doc_id)
+        self._evict_cold_pixels()
+
+    def _evict_cold_pixels(self) -> None:
+        """只保留最近 N 个标签的 numpy 数组；没路径的（测试装数组）永不驱逐。"""
+        while True:
+            victims = []
+            for doc_id in self._pixel_lru:
+                doc = self._doc_by_id(doc_id)
+                if doc is None or not doc.pixels_resident:
+                    continue
+                if doc.doc_id == self._active_id:
+                    continue
+                if doc.path is None:
+                    continue
+                victims.append(doc)
+            resident = 1 if self._blot is not None else 0
+            resident += sum(
+                1
+                for item in self._docs
+                if item.doc_id != self._active_id
+                and item.pixels_resident
+                and item.blot is not None
+            )
+            if resident <= int(self._max_resident_docs) or not victims:
+                return
+            victim = victims[0]
+            victim.blot_loaded = None
+            victim.blot_original = None
+            victim.blot = None
+            victim.pixels_resident = False
+            victim.dark_cache = None
+            victim.reload_generation += 1
+
+    def _start_reload(self, doc: Document) -> None:
+        if doc.path is None:
+            return
+        doc.reload_generation += 1
+        generation = doc.reload_generation
+        self._pending_reload = (doc.doc_id, generation)
+        token = self._begin_job(JOB_LOAD, f"正在重新载入 {doc.display_name()}……")
+        self._set_status(f"正在从磁盘重新载入 {doc.display_name()}……")
+        self._submit_job(
+            token,
+            partial(_reload_oriented, doc.path, doc.quarter_turns, doc.angle),
+            partial(self._on_reload_done, token, doc.doc_id, generation),
+            partial(self._on_reload_error, token, doc.doc_id, generation),
+        )
+
+    def _on_reload_error(
+        self, token: object, doc_id: int, generation: int, message: str
+    ) -> None:
+        if not self._job_is_current(token):
+            errorlog.log_message(f"忽略过期的重载报错：{message}")
+            return
+        self._finish_job(token)
+        if self._pending_reload == (doc_id, generation):
+            self._pending_reload = None
+        errorlog.log_message(f"重新载入失败：{message}")
+        self._set_status(f"⚠ 重新载入失败：{message}")
+        self._drain_open_queue()
+
+    def _on_reload_done(
+        self, token: object, doc_id: int, generation: int, payload: object
+    ) -> None:
+        if not self._job_is_current(token):
+            self._discard_stale_job(token, "图片加载")
+            return
+        self._finish_job(token)
+        if self._pending_reload == (doc_id, generation):
+            self._pending_reload = None
+        doc = self._doc_by_id(doc_id)
+        if doc is None or doc.reload_generation != generation:
+            self._drain_open_queue()
+            return
+        loaded, base, blot = payload
+        doc.blot_loaded = loaded
+        doc.blot_original = base
+        doc.blot = blot
+        doc.pixels_resident = True
+        if self._active_id != doc_id:
+            self._touch_resident(doc.doc_id)
+            self._drain_open_queue()
+            return
+        self._blot_loaded = loaded
+        self._blot_original = base
+        self._blot = blot
+        self._applying_document = True
+        try:
+            self._paint_live_view(doc)
+        finally:
+            self._roi_timer.stop()
+            self._quant_timer.stop()
+            self._applying_document = False
+        self._touch_resident(doc.doc_id)
         self._update_action_states()
+        self._set_status(f"已重新载入 {doc.display_name()}。")
+        self._drain_open_queue()
 
     # ------------------------------------------------------------------ 旋转
 
     def _set_rotation_controls(self, angle: float) -> None:
+        was_syncing = self._syncing
         self._syncing = True
         try:
             self.rotation_slider.setValue(int(round(angle * 10)))
             self.rotation_spin.setValue(angle)
         finally:
-            self._syncing = False
+            self._syncing = was_syncing
 
     def _on_slider_rotation(self, value: int) -> None:
         if self._syncing:
@@ -2024,6 +2692,7 @@ class MainWindow(QMainWindow):
 
     def _on_ruler_measured(self, angle: float, end_x: float, end_y: float) -> None:
         self._ruler_angle = normalize_angle(angle)
+        self._tilt_guide_angle = None
         self.ruler_label.setText(f"标尺倾角：{self._ruler_angle:.2f}°（相对水平）")
         self._show_ruler_popup(end_x, end_y)
         self._set_status("标尺已测量：就地点“旋正为水平/垂直”，或按 ✕ 取消。")
@@ -2042,20 +2711,21 @@ class MainWindow(QMainWindow):
             return
         blot, roi, dark = self._blot, self._roi, self._current_dark_bands()
         version = self._doc_version
+        epoch = self._tilt_epoch
         self._tilt_running = True
         self._update_action_states()
         self._set_status("正在自动测倾角……")
         run_async(
             self._pool,
             partial(estimate_tilt, blot.raw, roi=roi, dark_bands=dark),
-            partial(self._on_tilt_done, version, roi),
-            partial(self._on_tilt_failed, version),
+            partial(self._on_tilt_done, epoch, version, roi),
+            partial(self._on_tilt_failed, epoch, version),
         )
 
-    def _on_tilt_done(self, version: int, roi, estimate: object) -> None:
+    def _on_tilt_done(self, epoch: int, version: int, roi, estimate: object) -> None:
         self._tilt_running = False
         self._update_action_states()
-        if version != self._doc_version:
+        if epoch != self._tilt_epoch or version != self._doc_version:
             errorlog.log_message("丢弃过期的自动测倾角结果")
             return
         raw = getattr(estimate, "raw_angle_deg", None)
@@ -2070,6 +2740,7 @@ class MainWindow(QMainWindow):
             return
         angle = float(estimate.angle_deg)
         self._ruler_angle = angle
+        self._tilt_guide_angle = angle
         self.ruler_label.setText(f"标尺倾角：{angle:.2f}°（相对水平·自动）")
         self._ruler_popup.hide()
         drawn = self.canvas.show_tilt_guide(angle, roi)
@@ -2078,10 +2749,10 @@ class MainWindow(QMainWindow):
             message += "画布上的虚线就是这个角度，与条带平行才可用。"
         self._set_status(message)
 
-    def _on_tilt_failed(self, version: int, message: str) -> None:
+    def _on_tilt_failed(self, epoch: int, version: int, message: str) -> None:
         self._tilt_running = False
         self._update_action_states()
-        if version != self._doc_version:
+        if epoch != self._tilt_epoch or version != self._doc_version:
             return
         self._set_status(f"⚠ 自动测倾角失败：{message}" + errorlog.hint())
 
@@ -2143,7 +2814,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ ROI / 分隔线
 
     def _on_canvas_roi_changed(self, x: float, y: float, w: float, h: float) -> None:
-        if self._blot is None:
+        if self._applying_document or self._syncing or self._blot is None:
             return
         self._quant_timer.stop()
         # 与拖分隔线保持一致：只标记结果过期，不清空表格。无条件清空会让拖
@@ -2166,6 +2837,8 @@ class MainWindow(QMainWindow):
         保留画布上现有分隔线（含手动调整），只有新画 ROI 才重新计算。
         真正的计算（暗带判定 + 列剖面，都是整图级 numpy）走后台任务。
         """
+        if self._applying_document:
+            return
         self._roi_timer.stop()
         if self._blot is None:
             return
@@ -2306,10 +2979,12 @@ class MainWindow(QMainWindow):
         """ROI → 数值框。沿用旋转控件那套 _syncing 标志防回环。
 
         live 用于拖动 / 键盘微调过程中的即时回显：此时 self._roi 还没落地（要等
-        防抖结束），但数值框应当跟手。
+        防抖结束），但数值框应当跟手。切标签时外层已经把 _syncing 拉起来了，
+        这里仍要写数值，但不能把外层的标志打掉。
         """
-        if self._syncing:
+        if self._syncing and not self._applying_document:
             return
+        was_syncing = self._syncing
         self._syncing = True
         try:
             roi = self._roi
@@ -2337,11 +3012,11 @@ class MainWindow(QMainWindow):
                 spin.setMaximum(limits[key])
                 spin.setValue(int(values[key]))
         finally:
-            self._syncing = False
+            self._syncing = was_syncing
 
     def _on_roi_field_changed(self, _value: int) -> None:
         """数值框 → ROI。走和鼠标拖动同一条落地路径（防抖 → 剖面 → 定量）。"""
-        if self._syncing or self._blot is None:
+        if self._syncing or self._applying_document or self._blot is None:
             return
         rect = RoiRect(
             int(self.roi_spins["x"].value()),
@@ -2388,6 +3063,8 @@ class MainWindow(QMainWindow):
             self._update_action_states()
 
     def _on_lane_count_changed(self, _value: int) -> None:
+        if self._applying_document or self._syncing:
+            return
         if self._roi is not None and self._blot is not None:
             self._reset_separators()
 
@@ -2402,6 +3079,8 @@ class MainWindow(QMainWindow):
         _reset_separators 路径——后者会按剖面峰谷重划泳道，把用户手调过的
         分隔线全冲掉。
         """
+        if self._applying_document or self._syncing:
+            return
         if self._roi is None or self._blot is None:
             return
         self._schedule_quantify()
@@ -2602,6 +3281,8 @@ class MainWindow(QMainWindow):
 
     def _schedule_quantify(self) -> None:
         """ROI / 分隔线变化后安排一次防抖自动定量。"""
+        if self._applying_document:
+            return
         if self._blot is None or self._roi is None:
             return
         self._mark_result_stale()
@@ -2674,6 +3355,7 @@ class MainWindow(QMainWindow):
                 worker.cancel()
             dropped = self._job_tokens.pop(kind, None) is not None
             dropped = self._running.pop(kind, None) is not None or dropped
+            self._job_doc.pop(kind, None)
             if dropped and kind in RESULT_JOBS:
                 interrupted = True
         if JOB_QUANTIFY in targets:
@@ -2692,6 +3374,7 @@ class MainWindow(QMainWindow):
         self._job_serial += 1
         token = (kind, self._job_guard(kind), self._job_serial)
         self._job_tokens[kind] = token
+        self._job_doc[kind] = None if kind == JOB_LOAD else self._active_id
         self._running[kind] = message or JOB_LABELS.get(kind, kind)
         self._refresh_busy_ui(message)
         return token
@@ -2708,6 +3391,7 @@ class MainWindow(QMainWindow):
         if self._job_tokens.get(kind) != token:
             return
         self._job_tokens.pop(kind, None)
+        self._job_doc.pop(kind, None)
         self._workers.pop(kind, None)
         self._running.pop(kind, None)
         self._refresh_busy_ui()
@@ -2716,7 +3400,13 @@ class MainWindow(QMainWindow):
         if not isinstance(token, tuple) or len(token) != 3:
             return False
         kind, guard, _serial = token
-        return self._job_tokens.get(kind) == token and guard == self._job_guard(kind)
+        if self._job_tokens.get(kind) != token:
+            return False
+        if kind != JOB_LOAD:
+            owner = self._job_doc.get(kind, self._active_id)
+            if owner != self._active_id:
+                return False
+        return guard == self._job_guard(kind)
 
     def _view_pending(self, exclude=None) -> bool:
         """有没有会替换图像 / 剖面的呈现类任务在跑。"""
@@ -3774,10 +4464,9 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self._set_status(f"⚠ 无法打开文件夹：{exc}")
 
-    # export_result 用固定文件名 {stem}_bands.csv / {stem}_annotated.png，而
-    # “导出数据”只让用户选目录——第二次导出会静默盖掉第一次。export.py 不在本
-    # 轮可改范围内，所以在界面层做存在性检查。名字对不上时（核心改了命名约定）
-    # 退化为不提示，绝不因此报错。
+    # 默认档仍用固定文件名 {stem}_bands.csv / {stem}_annotated.png；勾了其它
+    # 项还会写出 raw_long.csv / normalized_results.csv / summary_*。只选目录、
+    # 不选文件名，第二次导出会盖掉第一次，所以落盘前按这次勾选核对已有文件。
     EXPORT_PATTERNS = ("{stem}_bands.csv", "{stem}_annotated.png")
 
     def _existing_exports(self, folder: str, stem: str) -> list[str]:
@@ -3810,35 +4499,109 @@ class MainWindow(QMainWindow):
         )
         return answer == QMessageBox.StandardButton.Yes
 
+    def _current_source_path(self) -> Path:
+        """当前活动标签的图像路径：给导出当 source / membrane 主干。"""
+        for blot in (self._blot, self._blot_original):
+            if blot is not None and getattr(blot, "path", None):
+                return Path(blot.path)
+        doc = self._current_doc()
+        if doc is not None and doc.path is not None:
+            return Path(doc.path)
+        return Path("blot.png")
+
     def _export_data(self) -> None:
-        if self._result is None or not self._result.measurements or self._blot is None:
+        # 活状态就是当前标签：切标签时 _apply_document 已经把 result / roi /
+        # origin / 图像搬到这些字段上，这里不要去翻别的 Document。
+        has_result = (
+            self._result is not None
+            and bool(self._result.measurements)
+            and self._blot is not None
+        )
+        can_normalized, normalized_reason = normalization_export_available(self._session)
+        can_summary, summary_reason = summary_export_available(self._session)
+        can_session_raw = bool(self._session.entries)
+        if not has_result and not can_normalized and not can_summary and not can_session_raw:
             self._set_status("⚠ 还没有可导出的定量结果：先框选 ROI 或点“自动检测”。")
             return
-        image_path = self._blot.path or (
-            self._blot_original.path if self._blot_original else None
+
+        dialog = DataExportDialog(
+            self,
+            options=DataExportDialog.load_options(),
+            can_export_raw=has_result,
+            can_export_normalized=can_normalized,
+            can_export_summary=can_summary,
+            can_export_session_raw=can_session_raw,
+            raw_reason=""
+            if has_result
+            else "还没有可导出的定量结果：先框选 ROI 或点“自动检测”。",
+            normalized_reason=normalized_reason,
+            summary_reason=summary_reason,
+            session_raw_reason=""
+            if can_session_raw
+            else "归一化历史是空的：还没有可导出的跨膜原始长表。",
         )
-        image_path = image_path or Path("blot.png")
-        start = self._last_export_dir or str(Path(image_path).parent)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.save_options()
+
+        image_path = self._current_source_path()
+        stem = image_path.stem
+        start = self._last_export_dir or (
+            str(image_path.parent) if image_path.parent != Path(".") else ""
+        )
         selected = QFileDialog.getExistingDirectory(self, "选择结果保存目录", start)
         if not selected:
             return
-        if not self._confirm_overwrite(selected, Path(image_path).stem):
+
+        planned = planned_data_export_names(
+            stem,
+            raw_stats=options.raw_stats,
+            normalized=options.normalized,
+            summary=options.summary_tables,
+            has_result=has_result,
+            has_session=bool(self._session.entries),
+            include_session_raw=options.session_raw,
+        )
+        existing = [
+            name for name in planned if (Path(selected) / name).exists()
+        ]
+        if not self._confirm_overwrite_names(existing):
             self._set_status("已取消导出（未覆盖已有文件）。")
             return
+
+        group = self.normalize_panel.group_name()
         try:
-            csv_path, preview_path = export_result(
-                self._result, image_path, selected, origin=self._result_origin
+            exported = export_selected_data(
+                selected,
+                raw_stats=options.raw_stats,
+                normalized=options.normalized,
+                summary=options.summary_tables,
+                result=self._result if has_result else None,
+                image_path=image_path,
+                origin=self._result_origin,
+                membrane=stem,
+                roi=self._roi,
+                sample_names=self._session.lane_labels_of(group),
+                background_params=self._bg_mode(),
+                protein=self.normalize_panel.protein_name(),
+                kind=self.normalize_panel.kind(),
+                group=group,
+                session=self._session,
+                include_session_raw=options.session_raw,
+                full_stats=options.full_stats,
             )
         except Exception as exc:  # noqa: BLE001 - cv2 / 权限错误都要给出提示
             errorlog.log_exception("导出数据失败", exc)
             QMessageBox.critical(self, "导出失败", str(exc) + errorlog.hint())
             return
-        self._results_dirty = False
+        if has_result:
+            self._results_dirty = False
         self._last_export_dir = selected
-        self._notify_exported(
-            f"已导出 CSV：{Path(csv_path).name}；标注预览：{Path(preview_path).name}",
-            selected,
-        )
+        names = [path.name for path in exported.paths]
+        if not names:
+            self._set_status("⚠ 没有文件被写出。")
+            return
+        self._notify_exported("已导出：" + "；".join(names), selected)
 
     FIGURE_SUFFIXES = (".tif", ".tiff", ".png")
 
@@ -4105,7 +4868,7 @@ class MainWindow(QMainWindow):
             elif self._result is None:
                 text = "泳道已划分，会自动定量；也可点“ROI 定量”手动刷新"
             else:
-                text = "可在“归一化”页加入历史，或导出数据 / 展示图"
+                text = "可在“归一化”页加入历史，或导出原始灰度 / 展示图"
         self._hint_label.setText(text)
 
     # ------------------------------------------------------------------ 最近文件
@@ -4157,15 +4920,28 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event: QDropEvent) -> None:
         if self._reject_while_busy("拖入新图片"):
             return
+        opened = False
         for url in event.mimeData().urls():
             if not url.isLocalFile():
                 continue
             path = Path(url.toLocalFile())
             if path.suffix.lower() in IMAGE_SUFFIXES and path.exists():
                 if self.open_path(path):
-                    event.acceptProposedAction()
-                return
+                    opened = True
+        if opened:
+            event.acceptProposedAction()
+            return
         self._set_status("⚠ 拖拽失败：请拖入 PNG / JPG / BMP / TIF / TIFF 图片文件。")
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        ctrl = event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        if ctrl and event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+            shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            delta = -1 if event.key() == Qt.Key.Key_Backtab or shift else 1
+            self._cycle_tab(delta)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ------------------------------------------------------------------ 设置
 

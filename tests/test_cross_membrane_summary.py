@@ -8,7 +8,7 @@
 2. 同一分组出现两条内参时**必须出警告**，否则前一块胶的目标会拿后一块胶的
    内参当分母，数字照常算出来、一个提示都没有；
 3. 长表逐行记住"这个比值是拿哪两张膜相除得来的"；
-4. 宽表可以直接丢进 Prism，而它自己不带溯源，所以旁注文件必须说清空格。
+4. 宽表是透视后的便利表，自身不带溯源，所以旁注文件必须说清空格。
 """
 
 import csv
@@ -682,7 +682,7 @@ def test_conflicting_sample_names_in_one_file_are_reported(tmp_path) -> None:
 
 
 def test_cross_membrane_export_end_to_end(tmp_path) -> None:
-    """三张膜（1 内参 + 2 目标）进同一分组，出一张能丢进 Prism 的汇总表。"""
+    """三张膜（1 内参 + 2 目标）进同一分组，出一张跨膜汇总表。"""
     session = three_membrane_session()
     session.upsert(
         entry(

@@ -770,6 +770,9 @@ class ProfilePanel(QWidget):
             return float(sum(float(m.integrated_density) for m in self._lane_bands(target)))
         return float(sum(target.band_densities))
 
+    def current_lane(self) -> int | None:
+        return self._current_lane
+
     def show_lane(self, lane_number: int) -> None:
         target = None
         for lane in self._lanes:

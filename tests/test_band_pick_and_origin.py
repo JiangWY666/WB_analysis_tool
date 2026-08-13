@@ -8,12 +8,14 @@ value stands for — summing a specific band with a non-specific one is the same
 error one level down.
 """
 
+import csv
+
 import cv2
 import numpy as np
 import pytest
 
 from wb_analyzer.analysis import BandMeasurement
-from wb_analyzer.export import export_result
+from wb_analyzer.export import LEGACY_BANDS_FIELDS, export_result
 from wb_analyzer.normalize import (
     BAND_PICK_ALL,
     BAND_PICK_BOTTOM,
@@ -322,18 +324,27 @@ def test_bands_csv_records_the_convention(tmp_path) -> None:
     roi = RoiRect(10, 20, 220, 160)
     result = quantify_lanes(gray, roi, default_separators(roi, 3), dark_bands=True)
     csv_path, _ = export_result(
-        result, tmp_path / "blot.tif", tmp_path / "out", origin=ORIGIN_ROI_BASELINE
+        result,
+        tmp_path / "blot.tif",
+        tmp_path / "out",
+        origin=ORIGIN_ROI_BASELINE,
+        full_stats=True,
     )
     lines = csv_path.read_text(encoding="utf-8-sig").strip().splitlines()
-    assert lines[0].endswith("origin")
-    assert all(line.endswith(ORIGIN_ROI_BASELINE) for line in lines[1:])
+    header = next(csv.reader([lines[0]]))
+    assert header[: len(LEGACY_BANDS_FIELDS)] == LEGACY_BANDS_FIELDS
+    assert header[len(LEGACY_BANDS_FIELDS) - 1] == "origin"
+    rows = list(csv.DictReader(lines))
+    assert rows and all(row["origin"] == ORIGIN_ROI_BASELINE for row in rows)
 
 
 def test_bands_csv_says_unknown_when_the_caller_did_not(tmp_path) -> None:
     gray = doublet_blot()
     roi = RoiRect(10, 20, 220, 160)
     result = quantify_lanes(gray, roi, default_separators(roi, 3), dark_bands=True)
-    csv_path, _ = export_result(result, tmp_path / "blot.tif", tmp_path / "out")
+    csv_path, _ = export_result(
+        result, tmp_path / "blot.tif", tmp_path / "out", full_stats=True
+    )
     assert ORIGIN_UNKNOWN in csv_path.read_text(encoding="utf-8-sig").splitlines()[1]
 
 

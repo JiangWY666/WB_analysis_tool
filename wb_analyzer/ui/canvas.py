@@ -682,6 +682,25 @@ class BlotCanvas(QGraphicsView):
     def current_scale(self) -> float:
         return float(self.transform().m11())
 
+    def view_state(self) -> tuple[QTransform, int, int]:
+        """缩放矩阵 + 滚动条位置，切标签时原样搬走再搬回来。"""
+        return (
+            QTransform(self.transform()),
+            int(self.horizontalScrollBar().value()),
+            int(self.verticalScrollBar().value()),
+        )
+
+    def restore_view_state(self, state: tuple | None) -> None:
+        """恢复 :meth:`view_state`；``None`` 表示还没记过，适应窗口。"""
+        if not state:
+            self.fit_view()
+            return
+        transform, h_scroll, v_scroll = state
+        self.setTransform(QTransform(transform))
+        self.horizontalScrollBar().setValue(int(h_scroll))
+        self.verticalScrollBar().setValue(int(v_scroll))
+        self._on_scale_changed()
+
     def set_guides_visible(self, visible: bool) -> None:
         self._guides_on = bool(visible)
         self._update_guides()

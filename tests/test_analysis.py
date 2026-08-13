@@ -79,7 +79,15 @@ def test_export_and_unicode_path(tmp_path: Path) -> None:
     assert csv_path.exists() and preview_path.exists()
     text = csv_path.read_text(encoding="utf-8-sig")
     assert text.count("\n") == 7
-    assert "saturated_fraction" in text.splitlines()[0]
+    header = text.splitlines()[0]
+    assert header.split(",") == [
+        "source",
+        "lane",
+        "band",
+        "sample",
+        "integrated_density",
+        "below_detection",
+    ]
 
 
 def test_rejects_tiny_image() -> None:

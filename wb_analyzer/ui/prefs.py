@@ -39,6 +39,11 @@ KEY_ROI_LINE = "ui/line_roi"
 KEY_BAND_LINE = "ui/line_band"
 KEY_SEPARATOR_LINE = "ui/line_separator"
 KEY_RESULT_COLUMNS = "ui/result_columns"
+KEY_DATA_EXPORT_RAW = "export/data_raw_stats"
+KEY_DATA_EXPORT_NORMALIZED = "export/data_normalized"
+KEY_DATA_EXPORT_SUMMARY = "export/data_summary"
+KEY_DATA_EXPORT_FULL_STATS = "export/data_full_stats"
+KEY_DATA_EXPORT_SESSION_RAW = "export/data_session_raw"
 
 
 def _clamp(value, low: float, high: float, fallback: float) -> float:
@@ -210,11 +215,64 @@ def save(value: UiPrefs, store: QSettings | None = None) -> None:
     store.setValue(KEY_RESULT_COLUMNS, ",".join(value.result_columns))
 
 
+def _as_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no", ""}:
+        return False
+    return default
+
+
+def load_data_export_choices(
+    store: QSettings | None = None,
+) -> tuple[bool, bool, bool, bool, bool]:
+    """上次「导出数据」勾选了哪几项。
+
+    返回 ``(原始灰度, 归一化, 跨膜汇总, 完整统计列, 历史长表)``。
+    缺省：只导精简的原始灰度统计。
+    """
+    store = store or settings()
+    return (
+        _as_bool(store.value(KEY_DATA_EXPORT_RAW, True), True),
+        _as_bool(store.value(KEY_DATA_EXPORT_NORMALIZED, False), False),
+        _as_bool(store.value(KEY_DATA_EXPORT_SUMMARY, False), False),
+        _as_bool(store.value(KEY_DATA_EXPORT_FULL_STATS, False), False),
+        _as_bool(store.value(KEY_DATA_EXPORT_SESSION_RAW, False), False),
+    )
+
+
+def save_data_export_choices(
+    raw_stats: bool,
+    normalized: bool,
+    summary_tables: bool,
+    full_stats: bool = False,
+    session_raw: bool = False,
+    store: QSettings | None = None,
+) -> None:
+    store = store or settings()
+    store.setValue(KEY_DATA_EXPORT_RAW, bool(raw_stats))
+    store.setValue(KEY_DATA_EXPORT_NORMALIZED, bool(normalized))
+    store.setValue(KEY_DATA_EXPORT_SUMMARY, bool(summary_tables))
+    store.setValue(KEY_DATA_EXPORT_FULL_STATS, bool(full_stats))
+    store.setValue(KEY_DATA_EXPORT_SESSION_RAW, bool(session_raw))
+    store.sync()
+
+
 __all__ = [
     "DEFAULTS",
     "DEFAULT_FONT_PT",
     "DEFAULT_LINE_SCALE",
     "FONT_STEP",
+    "KEY_DATA_EXPORT_FULL_STATS",
+    "KEY_DATA_EXPORT_NORMALIZED",
+    "KEY_DATA_EXPORT_RAW",
+    "KEY_DATA_EXPORT_SESSION_RAW",
+    "KEY_DATA_EXPORT_SUMMARY",
     "LINE_STEP",
     "MAX_FONT_PT",
     "MAX_LINE_SCALE",
@@ -223,7 +281,9 @@ __all__ = [
     "UiPrefs",
     "base_app_font",
     "load",
+    "load_data_export_choices",
     "remember_base_font",
     "save",
+    "save_data_export_choices",
     "scale_widget_font",
 ]

@@ -553,7 +553,7 @@ dpi = 像素宽 ÷ 印刷宽度（英寸）
 | --- | --- |
 | `Ctrl+O` | 打开图片 |
 | `Ctrl+W` | 关闭当前图片（归一化历史保留） |
-| `Ctrl+E` | 导出数据（CSV + 标注图） |
+| `Ctrl+E` | 导出数据（先选原始灰度 / 完整列 / 归一化 / 跨膜汇总） |
 | `Ctrl+Shift+E` | 导出展示图 |
 | `Ctrl+,` | 界面设置（字体大小、画布标注线宽、结果表列） |
 | `Ctrl+Q` | 退出 |
@@ -620,7 +620,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
 4. **查看诊断条**。框好 ROI 后会**自动定量**（微调分隔线亦会自动刷新），也可按 `Ctrl+R` 手动重跑。画布上方即为 ROI 自检结论：绿色"自检通过"为最常见结果；橙色"警告"与红色"严重"会给出具体动作（例如"把 ROI 上边往上挪至少 8 px"），点击"详情"查看全文。被点名的条带框右上角带有三角角标，ROI 相应边上会绘出所需的留白（斜纹带），被点名的分隔线转为红色并加粗。**应先按提示修正 ROI，再读取数值。** 确有理由如此绘制时点击"我知道了"。
 5. **补漏与删除误检**。漏检使用 **补画条带**（`3`）补充；误检在结果表或画布上选中后按 `Delete` 删除（可撤销，批量删除算一步）。每道纵向叠加双条带而只切出一条时，将「调整」页的**每道条带数**填为 2。
 6. **归一化**。在「归一化」页将内参与目标分别加入历史（选定类型 / 蛋白名 / 分组），同组按泳道号自动配对计算 normalized 与 fold change，并可指定对照泳道。双条带可在历史表"条带"列中选择"只取上面那条 / 只取下面那条"——该操作改变聚合方式，不重新定量。
-7. **导出**。`Ctrl+E` 输出条带 CSV 与标注图；`Ctrl+Shift+E` 输出发表级展示图（先选择干净版/标注版、灰度映射、位深、打印宽度，导出后弹出旁注内容）。
+7. **导出**。`Ctrl+E` 先选择这次要写哪些表：默认勾选**原始灰度统计**（精简 6 列：来源 / 泳道 / 条带 / 样品名 / 积分灰度 / 检出限标记；每次测量一行，不归一化、不合并重复上样）。「包含完整统计列」与「同时导出历史所有膜的原始长表」默认不勾。归一化结果与跨膜汇总长表/宽表也是可选项，未做归一化时对应项不可用。`Ctrl+Shift+E` 输出发表级展示图（先选择干净版/标注版、灰度映射、位深、打印宽度，导出后弹出旁注内容）。
 8. **关闭或切换**。`Ctrl+W` 关闭当前图片，回到空白工作区；归一化历史保留，可直接打开下一张膜继续跨膜流程。
 
 > 删除误检条带后，加入历史的强度为**剩余条带**的合计，并会记录泳道号；
@@ -673,21 +673,39 @@ wb-analyze .\example.tif -o .\results --sensitivity 0.8 --background dark_bands
 
 ### 条带结果 `*_bands.csv`
 
+导出分两档。**默认是精简档**，只写分析真正用得到的列：
+
 | 字段 | 含义 |
 | --- | --- |
+| `source` | 来源文件路径 |
 | `lane` / `band` | 泳道编号 / 该泳道内的条带编号（图上标作 L2-B1） |
+| `sample` | 用户为该泳道填写的样品名；未填写则为空。**同一名称可以出现在多行**（重复上样），导出不会求平均或去重 |
+| `integrated_density` | 扣除背景与噪声地板后的积分灰度，单位"灰度×像素"（数值越大信号越强） |
+| `below_detection` | `1` 表示 `snr < 3`，该积分与空白泳道不可区分（详见方法学第 10 节）。**它是噪声限，不判断该泳道是否有蛋白**；留下这一列是为了不让低于检出限的积分和真条带长得一样 |
+
+对话框勾选「包含完整统计列」后改为完整档。完整档的前 15 列与旧版逐列一致，新列追加在 `origin` 之后：
+
+`lane, band, x, y, width, height, area, mean_intensity, background, integrated_density, saturated_fraction, detection_limit, snr, below_detection, origin, source, membrane, roi_id, sample, peak, background_method, background_params`
+
+| 完整档额外字段 | 含义 |
+| --- | --- |
 | `x`, `y`, `width`, `height` | 包围框（像素）。`width` 为收紧后的条带横向足迹宽度，非整条泳道宽 |
 | `area` | 包围框像素数 |
 | `mean_intensity` | 框内平均原始灰度（未扣背景） |
 | `background` | 背景估计（ROI 路径为该段基线的每像素均值，折算回显示灰度） |
-| `integrated_density` | 扣除背景与噪声地板后的积分灰度，单位"灰度×像素"（数值越大信号越强） |
 | `saturated_fraction` | 疑似饱和像素占比，≥ 0.05 即不可用 |
 | `detection_limit` | 3σ 检出限，与 `integrated_density` 同单位；`0` 表示噪声无法估计、未评估 |
 | `snr` | 信噪比 = `integrated_density ÷ (σ × √样本数)` |
-| `below_detection` | `1` 表示 `snr < 3`，该积分与空白泳道不可区分（详见方法学第 10 节）。**它是噪声限，不判断该泳道是否有蛋白** |
 | `origin` | 该批数值的背景口径：`roi_baseline`（ROI 基线）/ `local_background`（环形中值）/ `unknown`（调用方未声明）。两套口径不可相互比较，详见方法学第 9 节 |
+| `membrane` | 膜标识（默认取文件名，可在历史中改名） |
+| `roi_id` | ROI 几何：`x=…;y=…;w=…;h=…`。整图自动检测时为空 |
+| `peak` | 条带窗口内扣除背景后的峰值（每像素灰度） |
+| `background_method` | 背景扣除方法的中文名称（与 `origin` 对应） |
+| `background_params` | 背景扣除参数（如 `baseline_mode=rubber;tight=true`）；未提供则为空 |
 
 字段顺序即文件中的列顺序。同一目录下重复导出会覆盖同名文件，界面会先行确认。
+
+**重复上样的膜建议只导出原始灰度统计**，在 Excel / R 里自行决定怎么合并、怎么配对。软件不会把同名样品合成一行，也不会把归一化当成导出的前提。归一化 CSV、跨膜汇总、历史所有膜的 `raw_long.csv` 都是可选项，需要时再勾选。`raw_long.csv` 默认不导出；勾选后列档位跟随「包含完整统计列」——精简档为上面 6 列再加 `protein, kind, group`，完整档为完整 22 列再加这 3 列。
 
 ### 内参 / 归一化
 
@@ -714,7 +732,7 @@ $env:QT_QPA_PLATFORM = "offscreen"; pytest -q
 | `wb_analyzer/tilt.py` | 自动测倾角（行投影平方梯度锐度最大化）与三条拒答约束 |
 | `wb_analyzer/analysis.py` | 整图自动检测（8 位粗检）与 `analyze_image` 两段式流水线、`BandMeasurement` |
 | `wb_analyzer/normalize.py` | 内参历史（带泳道身份）、背景口径与双条带策略、按泳道配对的归一化与 fold change、CSV 导入导出 |
-| `wb_analyzer/export.py` | 条带 CSV、标注预览图、发表级展示图与旁注说明文件、打印尺寸换算 |
+| `wb_analyzer/export.py` | 条带 CSV（原始灰度长表）、标注预览图、跨膜汇总长表/宽表、发表级展示图与旁注说明文件、打印尺寸换算 |
 | `wb_analyzer/cli.py` | `wb-analyze` 命令行入口 |
 
 界面（PySide6）：
@@ -725,6 +743,7 @@ $env:QT_QPA_PLATFORM = "offscreen"; pytest -q
 | `wb_analyzer/ui/canvas.py` | 图像画布：ROI 与手柄、分隔线、条带框、留白斜纹带、倾角参考线、框选与右键菜单、条带标签的降级排布 |
 | `wb_analyzer/ui/diagnostics_bar.py` | 画布上方的统一诊断条：ROI 自检 + 条带策略未生效 + 切分不足，按严重度排序，可展开、可忽略 |
 | `wb_analyzer/ui/figure_export_dialog.py` | 展示图导出选项对话框，以及导出后展示旁注内容的窗口 |
+| `wb_analyzer/ui/data_export_dialog.py` | 导出数据选项对话框：原始灰度（默认精简列）/ 完整统计列 / 历史长表 / 归一化 / 跨膜汇总 |
 | `wb_analyzer/ui/settings_dialog.py` | 界面设置对话框：字体大小、画布标注线宽、结果表列显示；非模态、即时生效、可恢复默认 |
 | `wb_analyzer/ui/prefs.py` | 界面偏好（`UiPrefs`）：取值范围与钳制、QSettings 读写、控件字号按倍数缩放 |
 | `wb_analyzer/ui/profile_panel.py` | 底部强度剖面（pyqtgraph）：左图为 ROI 列剖面、可拖分隔线，右图为逐泳道纵向剖面与积分区间；泳道标签的降级排布 |

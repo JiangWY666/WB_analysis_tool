@@ -60,6 +60,13 @@ class BandMeasurement:
     等价；单独给出是为了让用户看到「差多远」而不只是「过没过」。
     """
 
+    peak: float = 0.0
+    """条带窗口内、扣除背景后的峰值（每像素灰度）。
+
+    ROI 路径取剖面减基线后再除以条带宽度的最大值；局部背景路径取框内
+    ``max(signal - background, 0)`` 的最大值。0 表示未测量（占位框、旧数据）。
+    """
+
     @property
     def below_detection(self) -> bool:
         """积分没有越过 3σ 检出限——这个数值不能当成真实信号来用。"""
@@ -173,6 +180,8 @@ def measure_roi(
     else:
         integrated = float(np.maximum(roi_f - local_bg, 0).sum())
         saturated_fraction = float(np.mean(roi >= saturate_level))
+    residue = np.maximum((local_bg - roi_f) if dark_bands else (roi_f - local_bg), 0.0)
+    peak = round(float(residue.max()), 3) if residue.size else 0.0
     return BandMeasurement(
         lane=lane,
         band=band,
@@ -185,6 +194,7 @@ def measure_roi(
         background=round(local_bg, 3),
         integrated_density=round(integrated, 3),
         saturated_fraction=round(saturated_fraction, 4),
+        peak=peak,
     )
 
 
