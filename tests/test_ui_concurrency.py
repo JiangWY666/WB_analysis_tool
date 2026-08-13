@@ -4105,9 +4105,29 @@ def test_the_profile_panel_says_each_thing_once(qt_app):
         if label.text()
     ]
     assert sum(1 for t in texts if "双击" in t) == 0, (
-        f"剖面图标题之外还有一份操作说明：{texts}"
+        f"面板上又常驻了一份操作说明：{texts}"
     )
-    assert "双击加分隔线" in pp.COLUMN_TITLE, "说明本身不能丢，它在图标题里"
+    tip = panel._col_plot.toolTip()
+    assert "双击" in tip and "添加分隔线" in tip, (
+        f"说明本身不能丢，它挂在左图的 tooltip 里：{tip}"
+    )
+    close(window)
+
+
+def test_the_profile_axes_keep_their_labels_short(qt_app):
+    """标题与纵轴标签不塞括号解释：竖排文字每多一个字就多吃一列宽度。"""
+    window = make_window(qt_app)
+    window.show()
+    panel = window.profile_panel
+    qt_app.processEvents()
+    for text in (pp.COLUMN_TITLE, pp.LANE_TITLE_EMPTY, pp.COLUMN_Y_LABEL, pp.LANE_Y_LABEL):
+        assert "（" not in text and "(" not in text, f"又把解释塞回常驻文字里了：{text}"
+    # 两条纵轴口径不同，短名也得能区分开，否则读数会被当成同一回事
+    assert pp.COLUMN_Y_LABEL != pp.LANE_Y_LABEL
+    # 完整口径不许消失，它搬去了 tooltip
+    assert "平均" in panel._col_plot.toolTip()
+    assert "求和" in panel._lane_plot.toolTip()
+    assert "ROI 定量" in panel._lane_plot.toolTip(), "右图为什么是空的，得有地方说"
     close(window)
 
 
