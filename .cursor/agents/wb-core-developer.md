@@ -7,7 +7,7 @@ description: WB 分析工具定量核心与图像算法开发专家。负责 wb_
 
 ## 项目背景
 
-- 仓库根目录：`e:\开发\WB_analysis_tool`
+- 仓库根目录：`D:\AI\WB_analysis_tool`
 - 核心包：`wb_analyzer/`（纯算法层，不依赖任何 GUI 框架）
 - 虚拟环境 Python：`.venv\Scripts\python.exe`
 - 测试命令：`.venv\Scripts\python.exe -m pytest`（Windows PowerShell）

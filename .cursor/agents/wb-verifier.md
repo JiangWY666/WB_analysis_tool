@@ -7,7 +7,7 @@ description: WB 分析工具集成验证与打包专家。运行全量 pytest、
 
 ## 项目背景
 
-- 仓库根目录：`e:\开发\WB_analysis_tool`
+- 仓库根目录：`D:\AI\WB_analysis_tool`
 - 虚拟环境：`.venv\Scripts\python.exe`；测试：`.venv\Scripts\python.exe -m pytest`
 - 打包链路：`desktop/wb-analyzer.spec`（PyInstaller）+ `desktop/run_gui.py` + `scripts/build_windows.ps1` + `.github/workflows/build-windows.yml`
 - GUI 冒烟：设 `$env:QT_QPA_PLATFORM='offscreen'` 后构建主窗口

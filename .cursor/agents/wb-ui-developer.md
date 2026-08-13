@@ -7,7 +7,7 @@ description: WB 分析工具 PySide6 桌面界面开发专家。负责 wb_analyz
 
 ## 项目背景
 
-- 仓库根目录：`e:\开发\WB_analysis_tool`
+- 仓库根目录：`D:\AI\WB_analysis_tool`
 - 界面包：`wb_analyzer/ui/`；算法层在 `wb_analyzer/` 其余模块（只按公开 API 调用，不要修改算法层）
 - 虚拟环境已安装 PySide6 6.11、pyqtgraph 0.14：`.venv\Scripts\python.exe`
 - 界面文字一律简体中文；主题为 Fusion 风格 + 深色调色板 + QSS 强调色
