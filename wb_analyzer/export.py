@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,7 +33,16 @@ from .imageio import (
     clipping_fractions,
     resolve_display_mapping,
 )
-from .normalize import ORIGIN_UNKNOWN, BackgroundOrigin, coerce_origin
+from . import __version__
+from .normalize import (
+    ORIGIN_UNKNOWN,
+    AnalysisSession,
+    BackgroundOrigin,
+    BandPick,
+    RoiCheck,
+    _format_bands,
+    coerce_origin,
+)
 from .roi import RoiRect
 
 __all__ = [
@@ -45,13 +54,24 @@ __all__ = [
     "LAYER_SEPARATORS",
     "LOSSLESS_SUFFIXES",
     "MM_PER_INCH",
+    "SUMMARY_LONG_FIELDS",
+    "SUMMARY_VALUE_FOLD",
+    "SUMMARY_VALUE_NORMALIZED",
     "FigureExport",
     "PrintScale",
+    "SummaryExport",
+    "SummaryRow",
+    "WideCellGap",
+    "WideRow",
+    "WideTable",
+    "build_summary_rows",
+    "build_wide_table",
     "dpi_for_width_mm",
     "export_figure",
     "export_presentation_figure",
     "export_presentation_figures",
     "export_result",
+    "export_summary_tables",
     "max_print_width_mm",
     "print_scale",
 ]
@@ -151,6 +171,551 @@ def export_result(
         writer.writerows({**m.as_dict(), "origin": origin} for m in result.measurements)
     _write_image(preview_path, result.annotated_image, dpi=dpi, bgr=True)
     return csv_path, preview_path
+
+
+# --------------------------------------------------------------------- 汇总表
+
+
+SUMMARY_VALUE_FOLD = "fold_change"
+SUMMARY_VALUE_NORMALIZED = "normalized"
+
+SUMMARY_LONG_FIELDS = [
+    "group",
+    "lane",
+    "sample",
+    "target_name",
+    "target_membrane",
+    "target_membrane_path",
+    "target",
+    "target_origin",
+    "target_band_pick",
+    "target_bands",
+    "target_below_detection",
+    "target_roi_check",
+    "control_name",
+    "control_membrane",
+    "control_membrane_path",
+    "loading_control",
+    "loading_control_origin",
+    "loading_control_band_pick",
+    "loading_control_bands",
+    "loading_control_below_detection",
+    "control_roi_check",
+    "normalized",
+    "control_lane",
+    "fold_change",
+    "note",
+    "exported_at",
+    "app_version",
+]
+"""Column order of ``summary_long.csv``.
+
+``group`` / ``lane`` / ``sample`` lead because this file gets read by a human
+first. Both sides carry their own ``membrane`` and ``membrane_path``: once the
+loading control and its target live on different blots, "which two images was
+this ratio taken between" is the smallest fact that makes the number
+reproducible, and one membrane column would read as if they shared one.
+"""
+
+
+@dataclass(frozen=True)
+class SummaryRow:
+    """One row of the long table: group × lane × target protein."""
+
+    group: str
+    lane: int
+    sample: str
+    target_name: str
+    target_membrane: str
+    target_membrane_path: str
+    target: float | None
+    target_origin: BackgroundOrigin
+    target_band_pick: BandPick
+    target_bands: tuple[int, ...]
+    target_below_detection: bool
+    target_roi_check: RoiCheck
+    control_name: str
+    control_membrane: str
+    control_membrane_path: str
+    loading_control: float | None
+    loading_control_origin: BackgroundOrigin
+    loading_control_band_pick: BandPick
+    loading_control_bands: tuple[int, ...]
+    loading_control_below_detection: bool
+    control_roi_check: RoiCheck
+    normalized: float | None
+    control_lane: int
+    fold_change: float | None
+    note: str = ""
+
+    @property
+    def cell(self) -> tuple[str, int, str]:
+        """Which square of the wide table this row belongs in."""
+        return (self.group, self.lane, self.target_name)
+
+    def value(self, value_field: str = SUMMARY_VALUE_FOLD) -> float | None:
+        if value_field == SUMMARY_VALUE_FOLD:
+            return self.fold_change
+        if value_field == SUMMARY_VALUE_NORMALIZED:
+            return self.normalized
+        raise ValueError(
+            f"汇总表的取值只能是 {SUMMARY_VALUE_FOLD} 或 {SUMMARY_VALUE_NORMALIZED}，"
+            f"收到 {value_field!r}"
+        )
+
+    def as_dict(self, *, exported_at: str = "", app_version: str = "") -> dict[str, object]:
+        return {
+            "group": self.group,
+            "lane": self.lane,
+            "sample": self.sample,
+            "target_name": self.target_name,
+            "target_membrane": self.target_membrane,
+            "target_membrane_path": self.target_membrane_path,
+            "target": _number(self.target),
+            "target_origin": self.target_origin,
+            "target_band_pick": self.target_band_pick,
+            "target_bands": _format_bands(self.target_bands),
+            "target_below_detection": int(self.target_below_detection),
+            "target_roi_check": self.target_roi_check.as_field(),
+            "control_name": self.control_name,
+            "control_membrane": self.control_membrane,
+            "control_membrane_path": self.control_membrane_path,
+            "loading_control": _number(self.loading_control),
+            "loading_control_origin": self.loading_control_origin,
+            "loading_control_band_pick": self.loading_control_band_pick,
+            "loading_control_bands": _format_bands(self.loading_control_bands),
+            "loading_control_below_detection": int(self.loading_control_below_detection),
+            "control_roi_check": self.control_roi_check.as_field(),
+            "normalized": _number(self.normalized),
+            "control_lane": self.control_lane,
+            "fold_change": _number(self.fold_change),
+            "note": self.note,
+            "exported_at": exported_at,
+            "app_version": app_version,
+        }
+
+
+@dataclass(frozen=True)
+class WideCellGap:
+    """One empty square of the wide table, and why it is empty."""
+
+    group: str
+    lane: int
+    target_name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class WideRow:
+    group: str
+    lane: int
+    sample: str
+    values: dict[str, float | None] = field(default_factory=dict)
+    """Target name → value; missing or ``None`` means an empty cell."""
+
+
+@dataclass(frozen=True)
+class WideTable:
+    """Group × lane rows, one column per target protein.
+
+    No loading-control column, deliberately: an integrated density from the
+    actin blot cannot be compared with one from another blot, so plotting it
+    would be plotting exposure differences. The numbers are still in the long
+    table, where they are labelled with the membrane they came from.
+    """
+
+    targets: tuple[str, ...] = ()
+    rows: tuple[WideRow, ...] = ()
+    gaps: tuple[WideCellGap, ...] = ()
+    value_field: str = SUMMARY_VALUE_FOLD
+
+    @property
+    def header(self) -> list[str]:
+        return ["group", "lane", "sample", *self.targets]
+
+
+@dataclass(frozen=True)
+class SummaryExport:
+    """Everything the two tables and their sidecar came out as."""
+
+    long_path: Path
+    wide_path: Path
+    readme_path: Path | None
+    rows: tuple[SummaryRow, ...]
+    wide: WideTable
+    groups: tuple[str, ...]
+    warnings: tuple[str, ...]
+    generated_at: str
+    app_version: str
+
+    @property
+    def value_field(self) -> str:
+        return self.wide.value_field
+
+    def readme_text(self) -> str:
+        return _summary_readme_text(self)
+
+
+def _number(value: float | None) -> object:
+    return "" if value is None else value
+
+
+def build_summary_rows(
+    session: AnalysisSession, *, groups: Sequence[str] | None = None
+) -> list[SummaryRow]:
+    """Normalize every target of every group into long-table rows.
+
+    Each group is paired against its own loading control and its own reference
+    lane, which is what makes a multi-membrane experiment addable to one file:
+    the pairing unit is the group, not the session. Problems are collected in
+    :attr:`AnalysisSession.last_warnings`, as they are after
+    :meth:`~wb_analyzer.normalize.AnalysisSession.normalize_all`.
+    """
+    names = list(groups) if groups is not None else session.groups()
+    collected: list[str] = []
+    rows: list[SummaryRow] = []
+    for name in names:
+        group = session.canonical_group(name)
+        control = session.latest_loading_control(group)
+        targets = session.targets(group)
+        if not session.group_entries(group):
+            collected.append(f"分组“{group}”里没有数据。")
+            continue
+        if control is None:
+            for target in targets:
+                collected.append(
+                    f"“{target.name}”未能归一化：分组“{group}”还没有内参（Loading Control）"
+                )
+            continue
+        if not targets:
+            collected.append(f"分组“{group}”只有内参，还没有目标蛋白，汇总表里不会有这一组。")
+            continue
+        for target in targets:
+            try:
+                paired = session.normalize(target, control, warnings=collected)
+            except ValueError as exc:
+                collected.append(f"“{target.name}”未能归一化：{exc}")
+                continue
+            for row in paired:
+                rows.append(
+                    SummaryRow(
+                        group=row.group,
+                        lane=row.lane,
+                        sample=session.lane_label(row.group, row.lane),
+                        target_name=row.target_name,
+                        target_membrane=row.target_membrane,
+                        target_membrane_path=target.source,
+                        target=row.target,
+                        target_origin=row.target_origin,
+                        target_band_pick=row.target_band_pick,
+                        target_bands=row.target_bands,
+                        target_below_detection=row.target_below_detection,
+                        target_roi_check=row.target_roi_check,
+                        control_name=row.loading_control_name,
+                        control_membrane=row.loading_control_membrane,
+                        control_membrane_path=control.source,
+                        loading_control=row.loading_control,
+                        loading_control_origin=row.loading_control_origin,
+                        loading_control_band_pick=row.loading_control_band_pick,
+                        loading_control_bands=row.loading_control_bands,
+                        loading_control_below_detection=row.loading_control_below_detection,
+                        control_roi_check=row.loading_control_roi_check,
+                        normalized=row.normalized,
+                        control_lane=row.control_lane,
+                        fold_change=row.fold_change,
+                        note=row.note,
+                    )
+                )
+    session.last_warnings = collected
+    return _annotate_duplicate_cells(rows)
+
+
+def _annotate_duplicate_cells(rows: Sequence[SummaryRow]) -> list[SummaryRow]:
+    """Say in the long table's ``note`` why the wide table left a square blank.
+
+    Two records for one group × lane × protein — the same target quantified
+    off two membranes — is a question only the user can settle. The wide table
+    leaves the square empty and this note is where the reason lives, because
+    the wide table has nowhere to put one.
+    """
+    duplicates: dict[tuple[str, int, str], list[SummaryRow]] = {}
+    for row in rows:
+        duplicates.setdefault(row.cell, []).append(row)
+    out: list[SummaryRow] = []
+    for row in rows:
+        peers = duplicates[row.cell]
+        if len(peers) < 2:
+            out.append(row)
+            continue
+        membranes = "、".join(
+            dict.fromkeys(p.target_membrane or p.target_membrane_path or "未命名" for p in peers)
+        )
+        note = (
+            f"宽表该格留空：分组“{row.group}”泳道 {row.lane} 的“{row.target_name}”"
+            f"有 {len(peers)} 条记录（膜 {membranes}），宽表不做合并——"
+            "要不要合并是实验判断，软件不代做。"
+        )
+        out.append(replace(row, note=f"{row.note}；{note}" if row.note else note))
+    return out
+
+
+def _blank_reason(row: SummaryRow, value: str) -> str:
+    """Why one square has no number, in the terms of the column it is in."""
+    if row.note:
+        return row.note
+    if value == SUMMARY_VALUE_FOLD and row.normalized is not None:
+        # The ratio is fine, the reference it would be divided by is not — a
+        # per-column failure that the row's own note has no reason to mention.
+        return f"基准泳道 {row.control_lane} 本身没有比值，这一组的 fold change 都算不出来"
+    return "没有可用的数值"
+
+
+def build_wide_table(
+    rows: Sequence[SummaryRow], *, value: str = SUMMARY_VALUE_FOLD
+) -> WideTable:
+    """Pivot long rows into group × lane rows with one column per target.
+
+    The row key is ``group + lane``, never lane alone: two experiments both
+    have a lane 1, and merging them would put unrelated membranes on the same
+    line. Unrelated groups make the table sparse instead, which is honest and
+    which Prism reads without complaint.
+    """
+    if value not in (SUMMARY_VALUE_FOLD, SUMMARY_VALUE_NORMALIZED):
+        raise ValueError(
+            f"汇总表的取值只能是 {SUMMARY_VALUE_FOLD} 或 {SUMMARY_VALUE_NORMALIZED}，收到 {value!r}"
+        )
+    targets: list[str] = list(dict.fromkeys(row.target_name for row in rows))
+    # Groups in the order the experiments were entered, lanes in gel order —
+    # a target whose lanes start at 3 must not decide where lane 1 sits.
+    group_order: list[str] = list(dict.fromkeys(row.group for row in rows))
+    keys: list[tuple[str, int]] = sorted(
+        {(row.group, row.lane) for row in rows},
+        key=lambda key: (group_order.index(key[0]), key[1]),
+    )
+    by_cell: dict[tuple[str, int, str], list[SummaryRow]] = {}
+    samples: dict[tuple[str, int], str] = {}
+    for row in rows:
+        by_cell.setdefault(row.cell, []).append(row)
+        if row.sample:
+            samples.setdefault((row.group, row.lane), row.sample)
+
+    wide_rows: list[WideRow] = []
+    gaps: list[WideCellGap] = []
+    for group, lane in keys:
+        values: dict[str, float | None] = {}
+        for target in targets:
+            peers = by_cell.get((group, lane, target), [])
+            if not peers:
+                values[target] = None
+                gaps.append(
+                    WideCellGap(group, lane, target, f"分组“{group}”没有“{target}”的记录")
+                )
+                continue
+            if len(peers) > 1:
+                membranes = "、".join(
+                    dict.fromkeys(p.target_membrane or "未命名" for p in peers)
+                )
+                values[target] = None
+                gaps.append(
+                    WideCellGap(
+                        group,
+                        lane,
+                        target,
+                        f"该格对应 {len(peers)} 条记录（膜 {membranes}），未做合并",
+                    )
+                )
+                continue
+            number = peers[0].value(value)
+            values[target] = number
+            if number is None:
+                gaps.append(WideCellGap(group, lane, target, _blank_reason(peers[0], value)))
+        wide_rows.append(
+            WideRow(group=group, lane=lane, sample=samples.get((group, lane), ""), values=values)
+        )
+    return WideTable(
+        targets=tuple(targets),
+        rows=tuple(wide_rows),
+        gaps=tuple(gaps),
+        value_field=value,
+    )
+
+
+_SUMMARY_VALUE_LABELS = {
+    SUMMARY_VALUE_FOLD: "fold change（同分组内相对基准泳道的倍数，基准泳道 = 1）",
+    SUMMARY_VALUE_NORMALIZED: "normalized（目标 / 内参的比值，未再除以基准泳道）",
+}
+
+
+def _summary_readme_text(export: SummaryExport) -> str:
+    """The wide table's provenance, since the table itself carries none."""
+    wide = export.wide
+    lines: list[str] = [
+        "Western Blot 汇总表导出说明",
+        "本文件由 wb-gray-analyzer 自动生成，说明宽表里的数字是什么、空格为什么空。",
+        "",
+        f"宽表文件    {export.wide_path.name}",
+        f"长表文件    {export.long_path.name}",
+        f"生成时间    {export.generated_at}",
+        f"软件版本    {export.app_version}",
+        "",
+        "【表里的值】",
+        f"  数值口径    {_SUMMARY_VALUE_LABELS[wide.value_field]}",
+        "  计算方式    目标积分灰度 / 同泳道的内参积分灰度"
+        + ("，再除以基准泳道的同一比值" if wide.value_field == SUMMARY_VALUE_FOLD else ""),
+        "  行            一行 = 一个分组的一个泳道（分组 + 泳道才是行的身份，只有泳道号会把两次实验并成一行）",
+        "  列            一列 = 一个目标蛋白",
+        "  没有内参列  内参的绝对积分值不能跨膜比较，画出来没有意义；",
+        "              内参数值逐行保留在长表里，连同它来自哪张膜。",
+        "",
+        "【各分组的基准泳道】",
+    ]
+    seen_groups: list[str] = []
+    for row in export.rows:
+        if row.group not in seen_groups:
+            seen_groups.append(row.group)
+    for group in seen_groups:
+        # One lane per group: normalization never substitutes a different one,
+        # so every row of a group carries the same requested lane.
+        group_rows = [r for r in export.rows if r.group == group]
+        control_lane = group_rows[0].control_lane
+        at_reference = [r for r in group_rows if r.lane == control_lane]
+        if not at_reference:
+            # Not "nobody named this lane": there is no row here to carry a
+            # sample name because the lane has no data in this group at all,
+            # and that — not an empty sample column — is why every fold change
+            # below is blank. Blaming the sample name sends the reader off to
+            # fix the wrong thing.
+            lines.append(
+                f"  {group}    泳道 {control_lane}"
+                "（这一道在本组里没有数据，拿不到分母，这一组的 fold change 全部留空）"
+            )
+            continue
+        sample = next((r.sample for r in at_reference if r.sample), "")
+        suffix = f"（样品 {sample}）" if sample else "（这一道还没有样品名）"
+        lines.append(f"  {group}    泳道 {control_lane}{suffix}")
+        blocked = [
+            name
+            for name in dict.fromkeys(r.target_name for r in group_rows)
+            if all(r.normalized is None for r in at_reference if r.target_name == name)
+        ]
+        if blocked:
+            listed = "、".join(f"“{name}”" for name in blocked)
+            which = "这些列" if len(blocked) > 1 else "这一列"
+            lines.append(
+                f"  {group}    ↑ 这一道在{listed}上算不出比值，"
+                f"{which}的 fold change 全部留空（逐格理由见下）。"
+            )
+    if not seen_groups:
+        lines.append("  （本次没有可汇总的分组）")
+
+    lines += ["", "【本次用到的膜】"]
+    seen_membranes: set[tuple[str, str, str]] = set()
+    for row in export.rows:
+        for kind, name, membrane, check in (
+            ("内参", row.control_name, row.control_membrane, row.control_roi_check),
+            ("目标", row.target_name, row.target_membrane, row.target_roi_check),
+        ):
+            key = (row.group, kind, f"{name}@{membrane}")
+            if key in seen_membranes:
+                continue
+            seen_membranes.add(key)
+            verdict = check.summary or "（这次定量没有做 ROI 自检）"
+            lines.append(f"  {row.group}  {kind}  {name}  膜 {membrane or '未命名'}  {verdict}")
+    if not seen_membranes:
+        lines.append("  （本次没有可汇总的膜）")
+
+    lines += ["", "【空格是什么意思】"]
+    if wide.gaps:
+        lines += [
+            "  空格 = 这一格没有可填的数值，原因逐条列在下面。",
+            "  宽表不做任何聚合：一格对应多条记录时一律留空，合不合并是实验判断，软件不代做。",
+        ]
+        for gap in wide.gaps:
+            lines.append(
+                f"  {gap.group}  泳道 {gap.lane}  {gap.target_name}    {gap.reason}"
+            )
+    else:
+        lines.append("  本表没有空格：每个分组 × 泳道 × 目标蛋白都有一个数值。")
+
+    if export.warnings:
+        lines += ["", "【归一化时的提示】"]
+        lines += [f"  {text}" for text in export.warnings]
+    lines += [
+        "",
+        "【溯源】",
+        f"  每个数字的来源（两侧的膜名、膜文件路径、背景口径、条带取用、检出限）都在 {export.long_path.name} 里逐行记录。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def export_summary_tables(
+    session: AnalysisSession,
+    output_dir: str | Path,
+    *,
+    groups: Sequence[str] | None = None,
+    value: str = SUMMARY_VALUE_FOLD,
+    prefix: str = "summary",
+    write_readme: bool = True,
+    generated_at: str | None = None,
+) -> SummaryExport:
+    """Write ``summary_long.csv``, ``summary_wide.csv`` and the wide sidecar.
+
+    One experiment spans several membranes, so this is the table the whole
+    session adds up to — not the one group currently on screen, which is what
+    :func:`~wb_analyzer.normalize.export_normalized_csv` still writes.
+
+    The long table is the record: one row per group × lane × target, with both
+    sides' membrane, background convention, band pick and detection flag. The
+    wide table is the deliverable: group × lane rows and one column per
+    target, ready to paste into GraphPad / Prism. The sidecar exists because
+    the wide table carries no provenance of its own.
+    """
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    rows = build_summary_rows(session, groups=groups)
+    warnings = tuple(session.last_warnings)
+    if not rows:
+        raise ValueError(
+            "没有可导出的汇总数据：每个分组都需要一条内参和至少一个目标蛋白。"
+            + ("问题：" + "；".join(warnings) if warnings else "")
+        )
+    wide = build_wide_table(rows, value=value)
+    stamp = generated_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    long_path = output / f"{prefix}_long.csv"
+    with long_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_LONG_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row.as_dict(exported_at=stamp, app_version=__version__))
+
+    wide_path = output / f"{prefix}_wide.csv"
+    with wide_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(wide.header)
+        for row in wide.rows:
+            writer.writerow(
+                [row.group, row.lane, row.sample]
+                + [_number(row.values.get(name)) for name in wide.targets]
+            )
+
+    export = SummaryExport(
+        long_path=long_path,
+        wide_path=wide_path,
+        readme_path=None,
+        rows=tuple(rows),
+        wide=wide,
+        groups=tuple(dict.fromkeys(row.group for row in rows)),
+        warnings=warnings,
+        generated_at=stamp,
+        app_version=__version__,
+    )
+    if not write_readme:
+        return export
+    readme_path = output / f"{prefix}_wide_readme.txt"
+    readme_path.write_text(export.readme_text(), encoding="utf-8-sig")
+    return replace(export, readme_path=readme_path)
 
 
 # ----------------------------------------------------------------- 物理尺寸

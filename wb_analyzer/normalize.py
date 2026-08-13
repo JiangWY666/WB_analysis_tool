@@ -17,8 +17,10 @@ meaningless) and which bands of a multi-band lane were aggregated
 from __future__ import annotations
 
 import csv
-from collections.abc import Iterable, Sequence
+import os
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -136,6 +138,154 @@ def coerce_band_pick(value: object, *, strict: bool = True) -> BandPick:
 def band_pick_label(value: object) -> str:
     """Chinese label for a band pick."""
     return BAND_PICK_LABELS[coerce_band_pick(value, strict=False)]
+
+
+RoiCheckGrade = Literal["", "ok", "info", "warning", "error"]
+
+ROI_CHECK_UNKNOWN: RoiCheckGrade = ""
+ROI_CHECK_OK: RoiCheckGrade = "ok"
+ROI_CHECK_INFO: RoiCheckGrade = "info"
+ROI_CHECK_WARNING: RoiCheckGrade = "warning"
+ROI_CHECK_ERROR: RoiCheckGrade = "error"
+
+ROI_CHECK_LABELS: dict[str, str] = {
+    ROI_CHECK_UNKNOWN: "未自检",
+    ROI_CHECK_OK: "通过",
+    ROI_CHECK_INFO: "提示",
+    ROI_CHECK_WARNING: "警告",
+    ROI_CHECK_ERROR: "严重",
+}
+
+
+@dataclass(frozen=True)
+class RoiCheck:
+    """What the ROI self-check concluded about **one membrane's** quantification.
+
+    One per entry, not one per lane: the check is about where the ROI was
+    drawn, and that question is asked once for the whole image. Carrying it on
+    the entry is what lets a summary table months later say "this column came
+    off a membrane whose ROI was flagged" — by then the report object, the
+    image and the operator's memory are all gone.
+    """
+
+    grade: RoiCheckGrade = ROI_CHECK_UNKNOWN
+    """Machine-readable verdict. Empty means nobody ran the check."""
+
+    summary: str = ""
+    """:meth:`~wb_analyzer.roi_check.RoiQualityReport.summary` verbatim."""
+
+    @property
+    def recorded(self) -> bool:
+        return bool(self.grade or self.summary)
+
+    @property
+    def ok(self) -> bool:
+        return self.grade == ROI_CHECK_OK
+
+    @property
+    def label(self) -> str:
+        return ROI_CHECK_LABELS.get(self.grade, ROI_CHECK_LABELS[ROI_CHECK_UNKNOWN])
+
+    @classmethod
+    def from_report(cls, report: object) -> RoiCheck:
+        """Snapshot a :class:`~wb_analyzer.roi_check.RoiQualityReport`.
+
+        Duck-typed rather than imported: the quantification core has no reason
+        to depend on the diagnostics module just to store its one-line verdict.
+        """
+        if report is None:
+            return cls()
+        severity = getattr(report, "severity", None)
+        grade = ROI_CHECK_OK if severity is None else str(severity)
+        if grade not in ROI_CHECK_LABELS:
+            grade = ROI_CHECK_UNKNOWN
+        text = getattr(report, "summary", "")
+        summary = text() if callable(text) else str(text)
+        return cls(grade=grade, summary=summary.strip())  # type: ignore[arg-type]
+
+    def as_field(self) -> str:
+        """One CSV cell, ``grade: summary``.
+
+        The prefix is ASCII so the column can be filtered by machine; the
+        sentence behind it already states the verdict in Chinese, and the
+        Chinese sentences use a full-width colon, so splitting on the ASCII
+        one cannot cut a summary in half.
+        """
+        if not self.recorded:
+            return ""
+        if not self.summary:
+            return self.grade
+        if not self.grade:
+            return self.summary
+        return f"{self.grade}: {self.summary}"
+
+    @classmethod
+    def parse(cls, value: object) -> RoiCheck:
+        """Inverse of :meth:`as_field`; unrecognised text is kept, ungraded."""
+        text = str(value or "").strip()
+        if not text:
+            return cls()
+        head, sep, tail = text.partition(":")
+        key = head.strip().lower()
+        if sep and key and key in ROI_CHECK_LABELS:
+            return cls(grade=key, summary=tail.strip())  # type: ignore[arg-type]
+        return cls(grade=ROI_CHECK_UNKNOWN, summary=text)
+
+
+def coerce_roi_check(value: object) -> RoiCheck:
+    """Accept a :class:`RoiCheck`, a report, a serialized cell, or nothing."""
+    if value is None:
+        return RoiCheck()
+    if isinstance(value, RoiCheck):
+        return value
+    if isinstance(value, str):
+        return RoiCheck.parse(value)
+    return RoiCheck.from_report(value)
+
+
+def membrane_from_source(source: object) -> str:
+    """Default membrane name: the file name of ``source``, without extension."""
+    text = str(source or "").strip()
+    if not text:
+        return ""
+    try:
+        return Path(text).stem
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return text
+
+
+@lru_cache(maxsize=512)
+def _resolved_source(text: str) -> str:
+    try:
+        resolved = str(Path(text).expanduser().resolve())
+    except (OSError, ValueError, RuntimeError):
+        # A path the OS will not look at (a device name, a dead network share)
+        # still has an identity; comparing the text beats refusing to compare.
+        resolved = text
+    # normcase folds case and separators on Windows and is a no-op on POSIX,
+    # which is exactly the distinction that matters: one filesystem says
+    # X.TIF and x.tif are one file, the other says they are two.
+    return os.path.normcase(resolved)
+
+
+def source_key(source: object) -> str:
+    r"""Identity of the file behind ``source``, **for comparison only**.
+
+    ``upsert(key_on_source=True)`` treats the source as part of a membrane's
+    identity, so ``D:\a\x.tif`` and ``d:/a/x.tif`` have to be one membrane and
+    not two — otherwise "keep both" quietly produces a second record of a
+    membrane the user only added once. Relative paths (hand-edited CSVs) are
+    resolved against the working directory for the same reason.
+
+    Comparison only: entries keep the exact path string they were handed, so
+    nothing that gets written to a CSV changes shape here.
+
+    An empty source stays empty. An image built from an array has no file, and
+    "no file" is a different question from "which file" — every such entry
+    shares the one key, which is what made them interchangeable before too.
+    """
+    text = str(source or "").strip()
+    return _resolved_source(text) if text else ""
 
 
 @dataclass(frozen=True)
@@ -310,9 +460,32 @@ class QuantEntry:
     used_bands: list[list[int]] = field(default_factory=list)
     """Band numbers actually summed into each value, aligned with :attr:`lanes`."""
 
+    membrane: str = ""
+    """Human-readable name of the membrane these numbers were measured on.
+
+    Defaults to the file stem of :attr:`source` (filled in by
+    :meth:`AnalysisSession.upsert`) and can be renamed afterwards. Stored
+    rather than derived on demand: one experiment routinely spans several
+    membranes, and two of them can perfectly well be called ``actin.tif`` in
+    two different folders — in a summary table that ambiguity is an identity
+    error, not a cosmetic one.
+    """
+
+    roi_check: RoiCheck = field(default_factory=RoiCheck)
+    """The ROI self-check verdict for *this membrane's* quantification.
+
+    One per entry, not one per lane. Empty when nobody ran the check (whole
+    image auto-detection, CSV import).
+    """
+
     @property
     def lane_count(self) -> int:
         return len(self.intensities)
+
+    @property
+    def label(self) -> str:
+        """``Actin（膜 actin1）`` — how warnings and tables name this entry."""
+        return f"{self.name}（膜 {self.membrane}）" if self.membrane else self.name
 
     @property
     def has_lane_identity(self) -> bool:
@@ -391,6 +564,8 @@ class QuantEntry:
         source: str = "",
         doc_version: int = -1,
         origin: object = ORIGIN_UNKNOWN,
+        membrane: str = "",
+        roi_check: object = None,
     ) -> QuantEntry:
         return cls(
             kind=kind,
@@ -407,6 +582,10 @@ class QuantEntry:
             band_pick=coerce_band_pick(series.band_pick),
             bands=list(series.bands),
             used_bands=[list(u) for u in series.used_bands],
+            membrane=str(membrane or "").strip() or membrane_from_source(source),
+            # A RoiQualityReport, a RoiCheck or nothing: the GUI hands over
+            # whichever it is holding without a conversion step it could skip.
+            roi_check=coerce_roi_check(roi_check),
         )
 
 
@@ -435,20 +614,405 @@ class NormalizedRow:
     target_bands: tuple[int, ...] = ()
     """Which bands of this lane each side actually summed."""
 
+    loading_control_membrane: str = ""
+    target_membrane: str = ""
+    """Which membrane each side came off.
+
+    Both sides, always: once a loading control and its target live on separate
+    membranes, "which two images produced this ratio" is the smallest fact
+    that makes the number reproducible, and a single membrane column would
+    read as if the numerator and denominator shared one.
+    """
+
+    loading_control_below_detection: bool = False
+    target_below_detection: bool = False
+    """Whether each side cleared the detection limit in this lane.
+
+    A column of its own rather than a phrase inside :attr:`note`: ``note``
+    holds one reason at a time, so a lane that is both undetectable *and*
+    divided by a zero control would otherwise lose one of the two facts — and
+    no downstream script can read the Chinese either way.
+    """
+
+    loading_control_roi_check: RoiCheck = field(default_factory=RoiCheck)
+    target_roi_check: RoiCheck = field(default_factory=RoiCheck)
+    """Each side's membrane-level ROI verdict, carried through to the CSV."""
+
+    control_lane: int = 0
+    """Lane this row's :attr:`fold_change` is measured against (0 = unstated).
+
+    Recorded per row because the reference lane belongs to the group, not to
+    the session: two experiments in one file can legitimately use different
+    ones, and a fold change whose denominator is unnamed is not interpretable.
+
+    Always the lane that was *asked for*. Normalization never substitutes a
+    different one — when the requested lane has nothing to pair,
+    :attr:`fold_change` is empty and :attr:`note` says so, because switching
+    the reference silently switches which sample counts as 1.
+    """
+
+
+@dataclass(frozen=True)
+class MembraneStatus:
+    """One membrane's contribution to a group, as the UI would announce it."""
+
+    kind: Kind
+    name: str
+    membrane: str
+    source: str
+    lanes: tuple[int, ...]
+    missing_lanes: tuple[int, ...]
+    """Lanes other membranes of this group have and this one does not."""
+
+    roi_check: RoiCheck = field(default_factory=RoiCheck)
+
+    @property
+    def label(self) -> str:
+        return f"{self.name}（膜 {self.membrane}）" if self.membrane else self.name
+
+
+@dataclass(frozen=True)
+class GroupStatus:
+    """Whether one group (= one experiment) is ready to be normalized.
+
+    A group spans several membranes — one loading control plus N targets — and
+    the questions the interface has to answer before the user closes an image
+    ("is there an internal control yet?", "which lanes is this membrane
+    missing?") all have to be answerable *without* running normalization,
+    which is the only place that used to find out.
+    """
+
+    group: str
+    membranes: tuple[MembraneStatus, ...] = ()
+    lanes: tuple[int, ...] = ()
+    """Every lane number appearing on any membrane of the group."""
+
+    control_lane: int = 1
+    lane_labels: dict[int, str] = field(default_factory=dict)
+
+    @property
+    def loading_controls(self) -> tuple[MembraneStatus, ...]:
+        return tuple(m for m in self.membranes if m.kind == "loading_control")
+
+    @property
+    def targets(self) -> tuple[MembraneStatus, ...]:
+        return tuple(m for m in self.membranes if m.kind == "target")
+
+    @property
+    def has_loading_control(self) -> bool:
+        return bool(self.loading_controls)
+
+    @property
+    def target_count(self) -> int:
+        return len(self.targets)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.membranes
+
+    @property
+    def control_lane_missing(self) -> bool:
+        """Whether the reference lane appears nowhere in this group.
+
+        Narrower than :attr:`targets_without_fold_change`, and kept separate on
+        purpose: "does this lane exist here at all" is a different question
+        from "will anything lose its fold change".
+        """
+        return bool(self.lanes) and self.control_lane not in self.lanes
+
+    @property
+    def targets_without_fold_change(self) -> tuple[str, ...]:
+        """Targets the reference lane cannot produce a fold change for.
+
+        One field, one answer. Pairing happens per target against the loading
+        control normalization would use (the last one added), so the union in
+        :attr:`lanes` is too coarse to answer this: a reference lane that sits
+        on the control membrane but is missing from one target still costs
+        *that* target every fold change, and making the interface combine two
+        sentences to notice is how it gets missed.
+
+        Structural only — it reads lane numbers, not intensities, so a
+        reference lane whose control integrates to zero is not predictable
+        here. That one surfaces as a warning during normalization.
+        """
+        if not self.targets or not self.has_loading_control:
+            return ()
+        control = self.loading_controls[-1]
+        if self.control_lane not in control.lanes:
+            return tuple(m.name for m in self.targets)
+        return tuple(m.name for m in self.targets if self.control_lane not in m.lanes)
+
+    @property
+    def unnamed_lanes(self) -> tuple[int, ...]:
+        return tuple(n for n in self.lanes if not self.lane_labels.get(n, "").strip())
+
+    @property
+    def problems(self) -> tuple[str, ...]:
+        """Everything worth telling the user right now, one sentence each."""
+        issues: list[str] = []
+        if self.is_empty:
+            return (f"分组“{self.group}”里还没有任何数据。",)
+        if not self.has_loading_control:
+            names = "、".join(m.name for m in self.targets)
+            issues.append(
+                f"分组“{self.group}”已经有 {self.target_count} 个目标蛋白（{names}），"
+                "但还没有内参：请打开内参膜定量并加为内参，否则这一组算不出比值。"
+            )
+        elif len(self.loading_controls) > 1:
+            listed = "、".join(m.label for m in self.loading_controls)
+            issues.append(
+                f"分组“{self.group}”里有 {len(self.loading_controls)} 条内参（{listed}），"
+                f"归一化默认取最后加入的“{self.loading_controls[-1].label}”。"
+                "如果这两条内参各管一部分泳道，请把它们拆成两个分组。"
+            )
+        if self.has_loading_control and not self.targets:
+            issues.append(f"分组“{self.group}”只有内参，还没有目标蛋白。")
+        for membrane in self.membranes:
+            if membrane.missing_lanes:
+                missing = "、".join(str(n) for n in membrane.missing_lanes)
+                issues.append(
+                    f"{membrane.label}缺泳道 {missing}（本组共 {len(self.lanes)} 道），"
+                    "这些泳道在这张膜上不会有数值。"
+                )
+        # The reference lane's consequence gets exactly one sentence, whichever
+        # way it fails: nothing above says it, and the reader should not have to
+        # assemble it out of two other lines.
+        blocked = self.targets_without_fold_change
+        if self.control_lane_missing:
+            issues.append(
+                f"基准泳道 {self.control_lane} 不在本组任何一张膜上"
+                f"（本组泳道 {'、'.join(str(n) for n in self.lanes)}），"
+                "这一组的 fold change 会全部留空——软件不会替你换一道当基准。"
+            )
+        elif blocked and self.control_lane not in self.loading_controls[-1].lanes:
+            issues.append(
+                f"内参“{self.loading_controls[-1].label}”上没有基准泳道 {self.control_lane}，"
+                "这一组所有目标的 fold change 都会留空——"
+                "请换一道基准，或补上内参膜这一道的定量。"
+            )
+        elif blocked:
+            listed = "、".join(f"“{name}”" for name in blocked)
+            issues.append(
+                f"基准泳道 {self.control_lane} 不在{listed}上，"
+                f"{listed}的 fold change 会全部留空——"
+                "请换一道两边都有的基准泳道，或补上这张膜这一道的定量。"
+            )
+        unnamed = self.unnamed_lanes
+        if unnamed:
+            issues.append(
+                f"泳道 {'、'.join(str(n) for n in unnamed)} 还没有样品名，"
+                "汇总表的 sample 列会是空的。"
+            )
+        return tuple(issues)
+
+    def summary(self) -> str:
+        """One Chinese line for a status bar."""
+        if self.is_empty:
+            return f"分组“{self.group}”：还没有数据。"
+        control = (
+            "、".join(m.label for m in self.loading_controls)
+            if self.has_loading_control
+            else "缺内参"
+        )
+        targets = "、".join(m.name for m in self.targets) or "还没有目标蛋白"
+        text = (
+            f"分组“{self.group}”：内参 {control}；目标 {targets}；"
+            f"{len(self.lanes)} 个泳道，基准泳道 {self.control_lane}。"
+        )
+        problems = self.problems
+        if problems:
+            text += f" ⚠ {len(problems)} 项待确认。"
+        return text
+
 
 class AnalysisSession:
-    """In-memory history of quantified loading controls and targets."""
+    """In-memory history of quantified loading controls and targets.
+
+    A *group* is one experiment, and an experiment spans several membranes:
+    the loading control is photographed on its own blot, each target on
+    another. What ties them together is the lane numbering — lane 1 is the
+    same sample on every membrane of the experiment — which is exactly why
+    :attr:`lane_labels` and :attr:`control_lanes` are keyed by group rather
+    than by membrane. Filling a sample name once covers all N membranes, and a
+    group whose membranes disagree about which lanes exist is a group with a
+    real problem worth surfacing (see :meth:`group_status`).
+    """
 
     def __init__(self) -> None:
         self.entries: list[QuantEntry] = []
         self.last_warnings: list[str] = []
         """Human-readable problems found by the most recent normalize() call."""
 
+        self.lane_labels: dict[str, dict[int, str]] = {}
+        """``group -> lane -> sample name``. Use the accessors, not the dict.
+
+        Experimental data, not a preference: these names end up as the axis
+        labels of a published figure, so they must never be restored from
+        somewhere the user did not put them (a settings store would happily
+        carry last week's samples into this week's experiment). They travel
+        with the loading-control CSV instead, where importing them is an
+        explicit act.
+        """
+
+        self.control_lanes: dict[str, int] = {}
+        """``group -> reference lane`` for fold change. One per experiment."""
+
+        self.default_control_lane: int = 1
+        """Reference lane for groups that never set their own."""
+
     def clear(self) -> None:
         self.entries.clear()
         self.last_warnings.clear()
+        # Sample names and reference lanes describe *this* experiment; leaving
+        # them behind is how the next experiment silently inherits the wrong
+        # sample names. The session-wide default is a setting, so it stays.
+        self.lane_labels.clear()
+        self.control_lanes.clear()
 
-    def upsert(self, entry: QuantEntry) -> None:
+    # ------------------------------------------------------------ 分组数据
+
+    @staticmethod
+    def canonical_group(group: str) -> str:
+        """The group key an empty or padded name resolves to."""
+        return group.strip() or "默认"
+
+    def groups(self) -> list[str]:
+        """Groups that have data, in the order they first appeared."""
+        seen: list[str] = []
+        for entry in self.entries:
+            if entry.group not in seen:
+                seen.append(entry.group)
+        return seen
+
+    def group_entries(self, group: str) -> list[QuantEntry]:
+        group = self.canonical_group(group)
+        return [e for e in self.entries if e.group == group]
+
+    def group_lanes(self, group: str) -> list[int]:
+        """Every lane number appearing on any membrane of the group."""
+        lanes: set[int] = set()
+        for entry in self.group_entries(group):
+            lanes.update(entry.lane_numbers)
+        return sorted(lanes)
+
+    def set_lane_label(self, group: str, lane: int, sample: str) -> None:
+        """Name the sample in one lane of one experiment. Empty clears it."""
+        group = self.canonical_group(group)
+        lane = int(lane)
+        sample = str(sample or "").strip()
+        labels = self.lane_labels.setdefault(group, {})
+        if sample:
+            labels[lane] = sample
+        else:
+            labels.pop(lane, None)
+        if not labels:
+            self.lane_labels.pop(group, None)
+
+    def set_lane_labels(
+        self, group: str, labels: Mapping[int, str], *, replace: bool = True
+    ) -> None:
+        """Bulk form of :meth:`set_lane_label` (a table editor, a CSV import)."""
+        group = self.canonical_group(group)
+        if replace:
+            self.lane_labels.pop(group, None)
+        for lane, sample in labels.items():
+            self.set_lane_label(group, lane, sample)
+
+    def lane_label(self, group: str, lane: int) -> str:
+        """Sample name of one lane, or ``""`` when nobody named it."""
+        return self.lane_labels.get(self.canonical_group(group), {}).get(int(lane), "")
+
+    def lane_labels_of(self, group: str) -> dict[int, str]:
+        """Copy of one group's sample names, keyed by lane."""
+        return dict(self.lane_labels.get(self.canonical_group(group), {}))
+
+    def set_control_lane(self, group: str, lane: int) -> None:
+        """Set the fold-change reference lane of one experiment."""
+        lane = int(lane)
+        if lane < 1:
+            raise ValueError(f"基准泳道必须是正整数，收到 {lane}")
+        self.control_lanes[self.canonical_group(group)] = lane
+
+    def control_lane_of(self, group: str, default: int | None = None) -> int:
+        """Reference lane in force for a group.
+
+        The group's own setting wins; ``default`` (then
+        :attr:`default_control_lane`) only covers groups that never set one.
+        """
+        fallback = self.default_control_lane if default is None else int(default)
+        return int(self.control_lanes.get(self.canonical_group(group), fallback))
+
+    def forget_group(self, group: str) -> None:
+        """Drop a group's sample names and reference lane.
+
+        Deliberately not wired to entry deletion: the GUI's undo restores the
+        entry list wholesale, and labels quietly discarded by a delete would
+        not come back with it.
+        """
+        group = self.canonical_group(group)
+        self.lane_labels.pop(group, None)
+        self.control_lanes.pop(group, None)
+
+    def group_status(self, group: str) -> GroupStatus:
+        """Everything the interface needs to nag about, without normalizing."""
+        group = self.canonical_group(group)
+        entries = self.group_entries(group)
+        lanes = self.group_lanes(group)
+        all_lanes = set(lanes)
+        membranes = tuple(
+            MembraneStatus(
+                kind=entry.kind,
+                name=entry.name,
+                membrane=entry.membrane,
+                source=entry.source,
+                lanes=tuple(entry.lane_numbers),
+                missing_lanes=tuple(sorted(all_lanes - set(entry.lane_numbers))),
+                roi_check=entry.roi_check,
+            )
+            for entry in entries
+        )
+        return GroupStatus(
+            group=group,
+            membranes=membranes,
+            lanes=tuple(lanes),
+            control_lane=self.control_lane_of(group),
+            lane_labels=self.lane_labels_of(group),
+        )
+
+    # ------------------------------------------------------------ 记录管理
+
+    def conflicting_entries(self, entry: QuantEntry) -> list[QuantEntry]:
+        """Existing records this one would overwrite **from another membrane**.
+
+        Empty means :meth:`upsert` is unambiguous — either nothing matches, or
+        what matches came off the same file and is simply being re-measured.
+        A non-empty result is the interface's cue to ask the one question the
+        core cannot answer: is this the same membrane exposed twice (overwrite)
+        or a second membrane of the same experiment (keep both)?
+        """
+        key = (entry.kind, entry.name.strip(), self.canonical_group(entry.group))
+        source = source_key(entry.source)
+        return [
+            existing
+            for existing in self.entries
+            if (existing.kind, existing.name, existing.group) == key
+            and source_key(existing.source) != source
+        ]
+
+    def upsert(self, entry: QuantEntry, *, key_on_source: bool = False) -> None:
+        """Store one membrane's quantification, replacing what it supersedes.
+
+        The key is ``(kind, name, group)``: re-quantifying a membrane and
+        adding it again updates the record in place, which is what a second
+        exposure of the same blot (``actin1`` / ``actin1(1)``) should do.
+
+        ``key_on_source`` puts the file path in the key as well, so a *second*
+        membrane carrying the same protein in the same experiment is kept
+        alongside the first instead of replacing it. Only the interface can
+        tell those two situations apart, so it is a parameter and not a guess.
+        Keeping both is only safe because :meth:`normalize` refuses to pick
+        between two loading controls quietly — see the warning it raises there.
+        """
         if not entry.name.strip():
             raise ValueError("蛋白名称不能为空")
         if not entry.intensities:
@@ -467,11 +1031,11 @@ class AnalysisSession:
                 f"采用条带记录数量（{len(used_bands)}）与强度数量"
                 f"（{len(entry.intensities)}）不一致"
             )
-        key = (entry.kind, entry.name.strip(), entry.group.strip() or "默认")
+        key = (entry.kind, entry.name.strip(), self.canonical_group(entry.group))
         normalized = QuantEntry(
             kind=entry.kind,
             name=entry.name.strip(),
-            group=entry.group.strip() or "默认",
+            group=self.canonical_group(entry.group),
             intensities=[float(v) for v in entry.intensities],
             backgrounds=[float(v) for v in entry.backgrounds],
             mean_intensities=[float(v) for v in entry.mean_intensities],
@@ -483,12 +1047,39 @@ class AnalysisSession:
             band_pick=coerce_band_pick(entry.band_pick),
             bands=list(entry.bands),
             used_bands=used_bands,
+            membrane=str(entry.membrane or "").strip() or membrane_from_source(entry.source),
+            roi_check=coerce_roi_check(entry.roi_check),
         )
-        for index, existing in enumerate(self.entries):
-            if (existing.kind, existing.name, existing.group) == key:
-                self.entries[index] = normalized
-                return
+        matches = [
+            index
+            for index, existing in enumerate(self.entries)
+            if (existing.kind, existing.name, existing.group) == key
+        ]
+        source = source_key(normalized.source)
+        same_source = [i for i in matches if source_key(self.entries[i].source) == source]
+        if key_on_source:
+            matches = same_source
+        elif len(matches) > 1:
+            # Several membranes already carry this protein and the caller did
+            # not say which one it is replacing. Overwriting the one that came
+            # off the same file is the only reading that cannot invent a
+            # record claiming to be from a membrane it never touched.
+            matches = same_source or matches
+        if matches:
+            self.entries[matches[0]] = normalized
+            return
         self.entries.append(normalized)
+
+    def set_membrane(self, index: int, membrane: str) -> QuantEntry:
+        """Rename one entry's membrane. The file it came from does not change."""
+        if not 0 <= index < len(self.entries):
+            raise IndexError(f"历史记录第 {index} 行不存在")
+        entry = self.entries[index]
+        updated = replace(
+            entry, membrane=str(membrane or "").strip() or membrane_from_source(entry.source)
+        )
+        self.entries[index] = updated
+        return updated
 
     def remove_at(self, index: int) -> None:
         if 0 <= index < len(self.entries):
@@ -523,6 +1114,13 @@ class AnalysisSession:
         return [e for e in items if e.group == group]
 
     def latest_loading_control(self, group: str) -> QuantEntry | None:
+        """The loading control :meth:`normalize` would use for this group.
+
+        "Latest" is a tie-break, not a decision: when an experiment really did
+        run two gels with a loading control each, only the user knows which
+        one belongs to a given target. :meth:`normalize` says out loud which
+        one it took whenever there is more than one to take.
+        """
         matches = self.loading_controls(group)
         return matches[-1] if matches else None
 
@@ -530,7 +1128,7 @@ class AnalysisSession:
         self,
         target: QuantEntry,
         loading_control: QuantEntry | None = None,
-        control_lane: int = 1,
+        control_lane: int | None = None,
         *,
         warnings: list[str] | None = None,
     ) -> list[NormalizedRow]:
@@ -549,6 +1147,9 @@ class AnalysisSession:
         change built from one is off by an unknown factor. Refusing here rather
         than warning is deliberate: a warning is something the user can click
         past, and there is no reading of this number that would be right.
+
+        ``control_lane`` defaults to the group's own reference lane
+        (:meth:`control_lane_of`); passing a number overrides it for this call.
         """
         sink = self.last_warnings if warnings is None else warnings
         if warnings is None:
@@ -556,6 +1157,29 @@ class AnalysisSession:
         lc = loading_control or self.latest_loading_control(target.group)
         if lc is None:
             raise ValueError(f"分组“{target.group}”还没有内参（Loading Control）")
+
+        # Two loading controls in one experiment means two gels, and a target
+        # from gel A divided by the actin of gel B produces a number that looks
+        # exactly like a real one. The core cannot tell that apart from the
+        # same membrane exposed twice, so it refuses to be quiet about it: this
+        # warning is the only thing standing between "keep both" and a silently
+        # wrong denominator.
+        #
+        # Split in two on purpose. The group-level half is one sentence however
+        # many targets get normalized against it — five near-identical
+        # paragraphs is how a warning that matters ends up skipped — and each
+        # target adds only the one fact that is its own.
+        controls = self.loading_controls(target.group)
+        if len(controls) > 1:
+            listed = "、".join(e.label for e in controls)
+            _append_once(
+                sink,
+                f"分组“{target.group}”里有 {len(controls)} 条内参：{listed}。"
+                "归一化默认取最后加入的那一条。两块胶各带一条内参时它们各管一部分泳道，"
+                "配错了分母数字照样算得出来——请确认每个目标配的是它所在那块胶的内参，"
+                "或把两块胶拆成两个分组；如果这只是同一张膜的两次曝光，删掉多余的一条即可。",
+            )
+            sink.append(f"“{target.name}”用的是内参“{lc.label}”。")
 
         target_values = target.value_by_lane()
         lc_values = lc.value_by_lane()
@@ -633,12 +1257,36 @@ class AnalysisSession:
             if ratios[lane] is None:
                 sink.append(f"泳道 {lane}：内参强度为 0，无法作分母。")
 
-        control = int(control_lane)
-        if control not in ratios:
-            fallback = shared[int(np_clip_index(control - 1, len(shared)))]
-            sink.append(f"对照泳道 {control} 不在可配对泳道中，已改用泳道 {fallback}。")
-            control = fallback
+        control = (
+            self.control_lane_of(target.group) if control_lane is None else int(control_lane)
+        )
         control_ratio = ratios.get(control)
+        # No guess to make here. "Lane 1" means "the WT sample" to whoever set
+        # it; quietly using lane 2 instead swaps the denominator for a
+        # different sample and every fold change in the group comes out
+        # plausible and wrong — the one failure this module exists to prevent.
+        # The ratios themselves are unaffected and still exported, so refusing
+        # costs only the quantity that depends on a choice nobody validly made.
+        fold_note = ""
+        if control not in ratios:
+            pairable = "、".join(str(n) for n in shared)
+            sink.append(
+                f"基准泳道 {control} 在“{target.name}”与内参“{lc.name}”之间没有可配对的数据"
+                f"（可配对的是泳道 {pairable}），这一组的 fold change 全部留空。"
+                "请把基准泳道改成其中一道，或补上这一道的定量——"
+                "软件不会替你挑一道当基准，那等于替你换掉“以哪个样品为 1”。"
+            )
+            fold_note = f"基准泳道 {control} 没有可配对的数据，fold change 无法计算"
+        elif control_ratio is None and not cross_origin:
+            # The lane is there, its ratio is not: a control that integrates to
+            # nothing. Same consequence for the whole group, different cause —
+            # and the per-lane "内参强度为 0" warning does not say that the
+            # consequence reaches every other lane's fold change.
+            sink.append(
+                f"基准泳道 {control} 的比值算不出来（内参“{lc.name}”在这一道上强度为 0），"
+                f"“{target.name}”这一组的 fold change 全部留空。"
+            )
+            fold_note = f"基准泳道 {control} 没有比值，fold change 无法计算"
 
         # Only entries that actually know their lane numbers get rows for the
         # lanes that could not be paired; a legacy positional caller keeps the
@@ -668,6 +1316,11 @@ class AnalysisSession:
                 note = "低于检出限"
             elif ratio is None:
                 note = "内参强度为 0"
+            elif fold_note:
+                # Last: this row's ratio is fine, only the fold change is
+                # missing. Rows that already carry a problem keep theirs — one
+                # note, one reason, and the group-level fact is in the warnings.
+                note = fold_note
             fold = None
             if ratio is not None and control_ratio is not None and control_ratio > 0:
                 fold = round(ratio / control_ratio, 6)
@@ -688,17 +1341,36 @@ class AnalysisSession:
                     target_band_pick=coerce_band_pick(target.band_pick, strict=False),
                     loading_control_bands=tuple(lc_used.get(lane, ())),
                     target_bands=tuple(target_used.get(lane, ())),
+                    loading_control_membrane=lc.membrane,
+                    target_membrane=target.membrane,
+                    loading_control_below_detection=lane in weak_lc,
+                    target_below_detection=lane in weak_target,
+                    loading_control_roi_check=lc.roi_check,
+                    target_roi_check=target.roi_check,
+                    control_lane=control,
                 )
             )
         return rows
 
-    def normalize_all(self, control_lane: int = 1) -> list[NormalizedRow]:
+    def normalize_all(self, control_lane: int | None = None) -> list[NormalizedRow]:
+        """Normalize every target, each against its own group's reference lane.
+
+        ``control_lane`` is only the default for groups that never set one of
+        their own (:meth:`set_control_lane`). One reference lane for the whole
+        session was defensible while a session held one membrane; across an
+        experiment's worth of membranes the reference belongs to the group,
+        which is the unit the lanes are paired in.
+        """
         rows: list[NormalizedRow] = []
         collected: list[str] = []
         for target in self.targets():
             try:
                 rows.extend(
-                    self.normalize(target, control_lane=control_lane, warnings=collected)
+                    self.normalize(
+                        target,
+                        control_lane=self.control_lane_of(target.group, control_lane),
+                        warnings=collected,
+                    )
                 )
             except ValueError as exc:
                 collected.append(f"“{target.name}”未能归一化：{exc}")
@@ -706,6 +1378,14 @@ class AnalysisSession:
         return rows
 
     def export_loading_control_csv(self, path: str | Path, group: str | None = None) -> Path:
+        """Write the loading controls, sample names included.
+
+        ``sample`` rides along because lane naming is experimental data with
+        nowhere else to live: the next experiment usually loads the samples in
+        the same order, and this file is how that naming comes back — by an
+        explicit import, never by a settings store that would resurrect it
+        uninvited.
+        """
         path = Path(path)
         controls = self.loading_controls(group)
         if not controls:
@@ -714,14 +1394,17 @@ class AnalysisSession:
             "kind",
             "name",
             "group",
+            "sample",
             "lane",
             "integrated_density",
             "background",
             "mean_intensity",
             "source",
+            "membrane",
             "origin",
             "band_pick",
             "bands_used",
+            "roi_check",
         ]
         with path.open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
@@ -742,14 +1425,17 @@ class AnalysisSession:
                             "kind": entry.kind,
                             "name": entry.name,
                             "group": entry.group,
+                            "sample": self.lane_label(entry.group, lane),
                             "lane": lane,
                             "integrated_density": intensity,
                             "background": bg,
                             "mean_intensity": mean,
                             "source": entry.source,
+                            "membrane": entry.membrane,
                             "origin": coerce_origin(entry.origin, strict=False),
                             "band_pick": coerce_band_pick(entry.band_pick, strict=False),
                             "bands_used": _format_bands(used_by_lane.get(lane, [])),
+                            "roi_check": entry.roi_check.as_field(),
                         }
                     )
         return path
@@ -762,31 +1448,49 @@ class AnalysisSession:
         and quietly reassigned every intensity to the wrong lane. Gaps stay
         gaps (the lane simply won't pair during normalization) and are
         reported through :attr:`last_warnings`.
+
+        Records are grouped by ``(kind, name, group, source)`` — the same
+        identity :meth:`upsert` uses. Two membranes of one protein in one file
+        come back as two records instead of one record whose lanes overwrote
+        each other, and a protein that appears as both a loading control and a
+        target (one experiment's actin exported next to another's) stays two
+        records instead of collapsing into whichever ``kind`` came first.
+        ``source`` is compared through :func:`source_key`, so the same file
+        spelled two ways is one membrane.
+
+        ``sample`` names found in the file are applied to their group; anything
+        the file does not have (an older export with no ``sample`` /
+        ``membrane`` / ``roi_check`` column) simply stays empty.
         """
         path = Path(path)
         warnings: list[str] = []
+        samples: dict[tuple[str, int], str] = {}
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
             if not reader.fieldnames or "integrated_density" not in reader.fieldnames:
                 raise ValueError("内参 CSV 缺少 integrated_density 列")
             has_lane_column = "lane" in reader.fieldnames
-            buckets: dict[tuple[str, str], dict] = {}
+            buckets: dict[tuple[str, str, str, str], dict] = {}
             for line_no, row in enumerate(reader, start=2):
                 kind = (row.get("kind") or "loading_control").strip()
                 if kind not in {"loading_control", "target"}:
                     kind = "loading_control"
                 name = (row.get("name") or "Loading Control").strip()
                 group = (row.get("group") or "默认").strip()
+                source = str(row.get("source") or path)
                 bucket = buckets.setdefault(
-                    (name, group),
+                    (kind, name, group, source_key(source)),
                     {
-                        "kind": kind,
                         "rows": [],
-                        "source": row.get("source") or str(path),
+                        "source": source,
                         "origins": set(),
                         "picks": set(),
+                        "membranes": set(),
+                        "roi_checks": set(),
                     },
                 )
+                bucket["membranes"].add((row.get("membrane") or "").strip())
+                bucket["roi_checks"].add((row.get("roi_check") or "").strip())
                 try:
                     intensity = float(row["integrated_density"])
                 except (TypeError, ValueError) as exc:
@@ -797,6 +1501,15 @@ class AnalysisSession:
                 lane = _parse_lane(row.get("lane")) if has_lane_column else None
                 if has_lane_column and lane is None:
                     warnings.append(f"第 {line_no} 行缺少有效的 lane 值，已按出现顺序编号。")
+                sample = (row.get("sample") or "").strip()
+                if sample and lane is not None:
+                    previous = samples.get((group, lane))
+                    if previous and previous != sample:
+                        warnings.append(
+                            f"分组“{group}”泳道 {lane} 在文件里有两个样品名"
+                            f"（{previous} / {sample}），保留后出现的那个。"
+                        )
+                    samples[(group, lane)] = sample
                 # A CSV is foreign data: an unreadable origin degrades to
                 # "unknown" (which normalization then flags) instead of
                 # aborting an import the user cannot easily repair.
@@ -813,7 +1526,11 @@ class AnalysisSession:
                 )
 
         count = 0
-        for (name, group), bucket in buckets.items():
+        membranes_per_protein: dict[tuple[str, str, str], int] = {}
+        for kind, name, group, _source in buckets:
+            key = (kind, name, group)
+            membranes_per_protein[key] = membranes_per_protein.get(key, 0) + 1
+        for (kind, name, group, _source), bucket in buckets.items():
             rows = bucket["rows"]
             lanes = [lane for lane, *_ in rows]
             if any(lane is None for lane in lanes):
@@ -849,9 +1566,11 @@ class AnalysisSession:
                     f"“{name}”的 band_pick 列在不同行上不一致，已按“合并全部”处理。"
                 )
                 picks = {BAND_PICK_ALL}
+            membranes = sorted(m for m in bucket["membranes"] if m)
+            checks = sorted(c for c in bucket["roi_checks"] if c)
             self.upsert(
                 QuantEntry(
-                    kind=bucket["kind"],  # type: ignore[arg-type]
+                    kind=kind,  # type: ignore[arg-type]
                     name=name,
                     group=group,
                     intensities=[value for _, value, _, _, _ in ordered],
@@ -864,15 +1583,50 @@ class AnalysisSession:
                     # Only the aggregate survives a CSV, so the per-band detail
                     # stays empty: the pick can be *reported*, not redone.
                     used_bands=[list(value) for _, _, _, _, value in ordered],
-                )
+                    membrane=membranes[0] if membranes else "",
+                    roi_check=RoiCheck.parse(checks[0]) if checks else RoiCheck(),
+                ),
+                # Two membranes of one protein in one file are two records; the
+                # default key would let the second one overwrite the first and
+                # lose half the experiment on the way in.
+                key_on_source=membranes_per_protein[(kind, name, group)] > 1,
             )
             count += 1
+        for (kind, name, group), count_of_membranes in sorted(membranes_per_protein.items()):
+            if count_of_membranes < 2:
+                continue
+            head = (
+                f"文件里内参“{name}”（分组 {group}）有 {count_of_membranes} 张膜的数据，已各存一条记录。"
+                if kind == "loading_control"
+                else f"文件里目标“{name}”（分组 {group}）有 {count_of_membranes} 张膜的数据，已各存一条记录。"
+            )
+            warnings.append(
+                head
+                + (
+                    "归一化默认取最后加入的那一条，请确认这正是你要的那张膜。"
+                    if kind == "loading_control"
+                    else "汇总表的宽表会把这些格子留空（不做合并），理由写在长表的 note 里。"
+                )
+            )
+        for (group, lane), sample in samples.items():
+            previous = self.lane_label(group, lane)
+            if previous and previous != sample:
+                warnings.append(
+                    f"分组“{group}”泳道 {lane} 的样品名由“{previous}”改为“{sample}”（来自导入文件）。"
+                )
+            self.set_lane_label(group, lane, sample)
         self.last_warnings = warnings
         return count
 
 
-def np_clip_index(index: int, count: int) -> int:
-    return max(0, min(int(index), count - 1))
+def _append_once(sink: list[str], text: str) -> None:
+    """Append a warning unless that exact sentence is already in the list.
+
+    For facts about a *group*: :meth:`AnalysisSession.normalize` runs once per
+    target and they all share one warning list.
+    """
+    if text not in sink:
+        sink.append(text)
 
 
 def _parse_lane(value: object) -> int | None:
