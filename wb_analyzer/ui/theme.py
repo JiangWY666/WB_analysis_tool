@@ -223,6 +223,47 @@ QTabBar::tab:selected {{
     border-bottom: 2px solid {ACCENT};
 }}
 
+/* 文档标签：浏览器 / Origin 那种贴在内容上方的一排，和右侧控制面板的
+   下划线页签不是同一种东西，所以用 objectName 单独画。 */
+QTabBar#docTabBar {{
+    background: {BG_PANEL};
+    border: none;
+    border-bottom: 1px solid {BG_BASE};
+}}
+QTabBar#docTabBar::tab {{
+    background: {BG_RAISED};
+    color: {TEXT_DIM};
+    border: 1px solid {BORDER};
+    border-bottom: none;
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+    padding: 5px 10px 5px 10px;
+    margin: 4px 2px 0 2px;
+    min-width: 72px;
+    max-width: 180px;
+}}
+QTabBar#docTabBar::tab:hover {{
+    color: {TEXT};
+    background: {BG_PANEL};
+}}
+QTabBar#docTabBar::tab:selected {{
+    background: {BG_WINDOW};
+    color: {ACCENT};
+    border-color: {ACCENT_DIM};
+    border-bottom: 1px solid {BG_WINDOW};
+}}
+QTabBar#docTabBar::close-button {{
+    subcontrol-position: right;
+    padding: 2px;
+    border-radius: 3px;
+}}
+QTabBar#docTabBar::close-button:hover {{
+    background: {BG_RAISED};
+}}
+QTabBar#docTabBar::scroller {{
+    width: 24px;
+}}
+
 QGroupBox {{
     border: 1px solid {BORDER};
     border-radius: 6px;

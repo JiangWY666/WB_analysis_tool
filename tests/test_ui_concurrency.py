@@ -43,6 +43,7 @@ from PySide6.QtGui import (  # noqa: E402
     QKeyEvent,
     QKeySequence,
     QMouseEvent,
+    QShortcut,
 )
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
@@ -150,7 +151,7 @@ def fake_inflight_job(window: MainWindow, kind: str) -> tuple:
     """
     window._job_serial += 1
     token = (kind, window._job_guard(kind), window._job_serial)
-    window._job_tokens[kind] = token
+    window._job_tokens[window._job_slot(kind, window._active_id)] = token
     return token
 
 
@@ -173,6 +174,7 @@ def load_array(window: MainWindow, raw: np.ndarray) -> None:
     window.canvas.clear_roi()
     window.canvas.set_image(blot.display_bgr)
     window._clear_result()
+    window._ensure_document_tab()
 
 
 def settle(window: MainWindow, timeout: float = 20.0) -> bool:
@@ -233,6 +235,8 @@ def bands(window: MainWindow) -> list[tuple[int, int, float]]:
 
 def close(window: MainWindow) -> None:
     window._results_dirty = False
+    for doc in getattr(window, "_docs", []):
+        doc.results_dirty = False
     window.close()
 
 
@@ -335,15 +339,12 @@ def test_stale_detect_result_is_discarded_after_rotation(qt_app):
 
 
 def test_quantify_submitted_before_load_lands_is_discarded(qt_app, monkeypatch, tmp_path):
-    """doc_version 的递增时机：加载期间提交的定量绝不能被新图采用。
-
-    如果把 doc_version 改成"提交加载任务时就 +1"，此处提交的定量会拿到新版本
-    号，回来时校验反而通过——U1 就退回去了。
-    """
+    """打开新标签加载期间，A 上还在路上的定量必须落到 A，绝不能画到 B。"""
     window = make_window(qt_app)
     load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
     set_roi_and_quantify(window)
-    stale_payload = (window._result, list(window._lanes))
+    a_bands = bands(window)
+    stale_payload = (window._result, list(window._lanes), window._roi_report)
 
     new_blot = blot_from_array(synthetic_raw([1000.0, 900.0, 800.0]))
     monkeypatch.setattr(mw, "load_blot", slow(new_blot, 0.25))
@@ -351,38 +352,43 @@ def test_quantify_submitted_before_load_lands_is_discarded(qt_app, monkeypatch, 
     target.write_bytes(b"placeholder")  # 真正的读盘被 monkeypatch 换掉了
 
     assert window.open_path(target) is True
-    # 加载还在路上，此刻"上一张图的定量任务"仍持有旧文档的令牌
+    # 加载还在路上，当前仍是 A：令牌挂在 A 的槽上
     stale_token = fake_inflight_job(window, mw.JOB_QUANTIFY)
     assert window._blot is not None
     assert wait_for(lambda: window._blot is new_blot), "加载任务应当落地"
 
     window._on_quantify_done(stale_token, stale_payload)
-    assert bands(window) == [], "加载前提交的定量结果不得落到新图上"
+    assert bands(window) == [], "A 的定量回调绝不能画到新标签上"
+    window._switch_to_index(0)
+    assert bands(window) == a_bands
     close(window)
 
 
 def test_result_jobs_wait_for_pending_load(qt_app, monkeypatch, tmp_path):
-    """加载大图期间点定量：不许在旧图上开跑，排队等加载落地。"""
+    """打开 B 加载期间，A 仍可定量；结果落到 A，不画到 B。"""
     window = make_window(qt_app)
-    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    a_id = window._active_id
     new_blot = blot_from_array(synthetic_raw([18000.0, 14000.0]))
     monkeypatch.setattr(mw, "load_blot", slow(new_blot, 0.2))
     target = tmp_path / "b.tif"
     target.write_bytes(b"placeholder")
     window.open_path(target)
 
-    window._run_quantify()  # 手动点“ROI 定量”
-    assert mw.JOB_QUANTIFY not in window._running, "加载未落地就不该开跑定量"
-    assert window._quant_timer.isActive(), "应当排队重试而不是丢掉这次请求"
-    assert window._quant_manual_pending, "手动请求的身份要保留"
+    window._run_quantify()
+    assert window._has_job(mw.JOB_QUANTIFY, a_id), "B 在加载时 A 仍可开跑定量"
 
     assert settle(window)
     assert window._blot is new_blot
+    assert window._result is None, "A 的定量不得画到 B"
+    window._switch_to_index(0)
+    assert bands(window)
     close(window)
 
 
 def test_open_during_rotation_wins(qt_app, monkeypatch, tmp_path):
-    """旋转过程中换图：换图生效，半途的旋转结果不许落地。"""
+    """旋转过程中打开新标签：新图照常落地，A 的旋转继续跑完并回到 A。"""
     window = make_window(qt_app)
     load_array(window, synthetic_raw([20000.0, 15000.0]))
     rotated = blot_from_array(synthetic_raw([20000.0, 15000.0]))
@@ -396,12 +402,15 @@ def test_open_during_rotation_wins(qt_app, monkeypatch, tmp_path):
     target = tmp_path / "c.tif"
     target.write_bytes(b"placeholder")
     window.open_path(target)
-    assert mw.JOB_ORIENT not in window._running, "换图应当作废在跑的旋转"
+    assert mw.JOB_ORIENT in window._running, "打开新标签不得取消当前标签的旋转"
 
     assert settle(window)
     assert window._blot is new_blot
-    assert window._angle == 0.0, "新图的旋转角必须归零"
+    assert window._angle == 0.0, "新标签的旋转角必须归零"
     assert window._blot is not rotated
+    window._switch_to_index(0)
+    assert window._angle == 8.0
+    assert window._blot is rotated
     close(window)
 
 
@@ -436,8 +445,8 @@ def test_result_jobs_lock_inputs_and_offer_cancel(qt_app):
     load_array(window, synthetic_raw([20000.0, 15000.0]))
     window._begin_job(mw.JOB_QUANTIFY, "正在 ROI 定量……")
     assert window._busy
-    assert not window.act_open.isEnabled()
-    assert not window._recent_menu.isEnabled()
+    assert window.act_open.isEnabled(), "定量进行中仍可打开另一张膜"
+    assert window._recent_menu.isEnabled()
     assert window._busy_bar.isVisibleTo(window.statusBar())
     assert window._cancel_button.isVisibleTo(window.statusBar())
     assert not window._adjust_tab.isEnabled(), "忙碌时参数区应锁住"
@@ -2373,22 +2382,188 @@ def test_single_band_lane_says_the_strategy_did_not_apply(qt_app):
     close(window)
 
 
+def reset_data_export_prefs() -> None:
+    """导出勾选写在 session 级 QSettings 里，每条用例先回到默认精简档。"""
+    prefs_mod.save_data_export_choices(True, False, False, False, False)
+
+
+def run_data_export(window, monkeypatch, folder, *, options=None, accept=True):
+    """把选项对话框和目录选择换成固定答案，走一遍真的 Ctrl+E。"""
+    from wb_analyzer.ui.data_export_dialog import DataExportOptions
+
+    chosen = options if options is not None else DataExportOptions()
+    seen: list = []
+
+    def fake_exec(self):
+        seen.append(self)
+        self.raw_check.setChecked(chosen.raw_stats)
+        if self.normalized_check.isEnabled():
+            self.normalized_check.setChecked(chosen.normalized)
+        if self.summary_check.isEnabled():
+            self.summary_check.setChecked(chosen.summary_tables)
+        if self.session_raw_check.isEnabled():
+            self.session_raw_check.setChecked(chosen.session_raw)
+        if self.full_stats_check.isEnabled() or chosen.full_stats:
+            self.full_stats_check.setChecked(chosen.full_stats)
+        return (
+            mw.QDialog.DialogCode.Accepted
+            if accept
+            else mw.QDialog.DialogCode.Rejected
+        )
+
+    monkeypatch.setattr(mw.DataExportDialog, "exec", fake_exec)
+    monkeypatch.setattr(
+        mw.QFileDialog, "getExistingDirectory", lambda *a, **k: str(folder)
+    )
+    window.act_export_data.trigger()
+    return seen
+
+
 def test_exported_band_csv_records_the_background_origin(qt_app, monkeypatch, tmp_path):
-    """条带 CSV 要写明这批数字是哪套口径测的。"""
+    """完整统计列里要写明这批数字是哪套口径测的。"""
     import csv
 
+    from wb_analyzer.ui.data_export_dialog import DataExportOptions
+
+    reset_data_export_prefs()
     window = make_window(qt_app)
     load_array(window, synthetic_raw([20000.0, 15000.0]))
     set_roi_and_quantify(window)
-    monkeypatch.setattr(
-        mw.QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path)
+    run_data_export(
+        window,
+        monkeypatch,
+        tmp_path,
+        options=DataExportOptions(raw_stats=True, full_stats=True),
     )
-    window._export_data()
     exported = list(tmp_path.glob("*_bands.csv"))
     assert exported, "导出没落地"
     with exported[0].open(encoding="utf-8-sig") as handle:
         rows = list(csv.DictReader(handle))
     assert rows and {row["origin"] for row in rows} == {"roi_baseline"}
+    close(window)
+
+
+def test_ctrl_e_default_writes_only_compact_bands_and_preview(
+    qt_app, monkeypatch, tmp_path
+):
+    """只勾默认项时，目录里只有精简 *_bands.csv 和标注图。"""
+    import csv
+
+    from wb_analyzer.export import COMPACT_BANDS_FIELDS
+    from wb_analyzer.ui.data_export_dialog import DataExportOptions
+
+    reset_data_export_prefs()
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    set_roi_and_quantify(window)
+    dialogs = run_data_export(
+        window,
+        monkeypatch,
+        tmp_path,
+        options=DataExportOptions(),
+    )
+    assert dialogs, "Ctrl+E 应当弹出选项对话框"
+    assert dialogs[0].windowTitle() == "导出数据"
+    names = sorted(path.name for path in tmp_path.iterdir())
+    assert names == ["blot_annotated.png", "blot_bands.csv"]
+    with (tmp_path / "blot_bands.csv").open(encoding="utf-8-sig") as handle:
+        header = list(csv.DictReader(handle).fieldnames or [])
+    assert header == list(COMPACT_BANDS_FIELDS)
+    assert "origin" not in header
+    assert "normalized" not in header
+    close(window)
+
+
+def test_ctrl_e_writes_optional_tables_only_when_checked(
+    qt_app, monkeypatch, tmp_path
+):
+    """勾了归一化 / 汇总 / 历史长表，对应文件才出现。"""
+    from wb_analyzer.ui.data_export_dialog import DataExportOptions
+
+    reset_data_export_prefs()
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    add_history(window, "loading_control", "Actin", "G1")
+    add_history(window, "target", "ProteinX", "G1")
+    run_data_export(
+        window,
+        monkeypatch,
+        tmp_path,
+        options=DataExportOptions(
+            raw_stats=True,
+            normalized=True,
+            summary_tables=True,
+            session_raw=True,
+        ),
+    )
+    names = {path.name for path in tmp_path.iterdir()}
+    assert {
+        "blot_bands.csv",
+        "blot_annotated.png",
+        "raw_long.csv",
+        "normalized_results.csv",
+        "summary_long.csv",
+        "summary_wide.csv",
+        "summary_wide_readme.txt",
+    } <= names
+    close(window)
+
+
+def test_hand_drawn_band_peak_is_exported_in_full_stats(
+    qt_app, monkeypatch, tmp_path
+):
+    """手绘补画的条带在完整统计列里 peak 必须是真值，不能静默写成 0。"""
+    import csv
+
+    from wb_analyzer.ui.data_export_dialog import DataExportOptions
+
+    reset_data_export_prefs()
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    reference = window._result.measurements[1]
+    window._on_band_drawn(
+        reference.x, reference.y, reference.width, reference.height
+    )
+    added = window._result.measurements[-1]
+    assert added.peak != 0.0, "补画测量本身就该写出 peak"
+
+    run_data_export(
+        window,
+        monkeypatch,
+        tmp_path,
+        options=DataExportOptions(raw_stats=True, full_stats=True),
+    )
+    with (tmp_path / "blot_bands.csv").open(encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    hand_drawn = rows[-1]
+    assert float(hand_drawn["peak"]) != 0.0
+    assert hand_drawn["origin"] == "roi_baseline"
+    close(window)
+
+
+def test_ctrl_e_exports_the_active_tab_only(qt_app, monkeypatch, tmp_path):
+    """多标签时导出必须用当前活动标签的图像主干，不能写成另一张膜的名字。"""
+    from wb_analyzer.ui.data_export_dialog import DataExportOptions
+
+    reset_data_export_prefs()
+    window = make_window(qt_app)
+    load_new_tab(window, synthetic_raw([20000.0, 15000.0]), path=tmp_path / "memA.tif")
+    set_roi_and_quantify(window)
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0, 4500.0]), path=tmp_path / "memB.tif")
+    set_roi_and_quantify(window)
+    assert window.doc_tabs.currentIndex() == 1
+    run_data_export(
+        window,
+        monkeypatch,
+        tmp_path,
+        options=DataExportOptions(),
+    )
+    names = {path.name for path in tmp_path.iterdir()}
+    assert "memB_bands.csv" in names
+    assert "memB_annotated.png" in names
+    assert "memA_bands.csv" not in names
     close(window)
 
 
@@ -3043,8 +3218,9 @@ def test_a_tilt_result_for_the_previous_image_is_dropped(qt_app):
     stale = mw.estimate_tilt(window._blot.raw, roi=window._roi, dark_bands=True)
     assert stale.trusted
     version = window._doc_version
+    epoch = window._tilt_epoch
     load_array(window, tilted_raw(2.0))
-    window._on_tilt_done(version, None, stale)
+    window._on_tilt_done(epoch, version, None, stale)
     assert window._ruler_angle is None, "上一张图的角度不许落到新图上"
     assert window.canvas._ruler_items == []
     close(window)
@@ -4105,9 +4281,29 @@ def test_the_profile_panel_says_each_thing_once(qt_app):
         if label.text()
     ]
     assert sum(1 for t in texts if "双击" in t) == 0, (
-        f"剖面图标题之外还有一份操作说明：{texts}"
+        f"面板上又常驻了一份操作说明：{texts}"
     )
-    assert "双击加分隔线" in pp.COLUMN_TITLE, "说明本身不能丢，它在图标题里"
+    tip = panel._col_plot.toolTip()
+    assert "双击" in tip and "添加分隔线" in tip, (
+        f"说明本身不能丢，它挂在左图的 tooltip 里：{tip}"
+    )
+    close(window)
+
+
+def test_the_profile_axes_keep_their_labels_short(qt_app):
+    """标题与纵轴标签不塞括号解释：竖排文字每多一个字就多吃一列宽度。"""
+    window = make_window(qt_app)
+    window.show()
+    panel = window.profile_panel
+    qt_app.processEvents()
+    for text in (pp.COLUMN_TITLE, pp.LANE_TITLE_EMPTY, pp.COLUMN_Y_LABEL, pp.LANE_Y_LABEL):
+        assert "（" not in text and "(" not in text, f"又把解释塞回常驻文字里了：{text}"
+    # 两条纵轴口径不同，短名也得能区分开，否则读数会被当成同一回事
+    assert pp.COLUMN_Y_LABEL != pp.LANE_Y_LABEL
+    # 完整口径不许消失，它搬去了 tooltip
+    assert "平均" in panel._col_plot.toolTip()
+    assert "求和" in panel._lane_plot.toolTip()
+    assert "ROI 定量" in panel._lane_plot.toolTip(), "右图为什么是空的，得有地方说"
     close(window)
 
 
@@ -4386,7 +4582,7 @@ def test_prefs_are_clamped_not_trusted(qt_app):
     settings.sync()
 
 
-# ---------------------------------------------------------------- 五、关闭当前图片
+# ---------------------------------------------------------------- 五、关闭当前标签
 
 
 class auto_answer:  # noqa: N801 - 当上下文管理器用，名字按动作读
@@ -4441,6 +4637,10 @@ def document_is_empty(window: MainWindow) -> list[str]:
         leftovers.append(f"标题还是「{window.windowTitle()}」")
     if window._column_profile is not None:
         leftovers.append("横向剖面数据还在")
+    if getattr(window, "doc_tabs", None) is not None and window.doc_tabs.count():
+        leftovers.append("文档标签还在")
+    if getattr(window, "_docs", None):
+        leftovers.append("文档列表还在")
     return leftovers
 
 
@@ -4570,13 +4770,13 @@ def test_closing_says_what_gets_lost_worst_first(qt_app, monkeypatch):
     assert window._result is not None
     assert len(asked) == 1
     title, text = asked[0]
-    assert title == "关闭当前图片"
+    assert title == "关闭当前标签"
     assert f"这张膜的 {total} 个条带还没加入归一化历史" in text
     assert "尚未导出" in text
     assert text.index("归一化历史") < text.index("尚未导出"), (
         "跨膜流程里“没加入历史”比“没导出”损失大，得排在前面"
     )
-    assert "确定要关闭这张图片吗？" in text
+    assert "确定要关闭这个标签吗？" in text
 
     answer["value"] = QMessageBox.StandardButton.Yes
     assert window._close_document() is True
@@ -4624,3 +4824,470 @@ def test_reopening_after_a_close_does_not_inherit_the_old_document(qt_app):
     set_roi_and_quantify(window)
     assert {lane for lane, _band, _value in bands(window)} == {1, 2}
     close(window)
+
+
+# ---------------------------------------------------------------- 多文档标签
+
+
+def load_new_tab(window: MainWindow, raw: np.ndarray, path=None) -> None:
+    """在新标签里装一张合成图，不经磁盘。"""
+    blot = blot_from_array(raw, path=path)
+    window._open_blot_in_new_tab(blot, path=path)
+
+
+def write_synthetic_tif(path, depths: list[float]) -> None:
+    import cv2
+
+    raw = synthetic_raw(depths)
+    ok, buffer = cv2.imencode(".tif", raw)
+    assert ok, "合成 TIFF 编码失败"
+    path.write_bytes(buffer.tobytes())
+
+
+def test_opening_a_second_image_makes_a_new_tab(qt_app):
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    assert not window.doc_tabs.isHidden()
+    assert window.doc_tabs.count() == 1
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0, 4500.0]))
+    assert window.doc_tabs.count() == 2
+    assert window.doc_tabs.currentIndex() == 1
+    assert window._roi is None, "新标签必须是空白分析状态"
+    close(window)
+
+
+def test_tabs_keep_roi_separators_and_results_apart(qt_app):
+    """核心验收：A 定量后切到 B 再切回来，ROI / 分隔线 / 结果表原样。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    window.lane_spin.setValue(3)
+    set_roi_and_quantify(window)
+    a_roi = window._roi
+    a_seps = list(window._separators)
+    a_bands = bands(window)
+    a_rows = window.results_panel.table.rowCount()
+    a_version = window._doc_version
+    assert a_roi is not None and a_bands and a_rows
+
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0]))
+    assert window.doc_tabs.currentIndex() == 1
+    assert window._roi is None
+    assert window._result is None
+    assert window.results_panel.table.rowCount() == 0
+    assert window._doc_version != a_version
+    window.lane_spin.setValue(0)
+    set_roi_and_quantify(window)
+    b_bands = bands(window)
+    b_roi = window._roi
+    assert b_bands
+    assert b_bands != a_bands
+
+    window._switch_to_index(0)
+    assert window.doc_tabs.currentIndex() == 0
+    assert window._roi == a_roi
+    canvas_roi = window.canvas.roi()
+    assert canvas_roi is not None
+    assert (
+        int(round(canvas_roi[0])),
+        int(round(canvas_roi[1])),
+        int(round(canvas_roi[2])),
+        int(round(canvas_roi[3])),
+    ) == (a_roi.x, a_roi.y, a_roi.width, a_roi.height)
+    assert list(window._separators) == a_seps
+    assert list(window.canvas.separators()) == a_seps
+    assert bands(window) == a_bands
+    assert window.results_panel.table.rowCount() == a_rows
+    assert window.lane_spin.value() == 3
+    assert window._doc_version == a_version
+
+    window._switch_to_index(1)
+    assert window._roi == b_roi
+    assert bands(window) == b_bands
+    assert window.lane_spin.value() == 0
+    close(window)
+
+
+def test_closing_the_middle_tab_keeps_neighbors(qt_app):
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    a_bands = bands(window)
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0]))
+    set_roi_and_quantify(window)
+    load_new_tab(window, synthetic_raw([12000.0, 8000.0, 4000.0]))
+    set_roi_and_quantify(window)
+    c_bands = bands(window)
+    assert window.doc_tabs.count() == 3
+
+    window._switch_to_index(1)
+    window._results_dirty = False
+    with auto_answer():
+        assert window._close_document() is True
+    assert window.doc_tabs.count() == 2
+    assert window.doc_tabs.currentIndex() in (0, 1)
+
+    window._switch_to_index(0)
+    assert bands(window) == a_bands
+    window._switch_to_index(1)
+    assert bands(window) == c_bands
+    close(window)
+
+
+def test_closing_the_last_tab_returns_to_empty_workspace(qt_app):
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    load_new_tab(window, synthetic_raw([9000.0, 6000.0]))
+    assert window.doc_tabs.count() == 2
+    window._results_dirty = False
+    with auto_answer():
+        assert window._close_document() is True
+    assert window.doc_tabs.count() == 1
+    window._results_dirty = False
+    with auto_answer():
+        assert window._close_document() is True
+    assert document_is_empty(window) == []
+    assert window.doc_tabs.isHidden()
+    close(window)
+
+
+def test_reopening_the_same_file_switches_to_the_existing_tab(qt_app, tmp_path):
+    window = make_window(qt_app)
+    target = tmp_path / "same.tif"
+    write_synthetic_tif(target, [20000.0, 15000.0, 10000.0])
+    assert window.open_path(target) is True
+    assert settle(window)
+    set_roi_and_quantify(window)
+    a_bands = bands(window)
+    assert window.doc_tabs.count() == 1
+
+    other = tmp_path / "other.tif"
+    write_synthetic_tif(other, [18000.0, 9000.0])
+    assert window.open_path(other) is True
+    assert settle(window)
+    assert window.doc_tabs.count() == 2
+    assert window.doc_tabs.currentIndex() == 1
+
+    assert window.open_path(target) is True
+    assert window.doc_tabs.count() == 2
+    assert window.doc_tabs.currentIndex() == 0
+    assert bands(window) == a_bands, "切回已有标签时不许丢掉定量结果"
+    close(window)
+
+
+def test_background_job_is_dropped_when_switching_tabs(qt_app):
+    """开 B 时 A 的定量继续；回调不画到 B，切回 A 能看见结果。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    a_bands = bands(window)
+    stale_payload = (window._result, list(window._lanes), window._roi_report)
+    stale_token = fake_inflight_job(window, mw.JOB_QUANTIFY)
+
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0]))
+    assert window._job_is_current(stale_token), "切走不得取消 A 上还在跑的定量"
+    window._on_quantify_done(stale_token, stale_payload)
+    assert window._result is None, "A 的定量回调绝不能画到 B 上"
+
+    window._switch_to_index(0)
+    assert bands(window) == a_bands, "切回来时 A 自己的结果必须还在"
+    close(window)
+
+
+def test_ctrl_w_and_ctrl_tab_cycle_documents(qt_app):
+    window = make_window(qt_app)
+    assert window.act_close.shortcut() == QKeySequence("Ctrl+W")
+    assert window.act_next_doc.shortcut() == QKeySequence("Ctrl+Tab")
+    assert window.act_prev_doc.shortcut() == QKeySequence("Ctrl+Shift+Tab")
+    assert window.act_last_doc.shortcut() == QKeySequence("Ctrl+9")
+
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0]))
+    load_new_tab(window, synthetic_raw([12000.0, 8000.0]))
+    assert window.doc_tabs.currentIndex() == 2
+
+    window.act_next_doc.trigger()
+    assert window.doc_tabs.currentIndex() == 0
+    window.act_prev_doc.trigger()
+    assert window.doc_tabs.currentIndex() == 2
+    window._activate_tab_number(1)
+    assert window.doc_tabs.currentIndex() == 0
+    window.act_last_doc.trigger()
+    assert window.doc_tabs.currentIndex() == 2
+
+    window._results_dirty = False
+    with auto_answer():
+        window.act_close.trigger()
+        qt_app.processEvents()
+    assert window.doc_tabs.count() == 2
+    close(window)
+
+
+def test_evicted_tab_reloads_pixels_and_restores_analysis(qt_app, tmp_path):
+    """超出内存上限的标签切回来要从磁盘重载，ROI / 分隔线 / 结果不能丢。"""
+    window = make_window(qt_app)
+    window._max_resident_docs = 2
+    paths = []
+    for index, depths in enumerate(
+        ([20000.0, 15000.0, 10000.0], [18000.0, 9000.0], [12000.0, 8000.0, 4000.0])
+    ):
+        path = tmp_path / f"mem{index}.tif"
+        write_synthetic_tif(path, depths)
+        paths.append(path)
+
+    assert window.open_path(paths[0]) is True
+    assert settle(window)
+    set_roi_and_quantify(window)
+    a_roi = window._roi
+    a_seps = list(window._separators)
+    a_bands = bands(window)
+
+    assert window.open_path(paths[1]) is True
+    assert settle(window)
+    assert window.open_path(paths[2]) is True
+    assert settle(window)
+    assert window.doc_tabs.count() == 3
+    first = window._docs[0]
+    assert first.path == paths[0]
+    assert first.pixels_resident is False, "最早的标签应当被换出内存"
+    assert first.roi is not None, "分析状态必须留在标签上"
+
+    window._switch_to_index(0)
+    assert settle(window), "从磁盘重载应当能跑完"
+    assert window._blot is not None
+    assert window._roi == a_roi
+    assert list(window._separators) == a_seps
+    assert bands(window) == a_bands
+    close(window)
+
+
+def test_two_images_can_be_opened_switched_and_closed_offscreen(qt_app):
+    """冒烟：开两张、切换、关掉，窗口还活着。"""
+    window = make_window(qt_app)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    load_new_tab(window, synthetic_raw([9000.0, 6000.0]))
+    qt_app.processEvents()
+    assert window.doc_tabs.count() == 2
+    window._switch_to_index(0)
+    qt_app.processEvents()
+    window._results_dirty = False
+    with auto_answer():
+        assert window._close_document() is True
+    qt_app.processEvents()
+    assert window.doc_tabs.count() == 1
+    assert window._blot is not None
+    close(window)
+
+
+def test_opening_another_tab_does_not_cancel_current_quantify(qt_app):
+    """忙碌时仍可开新标签，原任务不被取消。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    a_id = window._active_id
+    payload = (window._result, list(window._lanes), window._roi_report)
+    token = fake_inflight_job(window, mw.JOB_QUANTIFY)
+    assert window.act_open.isEnabled()
+
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0]))
+    assert window._job_is_current(token)
+    assert window._has_job(mw.JOB_QUANTIFY, a_id)
+    window._on_quantify_done(token, payload)
+    assert window._result is None
+    window._switch_to_index(0)
+    assert bands(window)
+    close(window)
+
+
+def test_failed_open_does_not_disturb_current_tab_or_its_jobs(
+    qt_app, monkeypatch, tmp_path
+):
+    """新图加载失败时，当前标签的状态与在跑任务原样不动。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    a_blot = window._blot
+    a_bands = bands(window)
+    token = window._begin_job(mw.JOB_QUANTIFY, "正在 ROI 定量……")
+    monkeypatch.setattr(QMessageBox, "critical", lambda *_a, **_k: None)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("decode failed")
+
+    monkeypatch.setattr(mw, "load_blot", boom)
+    target = tmp_path / "bad.tif"
+    target.write_bytes(b"not-an-image")
+    assert window.open_path(target, synchronous=True) is False
+    assert window._blot is a_blot
+    assert bands(window) == a_bands
+    assert window._job_is_current(token)
+    close(window)
+
+
+def test_busy_indicator_follows_the_active_tab(qt_app):
+    """忙碌指示器 / 取消按钮只反映当前活动标签。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    a_id = window._active_id
+    window._begin_job(mw.JOB_QUANTIFY, "正在 ROI 定量……")
+    assert window._busy_bar.isVisibleTo(window.statusBar())
+    assert window._cancel_button.isVisibleTo(window.statusBar())
+
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0]))
+    assert not window._busy
+    assert not window._busy_bar.isVisibleTo(window.statusBar()), (
+        "切到 B 不该看到 A 的进度条"
+    )
+    assert not window._cancel_button.isVisibleTo(window.statusBar())
+    assert window.canvas.isEnabled()
+    assert window._has_job(mw.JOB_QUANTIFY, a_id)
+
+    window._switch_to_index(0)
+    assert window._busy
+    assert window._busy_bar.isVisibleTo(window.statusBar())
+    assert window._cancel_button.isVisibleTo(window.statusBar())
+    close(window)
+
+
+def test_new_tab_starts_from_auto_detection_defaults(qt_app):
+    """新标签从自动参数开始，不继承上一张手调过的泳道数 / 背景 / 灵敏度。"""
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    window.lane_spin.setValue(3)
+    window.band_spin.setValue(2)
+    window.weak_slider.setValue(80)
+    if window.bg_combo.count() > 1:
+        window.bg_combo.setCurrentIndex(1)
+
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0]))
+    assert window.lane_spin.value() == 0
+    assert window.band_spin.value() == 0
+    assert window.weak_slider.value() == 55
+    assert window.bg_combo.currentIndex() == 0
+
+    window._switch_to_index(0)
+    assert window.lane_spin.value() == 3
+    assert window.band_spin.value() == 2
+    assert window.weak_slider.value() == 80
+    close(window)
+
+
+def test_quit_names_every_tab_with_unsaved_results(qt_app, monkeypatch, tmp_path):
+    """退出时点名每一个还有未导出结果的标签。"""
+    window = make_window(qt_app)
+    actin = tmp_path / "actin.tif"
+    target = tmp_path / "target.tif"
+    write_synthetic_tif(actin, [20000.0, 15000.0, 10000.0])
+    write_synthetic_tif(target, [18000.0, 9000.0])
+    assert window.open_path(actin) is True
+    assert settle(window)
+    set_roi_and_quantify(window)
+    assert window.open_path(target) is True
+    assert settle(window)
+    set_roi_and_quantify(window)
+
+    asked: list[tuple[str, str]] = []
+
+    def ask(_parent, title, text, *_a, **_k):
+        asked.append((title, text))
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", ask)
+    assert window.close() is False
+    assert asked
+    title, text = asked[0]
+    assert title == "还有未保存的结果"
+    assert "actin.tif" in text
+    assert "target.tif" in text
+    assert text.count("尚未导出") == 2
+    assert "确定要退出吗？" in text
+    close(window)
+
+
+def test_ctrl_tab_cycles_document_tabs_not_control_panel(qt_app):
+    """Ctrl+Tab 切的是文档标签，不是右侧「调整 / 结果 / 归一化」。"""
+    window = make_window(qt_app)
+    window.show()
+    qt_app.processEvents()
+    load_array(window, synthetic_raw([20000.0, 15000.0]))
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0]))
+    load_new_tab(window, synthetic_raw([12000.0, 8000.0]))
+    window._tabs.setCurrentIndex(0)
+    panel_before = window._tabs.currentIndex()
+    assert window.doc_tabs.currentIndex() == 2
+    window.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+    window._release_ctrl_tab_for_documents()
+    qt_app.processEvents()
+
+    stolen = [
+        shortcut
+        for shortcut in window.findChildren(QShortcut)
+        if shortcut.key().matches(QKeySequence.StandardKey.NextChild)
+        or shortcut.key().matches(QKeySequence.StandardKey.PreviousChild)
+    ]
+    assert stolen, "控制面板页签应当创建过 Ctrl+Tab 快捷键，才能证明我们关掉了它"
+    assert all(not shortcut.isEnabled() for shortcut in stolen)
+
+    QTest.keyClick(window, Qt.Key.Key_Tab, Qt.KeyboardModifier.ControlModifier)
+    qt_app.processEvents()
+    if window.doc_tabs.currentIndex() == 2:
+        qt_app.sendEvent(
+            window, key_event(Qt.Key.Key_Tab, Qt.KeyboardModifier.ControlModifier)
+        )
+        qt_app.processEvents()
+    assert window.doc_tabs.currentIndex() == 0
+    assert window._tabs.currentIndex() == panel_before
+    close(window)
+
+
+def test_export_stays_available_when_only_session_history_remains(
+    qt_app, monkeypatch, tmp_path
+):
+    """当前标签没有结果、但会话历史里有可导内容时，导出入口仍可用。"""
+    reset_data_export_prefs()
+    window = make_window(qt_app)
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    set_roi_and_quantify(window)
+    add_history(window, "loading_control", "Actin")
+    window._results_dirty = False
+    with auto_answer():
+        assert window._close_document() is True
+    assert window._result is None
+    assert window._session.entries
+    assert window.act_export_data.isEnabled()
+
+    seen = run_data_export(window, monkeypatch, tmp_path, accept=False)
+    assert seen
+    dialog = seen[0]
+    assert not dialog.raw_check.isEnabled()
+    assert dialog.session_raw_check.isEnabled()
+    close(window)
+
+
+def test_quantify_on_a_lands_after_opening_b_offscreen(qt_app, monkeypatch):
+    """冒烟：A 定量进行中开 B，切回 A 时结果正常落地。"""
+    window = make_window(qt_app)
+    window.show()
+    load_array(window, synthetic_raw([20000.0, 15000.0, 10000.0]))
+    real_quantify = mw.quantify_roi
+
+    def slow_quantify(*args, **kwargs):
+        time.sleep(0.25)
+        return real_quantify(*args, **kwargs)
+
+    monkeypatch.setattr(mw, "quantify_roi", slow_quantify)
+    x, y, inset, height = ROI_BOX
+    window.canvas.set_roi(x, y, window._blot.width + inset, height)
+    window._apply_roi_change()
+    assert wait_for(lambda: mw.JOB_QUANTIFY in window._running), "A 的定量应当已经开跑"
+    a_id = window._active_id
+
+    load_new_tab(window, synthetic_raw([18000.0, 9000.0]))
+    assert window._has_job(mw.JOB_QUANTIFY, a_id)
+    assert window._result is None
+    assert settle(window)
+    window._switch_to_index(0)
+    qt_app.processEvents()
+    assert bands(window), "切回 A 时定量结果必须已经落地"
+    close(window)
+

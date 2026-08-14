@@ -1016,6 +1016,12 @@ def quantify_lanes(
             baseline_per_pixel = float(lane.baseline[seg_start:seg_stop].mean()) / max(width, 1)
             display_bg = (white_level - baseline_per_pixel) if dark_bands else baseline_per_pixel
             snr = (density / limit * LOD_SIGMA) if limit > 0.0 else 0.0
+            seg_profile = lane.profile[seg_start:seg_stop]
+            seg_base = lane.baseline[seg_start:seg_stop]
+            if seg_profile.size and width > 0:
+                peak = round(float(((seg_profile - seg_base) / width).max()), 3)
+            else:
+                peak = 0.0
             measurements.append(
                 BandMeasurement(
                     lane=lane.lane,
@@ -1034,6 +1040,7 @@ def quantify_lanes(
                     ),
                     detection_limit=round(limit, 3),
                     snr=round(snr, 3),
+                    peak=peak,
                 )
             )
 
@@ -1122,6 +1129,8 @@ def measure_box_native(
     # user drew, not with the protein inside it.
     integrated = max(0.0, raw_integral - CLIPPED_HALF_NORMAL_MEAN * sigma * box.size)
     limit = detection_limit(sigma, int(box.size))
+    residue = np.maximum((local_bg - box) if dark_bands else (box - local_bg), 0.0)
+    peak = round(float(residue.max()), 3) if residue.size else 0.0
     return BandMeasurement(
         lane=lane,
         band=band,
@@ -1138,6 +1147,7 @@ def measure_box_native(
         ),
         detection_limit=round(limit, 3),
         snr=round(integrated / limit * LOD_SIGMA, 3) if limit > 0.0 else 0.0,
+        peak=peak,
     )
 
 

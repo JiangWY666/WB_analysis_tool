@@ -210,6 +210,20 @@ class DiagnosticsBar(QFrame):
             return False
         return self._dismissed_key is not None and self._dismissed_key == self._key
 
+    def dismiss_state(self) -> tuple:
+        """「我知道了」与详情展开：切标签时跟着文档走，不能串到另一张膜。"""
+        return (self._key, self._dismissed_key, self._expanded)
+
+    def restore_dismiss_state(self, state: tuple | None) -> None:
+        if not state:
+            return
+        key, dismissed_key, expanded = state
+        if key != self._key:
+            return
+        self._dismissed_key = dismissed_key
+        self._expanded = expanded
+        self._refresh()
+
     def wants_detail(self) -> bool:
         """这批诊断该不该展开详情——用户没表过态时按严重度决定。"""
         if self._expanded is not None:

@@ -39,12 +39,23 @@ SEP_MARGIN = 2.0
 # 让"右键线上删除"在两处需要的手感完全一样。
 HIT_PX = CANVAS_HIT_PX - 1.0
 
-COLUMN_TITLE = "ROI 横向剖面（双击加分隔线 · 拖橙线微调 · 右键删除）"
-LANE_TITLE_EMPTY = "泳道纵向剖面（先 ROI 定量）"
+COLUMN_TITLE = "ROI 横向剖面"
+LANE_TITLE_EMPTY = "泳道纵向剖面"
 # 两张图纵轴的量纲不同：左图是 ROI 每一列的平均信号，右图是整条泳道宽度上
-# 求和后的信号。以前都标"信号强度"，读数会被误解成同一口径。
-COLUMN_Y_LABEL = "列平均信号（每像素灰度）"
-LANE_Y_LABEL = "行累加信号（整条泳道宽度求和）"
+# 求和后的信号。轴上只留短名把两者区分开，完整口径写在图的 tooltip 里——竖排
+# 的轴标签每多一个字就多占一列宽度，解释性文字摆在那里最不划算。
+COLUMN_Y_LABEL = "列平均信号"
+LANE_Y_LABEL = "行累加信号"
+
+COLUMN_TIP = (
+    "双击空白处添加分隔线；右键分隔线删除；拖动橙线微调。\n"
+    "位置按图像像素对齐，和画布上的分隔线是同一条。\n"
+    "纵轴：ROI 每一列的平均灰度。"
+)
+LANE_TIP = (
+    "点选条带后显示该泳道的纵向剖面，需要先做 ROI 定量。\n"
+    "纵轴：整条泳道宽度上求和后的灰度，与左图不是同一口径。"
+)
 
 
 TITLE_PT = 10.0
@@ -196,12 +207,9 @@ class ProfilePanel(QWidget):
         self._col_curve = self._col_plot.plot(
             pen=pg.mkPen(ACCENT, width=2), name="列平均信号"
         )
-        self._col_plot.setToolTip(
-            "双击空白处添加分隔线；右键分隔线删除；拖动橙线微调。\n"
-            "位置按图像像素对齐，和画布上的分隔线是同一条。"
-        )
-        # 图例只说"这个颜色是什么"。怎么加 / 怎么删写在图标题里了，图例里再写
-        # 一遍就是同一句话在同一张图上出现两次。
+        self._col_plot.setToolTip(COLUMN_TIP)
+        # 图例只说"这个颜色是什么"。怎么加 / 怎么删挂在图的 tooltip 里了，图例里
+        # 再写一遍就是同一句话在同一张图上出现两次。
         col_entries = [
             (ACCENT, None, False, "列平均信号"),
             (SEPARATOR, None, False, "泳道分隔线"),
@@ -215,6 +223,7 @@ class ProfilePanel(QWidget):
         )
         self._lane_plot.setLabel("bottom", "Y（像素）")
         self._lane_plot.setLabel("left", LANE_Y_LABEL)
+        self._lane_plot.setToolTip(LANE_TIP)
         lane_entries = [
             (ACCENT, None, False, "泳道信号"),
             (BASELINE, None, True, "扣除用基线"),
@@ -226,9 +235,8 @@ class ProfilePanel(QWidget):
         reset_button = QPushButton("复位视图")
         reset_button.setToolTip("把两张剖面图恢复为自动缩放（框选放大后用它退出）")
         reset_button.clicked.connect(self.reset_views)
-        # 这里以前还有一行"双击加分隔线 · 拖动微调 · 右键删除"的说明，和左图标题
-        # 逐字重复——同一句话在同一个面板里出现两次，占掉一整行高度却没多说什么。
-        # 留标题（在图内、看图时就在眼前），这一行撤掉。
+        # 这里以前还有一行"双击加分隔线 · 拖动微调 · 右键删除"的说明，占掉一整行
+        # 高度。操作说明统一收在左图的 tooltip 里，面板上不再常驻。
         bar = QHBoxLayout()
         bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(8)
@@ -761,6 +769,9 @@ class ProfilePanel(QWidget):
         if self._measurements:
             return float(sum(float(m.integrated_density) for m in self._lane_bands(target)))
         return float(sum(target.band_densities))
+
+    def current_lane(self) -> int | None:
+        return self._current_lane
 
     def show_lane(self, lane_number: int) -> None:
         target = None

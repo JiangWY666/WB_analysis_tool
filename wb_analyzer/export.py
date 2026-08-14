@@ -11,7 +11,7 @@ methods section can be copied out of.
 from __future__ import annotations
 
 import csv
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +42,8 @@ from .normalize import (
     RoiCheck,
     _format_bands,
     coerce_origin,
+    export_normalized_csv,
+    origin_label,
 )
 from .roi import RoiRect
 
@@ -54,26 +56,45 @@ __all__ = [
     "LAYER_SEPARATORS",
     "LOSSLESS_SUFFIXES",
     "MM_PER_INCH",
+    "BANDS_CSV_FIELDS",
+    "COMPACT_BANDS_FIELDS",
+    "COMPACT_SESSION_RAW_FIELDS",
+    "LEGACY_BANDS_FIELDS",
+    "RAW_STAT_FIELDS",
+    "SESSION_RAW_FIELDS",
     "SUMMARY_LONG_FIELDS",
     "SUMMARY_VALUE_FOLD",
     "SUMMARY_VALUE_NORMALIZED",
+    "DataExportResult",
     "FigureExport",
     "PrintScale",
+    "RawStatRow",
     "SummaryExport",
     "SummaryRow",
     "WideCellGap",
     "WideRow",
     "WideTable",
+    "bands_fields",
+    "build_raw_stat_rows",
+    "build_raw_stat_rows_from_session",
     "build_summary_rows",
     "build_wide_table",
     "dpi_for_width_mm",
     "export_figure",
     "export_presentation_figure",
     "export_presentation_figures",
+    "export_raw_stats",
     "export_result",
+    "export_selected_data",
+    "export_session_raw_stats",
     "export_summary_tables",
+    "format_roi_id",
     "max_print_width_mm",
+    "normalization_export_available",
+    "planned_data_export_names",
     "print_scale",
+    "session_raw_fields",
+    "summary_export_available",
 ]
 
 MM_PER_INCH = 25.4
@@ -123,6 +144,314 @@ _SEPARATOR_COLOR = (255, 200, 0)
 # --------------------------------------------------------------------- 结果表
 
 
+LEGACY_BANDS_FIELDS = [
+    "lane",
+    "band",
+    "x",
+    "y",
+    "width",
+    "height",
+    "area",
+    "mean_intensity",
+    "background",
+    "integrated_density",
+    "saturated_fraction",
+    "detection_limit",
+    "snr",
+    "below_detection",
+    "origin",
+]
+"""Column order of ``*_bands.csv`` before extra provenance columns existed.
+
+New columns are appended after this prefix. Anything reading the file by
+position through ``origin`` keeps working.
+"""
+
+COMPACT_BANDS_FIELDS = [
+    "source",
+    "lane",
+    "band",
+    "sample",
+    "integrated_density",
+    "below_detection",
+]
+"""Default ``*_bands.csv`` columns.
+
+The analysis-facing minimum: which file, which band, the integral, and
+whether that integral cleared the detection limit. Everything else lives
+behind the full-stats switch.
+"""
+
+BANDS_CSV_FIELDS = [
+    *LEGACY_BANDS_FIELDS,
+    "source",
+    "membrane",
+    "roi_id",
+    "sample",
+    "peak",
+    "background_method",
+    "background_params",
+]
+"""Full ``*_bands.csv`` when the caller asks for complete statistics.
+
+The original 15 columns stay in front so older scripts still read by
+position; provenance columns are appended after ``origin``.
+"""
+
+COMPACT_SESSION_RAW_FIELDS = [
+    *COMPACT_BANDS_FIELDS,
+    "protein",
+    "kind",
+    "group",
+]
+"""Default ``raw_long.csv``: compact band columns plus which history entry."""
+
+SESSION_RAW_FIELDS = [
+    *BANDS_CSV_FIELDS,
+    "protein",
+    "kind",
+    "group",
+]
+"""Full ``raw_long.csv`` when complete statistics are requested."""
+
+RAW_STAT_FIELDS = SESSION_RAW_FIELDS
+"""Alias for the full session-wide raw table."""
+
+
+def bands_fields(*, full_stats: bool = False) -> list[str]:
+    return list(BANDS_CSV_FIELDS if full_stats else COMPACT_BANDS_FIELDS)
+
+
+def session_raw_fields(*, full_stats: bool = False) -> list[str]:
+    return list(SESSION_RAW_FIELDS if full_stats else COMPACT_SESSION_RAW_FIELDS)
+
+_NORMALIZATION_COLUMNS = frozenset(
+    {
+        "normalized",
+        "fold_change",
+        "loading_control",
+        "loading_control_name",
+        "target",
+        "target_name",
+        "control_lane",
+    }
+)
+
+
+def format_roi_id(roi: RoiRect | str | None) -> str:
+    """Stable, copy-pasteable identity of one ROI. Empty when there is none."""
+    if roi is None:
+        return ""
+    if isinstance(roi, str):
+        return roi.strip()
+    return f"x={int(roi.x)};y={int(roi.y)};w={int(roi.width)};h={int(roi.height)}"
+
+
+def _cell(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return int(value)
+    return value
+
+
+@dataclass(frozen=True)
+class RawStatRow:
+    """One measurement, written as one CSV row. Never an aggregate."""
+
+    lane: int
+    band: int | str = ""
+    x: int | str = ""
+    y: int | str = ""
+    width: int | str = ""
+    height: int | str = ""
+    area: int | str = ""
+    mean_intensity: float | str = ""
+    background: float | str = ""
+    integrated_density: float | str = ""
+    saturated_fraction: float | str = ""
+    detection_limit: float | str = ""
+    snr: float | str = ""
+    below_detection: int | str = ""
+    origin: str = ORIGIN_UNKNOWN
+    source: str = ""
+    membrane: str = ""
+    roi_id: str = ""
+    sample: str = ""
+    peak: float | str = ""
+    background_method: str = ""
+    background_params: str = ""
+    protein: str = ""
+    kind: str = ""
+    group: str = ""
+
+    def as_dict(self) -> dict[str, object]:
+        return {name: _cell(getattr(self, name)) for name in RAW_STAT_FIELDS}
+
+
+def build_raw_stat_rows(
+    measurements: Sequence[BandMeasurement],
+    *,
+    origin: BackgroundOrigin | str = ORIGIN_UNKNOWN,
+    source: str = "",
+    membrane: str = "",
+    roi: RoiRect | str | None = None,
+    sample_names: Mapping[int, str] | None = None,
+    background_params: str = "",
+    protein: str = "",
+    kind: str = "",
+    group: str = "",
+) -> list[RawStatRow]:
+    """One :class:`RawStatRow` per measurement. Same sample name → N rows.
+
+    Does not average, pair, or drop duplicates. ``sample_names`` is keyed by
+    lane number; a missing name becomes an empty cell, not a skipped row.
+    """
+    origin = coerce_origin(origin)
+    method = origin_label(origin)
+    roi_id = format_roi_id(roi)
+    names = {int(lane): str(name or "").strip() for lane, name in (sample_names or {}).items()}
+    membrane = str(membrane or "").strip()
+    if not membrane and source:
+        membrane = Path(str(source)).stem
+    rows: list[RawStatRow] = []
+    for measurement in measurements:
+        lane = int(measurement.lane)
+        rows.append(
+            RawStatRow(
+                lane=lane,
+                band=int(measurement.band),
+                x=int(measurement.x),
+                y=int(measurement.y),
+                width=int(measurement.width),
+                height=int(measurement.height),
+                area=int(measurement.area),
+                mean_intensity=measurement.mean_intensity,
+                background=measurement.background,
+                integrated_density=measurement.integrated_density,
+                saturated_fraction=measurement.saturated_fraction,
+                detection_limit=measurement.detection_limit,
+                snr=measurement.snr,
+                below_detection=int(measurement.below_detection),
+                origin=origin,
+                source=str(source or ""),
+                membrane=membrane,
+                roi_id=roi_id,
+                sample=names.get(lane, ""),
+                peak=measurement.peak,
+                background_method=method,
+                background_params=str(background_params or ""),
+                protein=str(protein or ""),
+                kind=str(kind or ""),
+                group=str(group or ""),
+            )
+        )
+    return rows
+
+
+def build_raw_stat_rows_from_session(session: AnalysisSession) -> list[RawStatRow]:
+    """Every recorded band of every history entry, still un-normalized.
+
+    A lane that kept several bands contributes several rows — the entry's
+    :attr:`~wb_analyzer.normalize.QuantEntry.band_pick` is *not* applied here,
+    because collapsing those bands is the caller's decision. CSV imports that
+    never stored per-band detail fall back to one row per lane (the only
+    numbers that file contains), which is not an average computed at export.
+    """
+    rows: list[RawStatRow] = []
+    for entry in session.entries:
+        method = origin_label(entry.origin)
+        params = f"band_pick={entry.band_pick}" if entry.band_pick else ""
+        if entry.bands:
+            for band in entry.bands:
+                rows.append(
+                    RawStatRow(
+                        lane=int(band.lane),
+                        band=int(band.band),
+                        y=int(band.y),
+                        mean_intensity=band.mean_intensity,
+                        background=band.background,
+                        integrated_density=band.integrated_density,
+                        below_detection=int(band.below_detection),
+                        origin=entry.origin,
+                        source=entry.source,
+                        membrane=entry.membrane,
+                        sample=session.lane_label(entry.group, int(band.lane)),
+                        background_method=method,
+                        background_params=params,
+                        protein=entry.name,
+                        kind=entry.kind,
+                        group=entry.group,
+                    )
+                )
+            continue
+        for index, lane in enumerate(entry.lane_numbers):
+            intensity: object = ""
+            background: object = ""
+            mean_intensity: object = ""
+            below: object = ""
+            if index < len(entry.intensities):
+                intensity = entry.intensities[index]
+            if index < len(entry.backgrounds):
+                background = entry.backgrounds[index]
+            if index < len(entry.mean_intensities):
+                mean_intensity = entry.mean_intensities[index]
+            if index < len(entry.below_detection):
+                below = int(entry.below_detection[index])
+            rows.append(
+                RawStatRow(
+                    lane=int(lane),
+                    integrated_density=intensity if intensity != "" else "",
+                    background=background if background != "" else "",
+                    mean_intensity=mean_intensity if mean_intensity != "" else "",
+                    below_detection=below if below != "" else "",
+                    origin=entry.origin,
+                    source=entry.source,
+                    membrane=entry.membrane,
+                    sample=session.lane_label(entry.group, int(lane)),
+                    background_method=method,
+                    background_params=params,
+                    protein=entry.name,
+                    kind=entry.kind,
+                    group=entry.group,
+                )
+            )
+    return rows
+
+
+def export_raw_stats(
+    rows: Sequence[RawStatRow],
+    path: str | Path,
+    *,
+    fields: Sequence[str] | None = None,
+) -> Path:
+    """Write a long-format raw table. ``fields`` defaults to the compact band columns."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(fields) if fields is not None else list(COMPACT_BANDS_FIELDS)
+    if _NORMALIZATION_COLUMNS & set(fieldnames):
+        raise ValueError("原始灰度统计不得包含归一化或 fold change 列")
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row.as_dict())
+    return path
+
+
+def export_session_raw_stats(
+    session: AnalysisSession,
+    path: str | Path,
+    *,
+    full_stats: bool = False,
+) -> Path:
+    """Dump every history measurement to ``path``. See :func:`build_raw_stat_rows_from_session`."""
+    rows = build_raw_stat_rows_from_session(session)
+    if not rows:
+        raise ValueError("归一化历史是空的：还没有任何可导出的原始灰度统计。")
+    return export_raw_stats(rows, path, fields=session_raw_fields(full_stats=full_stats))
+
+
 def export_result(
     result: AnalysisResult,
     image_path: str | Path,
@@ -130,8 +459,17 @@ def export_result(
     *,
     origin: BackgroundOrigin | str = ORIGIN_UNKNOWN,
     dpi: float = DEFAULT_DPI,
-) -> tuple[Path, Path]:
-    """Write the band table and the annotated preview.
+    membrane: str = "",
+    roi: RoiRect | str | None = None,
+    sample_names: Mapping[int, str] | None = None,
+    background_params: str = "",
+    protein: str = "",
+    kind: str = "",
+    group: str = "",
+    write_preview: bool = True,
+    full_stats: bool = False,
+) -> tuple[Path, Path | None]:
+    """Write the band table and (optionally) the annotated preview.
 
     ``origin`` states which background convention measured these numbers
     (README §9). It is a parameter rather than something read off the result
@@ -139,38 +477,212 @@ def export_result(
     say is a file whose numbers cannot be safely compared with anyone else's a
     month later.
 
+    The CSV is long-format raw grayscale statistics: one row per measurement,
+    including technical replicates that share a sample name. It does not
+    normalize, compute fold change, or pivot into a wide table. By default
+    only :data:`COMPACT_BANDS_FIELDS` are written; ``full_stats=True`` restores
+    :data:`BANDS_CSV_FIELDS` (legacy 15 columns first, extras appended).
+
     The preview here is the 8-bit working view, not a figure; use
     :func:`export_presentation_figure` for anything that will be published.
     """
     origin = coerce_origin(origin)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    source = str(image_path)
     stem = Path(image_path).stem
     csv_path = output / f"{stem}_bands.csv"
+    rows = build_raw_stat_rows(
+        result.measurements,
+        origin=origin,
+        source=source,
+        membrane=membrane,
+        roi=roi,
+        sample_names=sample_names,
+        background_params=background_params,
+        protein=protein,
+        kind=kind,
+        group=group,
+    )
+    export_raw_stats(rows, csv_path, fields=bands_fields(full_stats=full_stats))
+    if not write_preview:
+        return csv_path, None
     preview_path = output / f"{stem}_annotated.png"
-    fields = [
-        "lane",
-        "band",
-        "x",
-        "y",
-        "width",
-        "height",
-        "area",
-        "mean_intensity",
-        "background",
-        "integrated_density",
-        "saturated_fraction",
-        "detection_limit",
-        "snr",
-        "below_detection",
-        "origin",
-    ]
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows({**m.as_dict(), "origin": origin} for m in result.measurements)
     _write_image(preview_path, result.annotated_image, dpi=dpi, bgr=True)
     return csv_path, preview_path
+
+
+@dataclass(frozen=True)
+class DataExportResult:
+    """Files produced by one :func:`export_selected_data` call."""
+
+    bands_csv: Path | None = None
+    preview_path: Path | None = None
+    session_raw_csv: Path | None = None
+    normalized_csv: Path | None = None
+    summary: SummaryExport | None = None
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        found: list[Path] = []
+        for path in (self.bands_csv, self.preview_path, self.session_raw_csv, self.normalized_csv):
+            if path is not None:
+                found.append(path)
+        if self.summary is not None:
+            found.extend([self.summary.long_path, self.summary.wide_path])
+            if self.summary.readme_path is not None:
+                found.append(self.summary.readme_path)
+        return tuple(found)
+
+
+def planned_data_export_names(
+    stem: str,
+    *,
+    raw_stats: bool = True,
+    normalized: bool = False,
+    summary: bool = False,
+    has_result: bool = True,
+    has_session: bool = False,
+    include_session_raw: bool = False,
+) -> list[str]:
+    """File names :func:`export_selected_data` would write into a directory."""
+    names: list[str] = []
+    if raw_stats and has_result:
+        names.append(f"{stem}_bands.csv")
+        names.append(f"{stem}_annotated.png")
+    if include_session_raw and has_session:
+        names.append("raw_long.csv")
+    if normalized:
+        names.append("normalized_results.csv")
+    if summary:
+        names.extend(["summary_long.csv", "summary_wide.csv", "summary_wide_readme.txt"])
+    return names
+
+
+def normalization_export_available(session: AnalysisSession | None) -> tuple[bool, str]:
+    """Whether a normalized CSV would contain at least one row, and why not."""
+    if session is None or not session.entries:
+        return False, "归一化历史是空的：把内参和目标蛋白分别加入历史后才能导出归一化结果。"
+    rows = session.normalize_all()
+    if not rows:
+        detail = "；".join(session.last_warnings)
+        extra = f" {detail}" if detail else ""
+        return False, (
+            "还没有可导出的归一化结果：同一分组需要同时有内参与目标蛋白。"
+            + extra
+        )
+    return True, ""
+
+
+def summary_export_available(session: AnalysisSession | None) -> tuple[bool, str]:
+    """Whether :func:`export_summary_tables` would write at least one row."""
+    if session is None or not session.entries:
+        return False, "归一化历史是空的：跨膜汇总需要至少一组内参与目标蛋白。"
+    rows = build_summary_rows(session)
+    if not rows:
+        detail = "；".join(session.last_warnings)
+        extra = f" {detail}" if detail else "每个分组都需要一条内参和至少一个目标蛋白。"
+        return False, f"还没有可导出的跨膜汇总：{extra}"
+    return True, ""
+
+
+def export_selected_data(
+    output_dir: str | Path,
+    *,
+    raw_stats: bool = True,
+    normalized: bool = False,
+    summary: bool = False,
+    result: AnalysisResult | None = None,
+    image_path: str | Path | None = None,
+    origin: BackgroundOrigin | str = ORIGIN_UNKNOWN,
+    dpi: float = DEFAULT_DPI,
+    membrane: str = "",
+    roi: RoiRect | str | None = None,
+    sample_names: Mapping[int, str] | None = None,
+    background_params: str = "",
+    protein: str = "",
+    kind: str = "",
+    group: str = "",
+    session: AnalysisSession | None = None,
+    include_session_raw: bool = False,
+    full_stats: bool = False,
+    write_preview: bool = True,
+    summary_value: str | None = None,
+) -> DataExportResult:
+    """Write the tables the caller asked for into ``output_dir``.
+
+    Raw stats, normalized ratios and the cross-membrane summary are independent
+    choices. Raw stats never include ``normalized`` / ``fold_change`` and never
+    average technical replicates. At least one of the three flags must be set.
+
+    ``full_stats`` switches the raw tables from :data:`COMPACT_BANDS_FIELDS`
+    to :data:`BANDS_CSV_FIELDS`. ``include_session_raw`` writes ``raw_long.csv``
+    from the whole history; it is off by default and is the only way that file
+    is produced.
+    """
+    if not raw_stats and not normalized and not summary and not include_session_raw:
+        raise ValueError("至少勾选一项要导出的内容。")
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    bands_csv: Path | None = None
+    preview_path: Path | None = None
+    session_raw_csv: Path | None = None
+    normalized_csv: Path | None = None
+    summary_export: SummaryExport | None = None
+
+    if raw_stats:
+        if result is not None:
+            source = image_path if image_path is not None else "blot.png"
+            bands_csv, preview_path = export_result(
+                result,
+                source,
+                output,
+                origin=origin,
+                dpi=dpi,
+                membrane=membrane,
+                roi=roi,
+                sample_names=sample_names,
+                background_params=background_params,
+                protein=protein,
+                kind=kind,
+                group=group,
+                write_preview=write_preview,
+                full_stats=full_stats,
+            )
+        if bands_csv is None and not include_session_raw:
+            raise ValueError("没有可导出的原始灰度统计：先定量，或勾选导出历史长表。")
+
+    if include_session_raw:
+        if session is None or not session.entries:
+            raise ValueError("归一化历史是空的：还没有任何可导出的原始灰度统计。")
+        session_raw_csv = export_session_raw_stats(
+            session, output / "raw_long.csv", full_stats=full_stats
+        )
+
+    if normalized:
+        ok, reason = normalization_export_available(session)
+        if not ok:
+            raise ValueError(reason)
+        assert session is not None
+        normalized_csv = export_normalized_csv(
+            session.normalize_all(), output / "normalized_results.csv"
+        )
+
+    if summary:
+        ok, reason = summary_export_available(session)
+        if not ok:
+            raise ValueError(reason)
+        assert session is not None
+        value = SUMMARY_VALUE_FOLD if summary_value is None else summary_value
+        summary_export = export_summary_tables(session, output, value=value)
+
+    return DataExportResult(
+        bands_csv=bands_csv,
+        preview_path=preview_path,
+        session_raw_csv=session_raw_csv,
+        normalized_csv=normalized_csv,
+        summary=summary_export,
+    )
 
 
 # --------------------------------------------------------------------- 汇总表
@@ -477,8 +989,8 @@ def build_wide_table(
 
     The row key is ``group + lane``, never lane alone: two experiments both
     have a lane 1, and merging them would put unrelated membranes on the same
-    line. Unrelated groups make the table sparse instead, which is honest and
-    which Prism reads without complaint.
+    line. Unrelated groups make the table sparse instead, which is honest:
+    an empty cell is preferable to inventing a merged value.
     """
     if value not in (SUMMARY_VALUE_FOLD, SUMMARY_VALUE_NORMALIZED):
         raise ValueError(
@@ -667,9 +1179,10 @@ def export_summary_tables(
 
     The long table is the record: one row per group × lane × target, with both
     sides' membrane, background convention, band pick and detection flag. The
-    wide table is the deliverable: group × lane rows and one column per
-    target, ready to paste into GraphPad / Prism. The sidecar exists because
-    the wide table carries no provenance of its own.
+    wide table is a convenience pivot: group × lane rows and one column per
+    target. It is optional — membranes with technical replicates are better
+    exported as raw grayscale statistics and merged downstream. The sidecar
+    exists because the wide table carries no provenance of its own.
     """
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
