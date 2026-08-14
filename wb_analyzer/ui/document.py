@@ -70,6 +70,8 @@ class Document:
     selected_bands: list = field(default_factory=list)
     current_lane: int | None = None
     reload_generation: int = 0
+    tilt_epoch: int = 0
+    tilt_running: bool = False
 
     def source(self) -> str:
         """给「同一文件不要开两个标签」用的身份；没有路径就空串。"""

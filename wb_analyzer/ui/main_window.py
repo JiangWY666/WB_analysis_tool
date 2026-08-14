@@ -147,6 +147,29 @@ LAYOUT_VERSION = 1
 # 关窗时最多等后台任务这么久，超时就放弃等待（已取消的任务不会再 emit）
 CLOSE_WAIT_MS = 4000
 
+# _invalidate_jobs(doc_id=...) 的哨兵：默认只动当前标签，关窗时清全部。
+_JOB_ACTIVE = object()
+_JOB_ALL = object()
+
+
+class _KindBag(dict):
+    """按 (文档, 任务种类) 存后台任务，同时让 ``kind in bag`` 仍能用。
+
+    多文档之后同一种任务可以在 A、B 上各跑一份。测试和若干旧判断写的是
+    ``JOB_ORIENT in window._running``，这里对字符串键做"任一标签有没有"的
+    查询，元组键则按槽位精确命中。
+    """
+
+    def _as_slot(self, key):
+        return key if isinstance(key, tuple) else (None, key)
+
+    def __contains__(self, key) -> bool:  # noqa: D105
+        if isinstance(key, tuple):
+            return dict.__contains__(self, key)
+        if isinstance(key, str):
+            return any(kind == key for _owner, kind in self)
+        return dict.__contains__(self, key)
+
 ORIGIN_ROI = "roi"  # 结果来自 quantify_lanes（橡皮筋基线）
 ORIGIN_DETECT = "detect"  # 结果来自自动检测（环形中值局部背景）
 # 两条路径用的是两套背景口径（README 方法学第 9 节），数值不可互相比较，所以
@@ -806,9 +829,9 @@ class MainWindow(QMainWindow):
         # 原件身份：只有打开新文件才 +1，是 orient 任务的校验基准
         self._source_version = 0
         self._job_serial = 0
-        self._job_tokens: dict[str, tuple] = {}
-        self._workers: dict[str, object] = {}  # kind -> Worker，用于按类取消
-        self._running: dict[str, str] = {}  # 在跑的任务 kind -> 状态栏文案
+        self._job_tokens: _KindBag = _KindBag()
+        self._workers: _KindBag = _KindBag()
+        self._running: _KindBag = _KindBag()
         self._orient_target: tuple = (0, 0.0)  # 最近一次提交的目标朝向
         self._pending_restore: _Snapshot | None = None  # 等旋转到位后再落地的撤销状态
         self._dark_cache: tuple | None = None  # ((doc_version, bg_mode), dark_bands)
@@ -849,7 +872,6 @@ class MainWindow(QMainWindow):
         self._pixel_lru: list[int] = []
         self._max_resident_docs = MAX_RESIDENT_DOCS
         self._tilt_epoch = 0
-        self._job_doc: dict[str, int | None] = {}
         self._tilt_guide_angle: float | None = None
 
         self._rotate_timer = QTimer(self)
@@ -902,12 +924,12 @@ class MainWindow(QMainWindow):
 
     @property
     def _busy(self) -> bool:
-        """"忙"只指会产出结果数据的任务（定量 / 自动检测）。
+        """当前活动标签有没有在跑的结果类任务（定量 / 自动检测）。
 
-        加载、旋转、剖面属于呈现类任务，它们跑的时候界面照常可用——否则旋转
-        滑杆一拖就把自己锁死了。
+        别的标签在算不影响当前这张膜：A 定量时仍可打开 B，B 的画布照常可用。
+        加载、旋转、剖面属于呈现类任务，不算忙。
         """
-        return any(kind in self._running for kind in RESULT_JOBS)
+        return self._has_result_job(self._active_id)
 
     # ------------------------------------------------------------------ 构建界面
 
@@ -1244,13 +1266,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.normalize_panel, "归一化")
         tabs.setMinimumWidth(CONTROL_DOCK_MIN_PX)
         # 默认 Ctrl+Tab 会切「调整 / 结果 / 归一化」，抢掉文档标签的浏览器式切换
-        for shortcut in tabs.findChildren(QShortcut):
-            sequence = shortcut.key()
-            if sequence.matches(QKeySequence.StandardKey.NextChild) or sequence.matches(
-                QKeySequence.StandardKey.PreviousChild
-            ):
-                shortcut.setEnabled(False)
         self._tabs = tabs
+        self._release_ctrl_tab_for_documents()
 
         self._control_dock = QDockWidget("控制面板", self)
         self._control_dock.setObjectName("controlDock")
@@ -1663,8 +1680,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ 打开图片
 
     def _choose_image(self) -> None:
-        if self._reject_while_busy("打开图片"):
-            return
         start = self._last_open_dir or str(Path.home())
         filenames, _ = QFileDialog.getOpenFileNames(
             self,
@@ -1688,27 +1703,20 @@ class MainWindow(QMainWindow):
             self._switch_to_index(existing)
             self._set_status(f"{path.name} 已经打开，已切到该标签。")
             return True
-        if self._reject_while_busy("打开图片"):
-            return False
-        if JOB_LOAD in self._running:
+        if self._has_job(JOB_LOAD, None):
             if self._pending_load_path is None or source_key(self._pending_load_path) != source_key(path):
                 queued = {source_key(item) for item in self._open_queue}
                 if source_key(path) not in queued:
                     self._open_queue.append(path)
             return True
-        abandoned = self._invalidate_jobs(
-            {JOB_QUANTIFY, JOB_DETECT, JOB_ORIENT, JOB_PROFILE}
-        )
-        self._stop_doc_timers()
-        return self._start_load(path, abandoned=abandoned, synchronous=synchronous)
+        return self._start_load(path, abandoned=False, synchronous=synchronous)
 
     def _start_load(
         self, path: Path, *, abandoned: bool = False, synchronous: bool = False
     ) -> bool:
         self._pending_load_path = path
         self._pending_load_abandoned = abandoned
-        self._pending_reload = None
-        token = self._begin_job(JOB_LOAD, f"正在加载 {path.name}……")
+        token = self._begin_job(JOB_LOAD, f"正在加载 {path.name}……", doc_id=None)
         job = partial(load_blot, path)
         if synchronous:
             try:
@@ -1749,11 +1757,11 @@ class MainWindow(QMainWindow):
         """清掉窗口上「当前这一张膜」的痕迹，不碰标签列表与归一化历史。
 
         打开新标签时装上空白活状态、关掉最后一个标签退回空工作区，都走这里。
-        检测参数（泳道数 / 背景模式）故意不动：那是用户的工作习惯，不是某张膜
-        的分析结果。
+        检测参数不在这里改：新标签由 ``_reset_detection_defaults`` 拉回自动，
+        切回已有标签时由 Document 袋子还原那一张自己的值。
         """
         if drop_jobs:
-            skip_load = JOB_LOAD in self._running or self._pending_load_path is not None
+            skip_load = self._has_job(JOB_LOAD, None) or self._pending_load_path is not None
             kinds = None
             if skip_load:
                 kinds = (RESULT_JOBS | VIEW_JOBS) - {JOB_LOAD}
@@ -1837,8 +1845,8 @@ class MainWindow(QMainWindow):
             else []
         )
         if not self._confirm_discard_results(
-            title="关闭当前图片",
-            question="确定要关闭这张图片吗？",
+            title="关闭当前标签",
+            question="确定要关闭这个标签吗？",
             extra=extra,
         ):
             return False
@@ -1851,7 +1859,7 @@ class MainWindow(QMainWindow):
             self._set_status("已关闭当前标签；归一化历史保留着。")
         else:
             self._set_status(
-                "已关闭当前图片；归一化历史保留着，可以直接打开下一张膜继续。"
+                "已关闭最后一个标签；归一化历史保留着，可以直接打开下一张膜继续。"
             )
         return True
 
@@ -1878,10 +1886,11 @@ class MainWindow(QMainWindow):
         """把一张已解码的膜放进新标签（加载完成 / 测试装数组）。"""
         path = Path(path) if path is not None else getattr(blot, "path", None)
         if self._docs:
-            self._invalidate_jobs({JOB_QUANTIFY, JOB_DETECT, JOB_ORIENT, JOB_PROFILE})
-            self._stop_doc_timers()
+            self._flush_pending_live_jobs()
+            self._stop_live_timers(abandon_tilt=False)
             self._harvest_current()
         self._clear_live_document_ui(drop_jobs=False, clear_canvas=False)
+        self._reset_detection_defaults()
         doc = self._make_document(path)
         self._docs.append(doc)
         self._active_id = doc.doc_id
@@ -1889,6 +1898,9 @@ class MainWindow(QMainWindow):
         self._harvest_current()
         self._append_tab(doc)
         self._touch_resident(doc.doc_id)
+        # 活状态已经是新标签：忙碌条 / 取消按钮 / 画布锁必须跟着切走，
+        # 不能继续显示上一张还在跑的定量。
+        self._refresh_busy_ui()
 
     def _install_blot_pixels(
         self, blot, path: Path | None, *, abandoned: bool = False
@@ -1905,8 +1917,6 @@ class MainWindow(QMainWindow):
         self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
         name = path.name if path is not None else "未命名"
         loaded = f"已加载 {name}（{blot.width}×{blot.height}，{blot.bit_depth} 位）。"
-        if abandoned:
-            loaded = "⚠ 已放弃上一张图正在进行的计算。" + loaded
         self._select_tool(Tool.ROI)
         self._sync_roi_fields()
         self._update_action_states()
@@ -1955,10 +1965,6 @@ class MainWindow(QMainWindow):
             path=path,
             title=name,
             committed=self._EMPTY_STATE,
-            bg_index=max(0, self.bg_combo.currentIndex()),
-            lane_count=int(self.lane_spin.value()),
-            band_count=int(self.band_spin.value()),
-            weak_value=int(self.weak_slider.value()),
             tool=self.canvas.tool(),
         )
 
@@ -1990,13 +1996,56 @@ class MainWindow(QMainWindow):
                 return index
         return None
 
-    def _stop_doc_timers(self) -> None:
+    def _stop_live_timers(self, *, abandon_tilt: bool = False) -> None:
+        """停掉只属于当前这块活 UI 的防抖定时器。
+
+        切标签时不能把倾角任务的 epoch 一起 +1：那是上一张膜还在后台量的角度，
+        回来要落到那一张上。关掉当前标签才作废。
+        """
         self._rotate_timer.stop()
         self._roi_timer.stop()
         self._quant_timer.stop()
         self._quant_manual_pending = False
-        self._tilt_epoch += 1
-        self._tilt_running = False
+        if abandon_tilt:
+            self._tilt_epoch += 1
+            self._tilt_running = False
+
+    def _stop_doc_timers(self) -> None:
+        self._stop_live_timers(abandon_tilt=True)
+
+    def _flush_pending_live_jobs(self) -> None:
+        """切走之前把防抖里还没提交的活变成绑定当前文档的后台任务。"""
+        if self._rotate_timer.isActive():
+            self._rotate_timer.stop()
+            self._apply_rotation()
+        if self._roi_timer.isActive():
+            self._apply_roi_change()
+        elif self._quant_timer.isActive():
+            self._quant_timer.stop()
+            if self._blot is not None and self._roi is not None:
+                self._run_quantify(auto=not self._quant_manual_pending)
+
+    def _reset_detection_defaults(self) -> None:
+        """新标签从「自动」开始，不继承上一张膜手调过的泳道数 / 背景 / 灵敏度。
+
+        上一张膜为了对齐条带把泳道数改成 3，下一张若悄悄沿用，结果表行数看起来
+        正常，但分道已经错了——这种错没有任何提示。
+        """
+        self.bg_combo.blockSignals(True)
+        self.lane_spin.blockSignals(True)
+        self.band_spin.blockSignals(True)
+        self.weak_slider.blockSignals(True)
+        try:
+            self.bg_combo.setCurrentIndex(0)
+            self.lane_spin.setValue(0)
+            self.band_spin.setValue(0)
+            self.weak_slider.setValue(55)
+        finally:
+            self.bg_combo.blockSignals(False)
+            self.lane_spin.blockSignals(False)
+            self.band_spin.blockSignals(False)
+            self.weak_slider.blockSignals(False)
+        self._update_weak_hint(55)
 
     def _harvest_current(self) -> None:
         doc = self._current_doc()
@@ -2046,6 +2095,8 @@ class MainWindow(QMainWindow):
         doc.diagnostics_state = self.diagnostics.dismiss_state()
         doc.selected_bands = list(self.canvas.selected_bands())
         doc.current_lane = self.profile_panel.current_lane()
+        doc.tilt_epoch = int(self._tilt_epoch)
+        doc.tilt_running = bool(self._tilt_running)
 
     def _apply_document(self, doc: Document) -> None:
         self._applying_document = True
@@ -2071,6 +2122,8 @@ class MainWindow(QMainWindow):
             self._detect_dropped_roi = bool(doc.detect_dropped_roi)
             self._ruler_angle = doc.ruler_angle
             self._tilt_guide_angle = doc.tilt_guide_angle
+            self._tilt_epoch = int(doc.tilt_epoch)
+            self._tilt_running = bool(doc.tilt_running)
             self._doc_version = int(doc.doc_version)
             self._source_version = int(doc.source_version)
             self._dark_cache = doc.dark_cache
@@ -2116,6 +2169,7 @@ class MainWindow(QMainWindow):
             self._quant_timer.stop()
             self._syncing = False
             self._applying_document = False
+        self._refresh_busy_ui()
         if not doc.pixels_resident or self._blot is None:
             if doc.path is not None:
                 self._start_reload(doc)
@@ -2191,12 +2245,18 @@ class MainWindow(QMainWindow):
         if target.doc_id == self._active_id:
             self._sync_tab_current(index)
             return
-        self._invalidate_jobs({JOB_QUANTIFY, JOB_DETECT, JOB_ORIENT, JOB_PROFILE})
-        self._stop_doc_timers()
+        self._flush_pending_live_jobs()
+        self._stop_live_timers(abandon_tilt=False)
         self._harvest_current()
         self._apply_document(target)
         self._sync_tab_current(index)
         self._touch_resident(target.doc_id)
+        messages = self._visible_job_messages()
+        if messages:
+            self._refresh_busy_ui(messages[-1])
+        else:
+            self._refresh_busy_ui()
+            self._set_status()
 
     def _on_tab_current_changed(self, index: int) -> None:
         if self._syncing_tabs or index < 0:
@@ -2243,8 +2303,8 @@ class MainWindow(QMainWindow):
             return True
         answer = QMessageBox.question(
             self,
-            "关闭当前图片",
-            "\n".join([*lines, "确定要关闭这张图片吗？"]),
+            "关闭当前标签",
+            "\n".join([*lines, "确定要关闭这个标签吗？"]),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -2267,9 +2327,12 @@ class MainWindow(QMainWindow):
             return
         closing = self._docs[index]
         closing_current = closing.doc_id == self._active_id
+        self._invalidate_jobs(
+            {JOB_QUANTIFY, JOB_DETECT, JOB_ORIENT, JOB_PROFILE, JOB_LOAD},
+            doc_id=closing.doc_id,
+        )
         if closing_current:
-            self._invalidate_jobs({JOB_QUANTIFY, JOB_DETECT, JOB_ORIENT, JOB_PROFILE})
-            self._stop_doc_timers()
+            self._stop_live_timers(abandon_tilt=True)
         self._docs.pop(index)
         if closing.doc_id in self._pixel_lru:
             self._pixel_lru.remove(closing.doc_id)
@@ -2399,7 +2462,9 @@ class MainWindow(QMainWindow):
         doc.reload_generation += 1
         generation = doc.reload_generation
         self._pending_reload = (doc.doc_id, generation)
-        token = self._begin_job(JOB_LOAD, f"正在重新载入 {doc.display_name()}……")
+        token = self._begin_job(
+            JOB_LOAD, f"正在重新载入 {doc.display_name()}……", doc_id=doc.doc_id
+        )
         self._set_status(f"正在从磁盘重新载入 {doc.display_name()}……")
         self._submit_job(
             token,
@@ -2541,7 +2606,15 @@ class MainWindow(QMainWindow):
         if not self._job_is_current(token):
             errorlog.log_message(f"忽略过期的旋转报错：{message}")
             return
+        owner = self._live_owner(token)
         self._finish_job(token)
+        if owner != self._active_id:
+            doc = self._doc_by_id(owner)
+            if doc is not None:
+                doc.orient_target = (doc.quarter_turns, round(float(doc.angle), 6))
+                doc.pending_restore = None
+            errorlog.log_message(f"后台旋转失败（{owner}）：{message}")
+            return
         self._orient_target = (self._quarter_turns, round(self._angle, 6))
         self._pending_restore = None
         errorlog.log_message(f"旋转失败：{message}")
@@ -2550,14 +2623,22 @@ class MainWindow(QMainWindow):
         self._set_status(f"⚠ 旋转失败：{message}")
 
     def _remap_roi_for_rotation(
-        self, shape_hw: tuple, old_angle: float, new_angle: float, blot
+        self,
+        shape_hw: tuple,
+        old_angle: float,
+        new_angle: float,
+        blot,
+        *,
+        roi=None,
+        separators=None,
     ) -> tuple:
         """把 ROI 与分隔线从旧角度的坐标系搬到新角度（只算 4 个角点，很轻）。
 
         故意留在 UI 线程做：worker 提交时的"旧角度"可能已经因为超车而不是落地
         时的真实旧角度，只有在回调里用 self._angle 才对得上。
         """
-        r = self._roi
+        r = self._roi if roi is None else roi
+        seps = self._separators if separators is None else separators
         if r is None:
             return None, []
         corners = np.array(
@@ -2581,9 +2662,9 @@ class MainWindow(QMainWindow):
             max(1, int(round(y2 - y1))),
         ).clipped(blot.raw)
         new_seps: list[float] = []
-        if self._separators:
+        if seps:
             cy = r.y + r.height / 2.0
-            anchors = np.array([[s, cy] for s in self._separators], dtype=float)
+            anchors = np.array([[s, cy] for s in seps], dtype=float)
             mapped_x = remap_rotation(anchors, shape_hw, old_angle, new_angle)[:, 0]
             lo = new_roi.x + 2.0
             hi = new_roi.x + new_roi.width - 2.0
@@ -2597,7 +2678,11 @@ class MainWindow(QMainWindow):
         if not self._job_is_current(token):
             self._discard_stale_job(token, "旋转")
             return
+        owner = self._live_owner(token)
         self._finish_job(token)
+        if owner != self._active_id:
+            self._store_orient_on_doc(owner, turns, angle, payload)
+            return
         base, blot = payload
         restore = self._pending_restore
         self._pending_restore = None
@@ -2666,6 +2751,53 @@ class MainWindow(QMainWindow):
             self._set_status(f"已旋转 {angle:.1f}°。")
         self._update_action_states()
 
+    def _store_orient_on_doc(self, owner, turns: int, angle: float, payload) -> None:
+        doc = self._doc_by_id(owner)
+        if doc is None:
+            return
+        base, blot = payload
+        restore = doc.pending_restore
+        doc.pending_restore = None
+        turn_changed = int(turns) != int(doc.quarter_turns)
+        new_roi = None
+        new_seps: list[float] = []
+        if restore is None and not turn_changed and doc.roi is not None:
+            shape = (doc.blot_original or base).raw.shape[:2]
+            new_roi, new_seps = self._remap_roi_for_rotation(
+                shape,
+                float(doc.angle),
+                angle,
+                blot,
+                roi=doc.roi,
+                separators=list(doc.separators),
+            )
+        doc.doc_version = int(doc.doc_version) + 1
+        doc.dark_cache = None
+        self._invalidate_jobs(
+            {JOB_QUANTIFY, JOB_DETECT, JOB_PROFILE}, doc_id=owner
+        )
+        doc.blot_original = base
+        doc.blot = blot
+        doc.quarter_turns = int(turns)
+        doc.angle = float(angle)
+        doc.orient_target = (int(turns), round(float(angle), 6))
+        if restore is not None:
+            return
+        doc.result = None
+        doc.lanes = []
+        doc.roi_report = None
+        doc.results_dirty = False
+        doc.result_stale = False
+        if turn_changed:
+            doc.roi = None
+            doc.separators = []
+            doc.column_profile = None
+        elif new_roi is not None:
+            doc.roi = new_roi
+            doc.separators = new_seps
+            self._run_quantify_on_doc(doc)
+        errorlog.log_message(f"后台旋转已落到标签「{doc.display_name()}」")
+
     def _rotate_90(self, clockwise: bool) -> None:
         """整图 90° 旋转（横竖颠倒的扫描图）。
 
@@ -2718,11 +2850,27 @@ class MainWindow(QMainWindow):
         run_async(
             self._pool,
             partial(estimate_tilt, blot.raw, roi=roi, dark_bands=dark),
-            partial(self._on_tilt_done, epoch, version, roi),
-            partial(self._on_tilt_failed, epoch, version),
+            partial(self._on_tilt_done, epoch, version, roi, doc_id=self._active_id),
+            partial(self._on_tilt_failed, epoch, version, doc_id=self._active_id),
         )
 
-    def _on_tilt_done(self, epoch: int, version: int, roi, estimate: object) -> None:
+    def _on_tilt_done(
+        self, epoch: int, version: int, roi, estimate: object, doc_id=None
+    ) -> None:
+        owner = self._active_id if doc_id is None else doc_id
+        if owner != self._active_id:
+            doc = self._doc_by_id(owner)
+            if doc is None or epoch != int(doc.tilt_epoch) or version != int(doc.doc_version):
+                errorlog.log_message("丢弃过期的自动测倾角结果")
+                return
+            doc.tilt_running = False
+            if not getattr(estimate, "trusted", False):
+                return
+            angle = float(estimate.angle_deg)
+            doc.ruler_angle = angle
+            doc.tilt_guide_angle = angle
+            doc.ruler_text = f"标尺倾角：{angle:.2f}°（相对水平·自动）"
+            return
         self._tilt_running = False
         self._update_action_states()
         if epoch != self._tilt_epoch or version != self._doc_version:
@@ -2749,7 +2897,13 @@ class MainWindow(QMainWindow):
             message += "画布上的虚线就是这个角度，与条带平行才可用。"
         self._set_status(message)
 
-    def _on_tilt_failed(self, epoch: int, version: int, message: str) -> None:
+    def _on_tilt_failed(self, epoch: int, version: int, message: str, doc_id=None) -> None:
+        owner = self._active_id if doc_id is None else doc_id
+        if owner != self._active_id:
+            doc = self._doc_by_id(owner)
+            if doc is not None:
+                doc.tilt_running = False
+            return
         self._tilt_running = False
         self._update_action_states()
         if epoch != self._tilt_epoch or version != self._doc_version:
@@ -2907,8 +3061,11 @@ class MainWindow(QMainWindow):
         if not self._job_is_current(token):
             errorlog.log_message(f"忽略过期的剖面报错：{message}")
             return
+        owner = self._live_owner(token)
         self._finish_job(token)
         errorlog.log_message(f"ROI 剖面计算失败：{message}")
+        if owner != self._active_id:
+            return
         self.profile_panel.clear_column_profile()
         self._set_status(f"⚠ 剖面计算失败：{message}")
 
@@ -2924,8 +3081,12 @@ class MainWindow(QMainWindow):
         if not self._job_is_current(token):
             self._discard_stale_job(token, "剖面计算")
             return
+        owner = self._live_owner(token)
         self._finish_job(token)
         dark, profile = payload
+        if owner != self._active_id:
+            self._store_profile_on_doc(owner, rect, keep, created, commit, dark, profile)
+            return
         self._dark_cache = ((self._doc_version, self._bg_mode()), bool(dark))
         self._column_profile = np.asarray(profile, dtype=float)
         if self._roi is None:
@@ -2957,6 +3118,26 @@ class MainWindow(QMainWindow):
         self._schedule_quantify()
         if created and self.canvas.tool() is Tool.ROI:
             self._select_tool(Tool.ADJUST)
+
+    def _store_profile_on_doc(
+        self, owner, rect, keep: bool, created: bool, commit: bool, dark, profile
+    ) -> None:
+        doc = self._doc_by_id(owner)
+        if doc is None:
+            return
+        mode = BG_MODES[int(doc.bg_index) % len(BG_MODES)][1]
+        doc.dark_cache = ((int(doc.doc_version), mode), bool(dark))
+        doc.column_profile = np.asarray(profile, dtype=float)
+        if doc.roi is None:
+            return
+        if not keep:
+            expected = int(doc.lane_count) or None
+            seps = separators_from_profile(profile, rect, expected_lanes=expected)
+            if not seps and expected and expected > 1:
+                seps = default_separators(rect, expected)
+            doc.separators = [float(s) for s in seps]
+        if commit:
+            self._run_quantify_on_doc(doc)
 
     def _push_snap_targets(self) -> None:
         """把剖面谷底交给画布作为分隔线吸附目标。"""
@@ -3319,6 +3500,53 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------- 后台任务身份
 
+    def _job_slot(self, kind: str, doc_id=...):
+        """一种任务在一份文档上占一个槽。新文件加载挂在 (None, load)。"""
+        if doc_id is ...:
+            if kind == JOB_LOAD:
+                return (None, kind)
+            return (self._active_id, kind)
+        return (doc_id, kind)
+
+    def _slot_of_token(self, token: object):
+        for slot, stored in list(self._job_tokens.items()):
+            if stored == token:
+                return slot
+        return None
+
+    def _has_job(self, kind: str, doc_id=...) -> bool:
+        if doc_id is ...:
+            return kind in self._running
+        return (doc_id, kind) in self._job_tokens
+
+    def _has_result_job(self, doc_id) -> bool:
+        return any(
+            owner == doc_id and kind in RESULT_JOBS for owner, kind in self._running
+        )
+
+    def _visible_job_messages(self) -> list[str]:
+        messages: list[str] = []
+        for (owner, _kind), text in self._running.items():
+            if owner is None or owner == self._active_id:
+                messages.append(text)
+        return messages
+
+    def _job_is_visible(self, slot: tuple) -> bool:
+        owner, _kind = slot
+        return owner is None or owner == self._active_id
+
+    def _guard_for_owner(self, owner, kind: str) -> int | None:
+        if kind == JOB_LOAD:
+            return -1
+        if owner == self._active_id:
+            return self._job_guard(kind)
+        doc = self._doc_by_id(owner)
+        if doc is None:
+            return None
+        if kind == JOB_ORIENT:
+            return int(doc.source_version)
+        return int(doc.doc_version)
+
     def _job_guard(self, kind: str) -> int:
         """任务令牌里存的"身份"取自哪个版本号。
 
@@ -3341,77 +3569,100 @@ class MainWindow(QMainWindow):
         self._doc_version += 1
         self._dark_cache = None
 
-    def _invalidate_jobs(self, kinds=None) -> bool:
+    def _invalidate_jobs(self, kinds=None, *, doc_id=_JOB_ACTIVE) -> bool:
         """作废指定类别在跑的任务，返回是否中断了会产出结果的任务。
 
+        默认只动**当前标签**的槽。别的标签在跑的定量 / 旋转不受影响。
         令牌比对才是真正的护栏：就算取消晚了一步，回调也会因为身份对不上被
         丢弃。取消只是为了少算一点、少弹一次提示。
         """
         targets = set(RESULT_JOBS | VIEW_JOBS) if kinds is None else {str(k) for k in kinds}
         interrupted = False
-        for kind in targets:
-            worker = self._workers.pop(kind, None)
+        if doc_id is _JOB_ACTIVE:
+            owners = {self._active_id}
+        elif doc_id is _JOB_ALL:
+            owners = None
+        else:
+            owners = {doc_id}
+        for slot in list(self._job_tokens):
+            owner, kind = slot
+            if kind not in targets:
+                continue
+            if owners is not None and owner not in owners:
+                continue
+            worker = self._workers.pop(slot, None)
             if worker is not None:
                 worker.cancel()
-            dropped = self._job_tokens.pop(kind, None) is not None
-            dropped = self._running.pop(kind, None) is not None or dropped
-            self._job_doc.pop(kind, None)
+            dropped = self._job_tokens.pop(slot, None) is not None
+            dropped = self._running.pop(slot, None) is not None or dropped
             if dropped and kind in RESULT_JOBS:
                 interrupted = True
-        if JOB_QUANTIFY in targets:
+        if JOB_QUANTIFY in targets and (
+            doc_id is _JOB_ALL or doc_id is _JOB_ACTIVE or doc_id == self._active_id
+        ):
             self._quant_job_state = None
-        if JOB_ORIENT in targets:
+        if JOB_ORIENT in targets and (
+            doc_id is _JOB_ALL or doc_id is _JOB_ACTIVE or doc_id == self._active_id
+        ):
             self._orient_target = (self._quarter_turns, self._angle)
             self._pending_restore = None
         self._refresh_busy_ui()
         return interrupted
 
-    def _begin_job(self, kind: str, message: str | None = None) -> tuple:
-        """登记后台任务并返回令牌；同类任务后来者顶掉前者（任务超车）。"""
-        previous = self._workers.pop(kind, None)
+    def _begin_job(self, kind: str, message: str | None = None, *, doc_id=...) -> tuple:
+        """登记后台任务并返回令牌；同一文档上同类任务后来者顶掉前者。"""
+        slot = self._job_slot(kind, doc_id)
+        previous = self._workers.pop(slot, None)
         if previous is not None:
-            previous.cancel()  # 中间态直接丢，回来也会被令牌拦住
+            previous.cancel()
+        owner = slot[0]
         self._job_serial += 1
-        token = (kind, self._job_guard(kind), self._job_serial)
-        self._job_tokens[kind] = token
-        self._job_doc[kind] = None if kind == JOB_LOAD else self._active_id
-        self._running[kind] = message or JOB_LABELS.get(kind, kind)
-        self._refresh_busy_ui(message)
+        guard = self._guard_for_owner(owner, kind)
+        if guard is None:
+            guard = self._job_guard(kind)
+        token = (kind, int(guard), self._job_serial)
+        self._job_tokens[slot] = token
+        text = message or JOB_LABELS.get(kind, kind)
+        self._running[slot] = text
+        self._refresh_busy_ui(text if self._job_is_visible(slot) else None)
         return token
 
     def _submit_job(self, token: tuple, job, on_done, on_error) -> None:
         worker = run_async(self._pool, job, on_done, on_error)
-        self._workers[token[0]] = worker
+        slot = self._slot_of_token(token)
+        if slot is not None:
+            self._workers[slot] = worker
 
     def _finish_job(self, token: object) -> None:
         """任务收尾：只有令牌还是当前的才清掉忙碌状态（被超车的不清）。"""
-        if not isinstance(token, tuple) or not token:
+        slot = self._slot_of_token(token)
+        if slot is None:
             return
-        kind = token[0]
-        if self._job_tokens.get(kind) != token:
+        if self._job_tokens.get(slot) != token:
             return
-        self._job_tokens.pop(kind, None)
-        self._job_doc.pop(kind, None)
-        self._workers.pop(kind, None)
-        self._running.pop(kind, None)
+        self._job_tokens.pop(slot, None)
+        self._workers.pop(slot, None)
+        self._running.pop(slot, None)
         self._refresh_busy_ui()
 
     def _job_is_current(self, token: object) -> bool:
+        """令牌是否仍对应那份文档上的那次任务——不要求文档此刻正在看。"""
         if not isinstance(token, tuple) or len(token) != 3:
             return False
         kind, guard, _serial = token
-        if self._job_tokens.get(kind) != token:
+        slot = self._slot_of_token(token)
+        if slot is None or slot[1] != kind:
             return False
-        if kind != JOB_LOAD:
-            owner = self._job_doc.get(kind, self._active_id)
-            if owner != self._active_id:
-                return False
-        return guard == self._job_guard(kind)
+        expected = self._guard_for_owner(slot[0], kind)
+        return expected is not None and guard == expected
 
     def _view_pending(self, exclude=None) -> bool:
-        """有没有会替换图像 / 剖面的呈现类任务在跑。"""
+        """当前活动标签有没有会替换图像 / 剖面的呈现类任务在跑。"""
         skip = set(exclude or ())
-        return any(kind in self._running for kind in VIEW_JOBS if kind not in skip)
+        return any(
+            owner == self._active_id and kind in VIEW_JOBS and kind not in skip
+            for owner, kind in self._running
+        )
 
     def _discard_stale_job(self, token: object, what: str) -> None:
         """丢弃过期任务的结果。
@@ -3439,6 +3690,10 @@ class MainWindow(QMainWindow):
             self._set_status(f"⚠ 正在计算，请先等待或点“取消”，再{what}。")
             return True
         return False
+
+    def _live_owner(self, token: object):
+        slot = self._slot_of_token(token)
+        return None if slot is None else slot[0]
 
     # ---------------------------------------------------------- 两条口径互斥
 
@@ -3540,8 +3795,12 @@ class MainWindow(QMainWindow):
         if not self._job_is_current(token):
             self._discard_stale_job(token, "ROI 定量")
             return
+        owner = self._live_owner(token)
         self._finish_job(token)
         result, lanes, report = payload
+        if owner != self._active_id:
+            self._store_quantify_on_doc(owner, result, lanes, report)
+            return
         self._result_expected_bands = self._quant_job_expected
         self._set_result(result, lanes, origin=ORIGIN_ROI, report=report)
         if self._quant_job_state == self._quant_input_state():
@@ -3580,6 +3839,44 @@ class MainWindow(QMainWindow):
         # 逐字写着同一句。状态栏只报这次算出了什么、有没有出事。
         self._set_status(text)
 
+    def _store_quantify_on_doc(self, owner, result, lanes, report) -> None:
+        doc = self._doc_by_id(owner)
+        if doc is None:
+            return
+        doc.result = result
+        doc.lanes = list(lanes or [])
+        doc.roi_report = report
+        doc.result_origin = ORIGIN_ROI
+        doc.result_expected_bands = doc.quant_job_expected
+        doc.result_doc_version = int(doc.doc_version)
+        doc.results_dirty = bool(getattr(result, "measurements", None))
+        doc.result_stale = False
+        errorlog.log_message(f"后台定量已落到标签「{doc.display_name()}」")
+
+    def _run_quantify_on_doc(self, doc: Document) -> None:
+        if doc.blot is None or doc.roi is None:
+            return
+        if self._has_job(JOB_QUANTIFY, doc.doc_id):
+            return
+        mode = BG_MODES[int(doc.bg_index) % len(BG_MODES)][1]
+        dark = bool(resolve_dark_bands(doc.blot, mode))
+        expected = int(doc.band_count) or None
+        job = partial(
+            quantify_roi,
+            doc.blot,
+            doc.roi,
+            list(doc.separators),
+            dark,
+            expected,
+        )
+        token = self._begin_job(JOB_QUANTIFY, "正在 ROI 定量……", doc_id=doc.doc_id)
+        self._submit_job(
+            token,
+            job,
+            partial(self._on_quantify_done, token),
+            partial(self._on_worker_error, token),
+        )
+
     def _run_auto(self, synchronous: bool = False) -> None:
         if self._busy or self._blot is None:
             return
@@ -3608,8 +3905,24 @@ class MainWindow(QMainWindow):
         if not self._job_is_current(token):
             self._discard_stale_job(token, "自动检测")
             return
+        owner = self._live_owner(token)
         self._finish_job(token)
         result, lanes = payload
+        if owner != self._active_id:
+            doc = self._doc_by_id(owner)
+            if doc is None:
+                return
+            doc.result = result
+            doc.lanes = list(lanes or [])
+            doc.result_origin = ORIGIN_DETECT
+            doc.result_expected_bands = None
+            doc.result_doc_version = int(doc.doc_version)
+            doc.results_dirty = bool(getattr(result, "measurements", None))
+            doc.result_stale = False
+            doc.roi = None
+            doc.separators = []
+            doc.column_profile = None
+            return
         self._set_result(result, lanes, origin=ORIGIN_DETECT)
         self._result_stale = False
         self._absorb_result_state()
@@ -3639,8 +3952,11 @@ class MainWindow(QMainWindow):
         if not self._job_is_current(token):
             errorlog.log_message(f"忽略过期任务的报错：{message}")
             return
+        owner = self._live_owner(token)
         self._finish_job(token)
         errorlog.log_message(f"分析失败：{message}")
+        if owner != self._active_id:
+            return
         QMessageBox.critical(self, "分析失败", message + errorlog.hint())
         self._set_status(f"分析失败：{message}")
 
@@ -3653,9 +3969,10 @@ class MainWindow(QMainWindow):
         一次生效。旋转滑杆连续拖动全靠这条，否则拖到一半就被自己锁死。
         """
         computing = self._busy
-        active = bool(self._running)
+        visible = self._visible_job_messages()
+        active = bool(visible)
         self._busy_bar.setVisible(active)
-        self._busy_bar.setToolTip("；".join(self._running.values()) if active else "")
+        self._busy_bar.setToolTip("；".join(visible) if active else "")
         self._cancel_button.setVisible(computing)
         # 画布用 setEnabled 而不是 setInteractive：ROI 拖拽是 BlotCanvas 自己的
         # mousePressEvent，setInteractive(False) 拦不住它
@@ -4517,23 +4834,29 @@ class MainWindow(QMainWindow):
             and bool(self._result.measurements)
             and self._blot is not None
         )
+        can_raw = has_result and not self._result_stale
         can_normalized, normalized_reason = normalization_export_available(self._session)
         can_summary, summary_reason = summary_export_available(self._session)
         can_session_raw = bool(self._session.entries)
-        if not has_result and not can_normalized and not can_summary and not can_session_raw:
+        if not can_raw and not can_normalized and not can_summary and not can_session_raw:
             self._set_status("⚠ 还没有可导出的定量结果：先框选 ROI 或点“自动检测”。")
             return
+
+        if has_result and self._result_stale:
+            raw_reason = "当前结果已过期：请等自动定量完成，或点“ROI 定量”刷新后再导出原始灰度。"
+        elif not has_result:
+            raw_reason = "还没有可导出的定量结果：先框选 ROI 或点“自动检测”。"
+        else:
+            raw_reason = ""
 
         dialog = DataExportDialog(
             self,
             options=DataExportDialog.load_options(),
-            can_export_raw=has_result,
+            can_export_raw=can_raw,
             can_export_normalized=can_normalized,
             can_export_summary=can_summary,
             can_export_session_raw=can_session_raw,
-            raw_reason=""
-            if has_result
-            else "还没有可导出的定量结果：先框选 ROI 或点“自动检测”。",
+            raw_reason=raw_reason,
             normalized_reason=normalized_reason,
             summary_reason=summary_reason,
             session_raw_reason=""
@@ -4830,20 +5153,25 @@ class MainWindow(QMainWindow):
             text = "当前：适中（漏检时可往右拖）"
         self.weak_hint.setText(text)
 
+    def _session_has_exportable_data(self) -> bool:
+        can_normalized, _reason = normalization_export_available(self._session)
+        can_summary, _summary_reason = summary_export_available(self._session)
+        return bool(can_normalized or can_summary or self._session.entries)
+
     def _update_action_states(self) -> None:
         has_image = self._blot is not None
         has_result = self._result is not None and bool(self._result.measurements)
-        # 忙碌期间不许换图：否则后台结果回来时已经不知道该落到哪张图上
-        self.act_open.setEnabled(not self._busy)
-        self.act_close.setEnabled(has_image and not self._busy)
-        self._recent_menu.setEnabled(not self._busy)
-        self.act_auto.setEnabled(has_image and not self._busy)
-        self.act_quant.setEnabled(has_image and not self._busy)
-        # 分隔线改动后结果过期：禁止把旧结果导出（自动重定量结束后恢复）
+        computing = self._busy
+        self.act_open.setEnabled(True)
+        self.act_close.setEnabled(has_image)
+        self._recent_menu.setEnabled(True)
+        self.act_auto.setEnabled(has_image and not computing)
+        self.act_quant.setEnabled(has_image and not computing)
+        current_exportable = has_result and not self._result_stale
         self.act_export_data.setEnabled(
-            has_result and not self._busy and not self._result_stale
+            current_exportable or self._session_has_exportable_data()
         )
-        self.act_export_figure.setEnabled(has_image and not self._busy)
+        self.act_export_figure.setEnabled(has_image and not computing)
         self.act_fit.setEnabled(has_image)
         self.act_100.setEnabled(has_image)
         self.act_zoom_in.setEnabled(has_image)
@@ -4893,8 +5221,6 @@ class MainWindow(QMainWindow):
         clear.triggered.connect(self._clear_recent)
 
     def _open_recent(self, entry: str) -> None:
-        if self._reject_while_busy("打开图片"):
-            return
         path = Path(entry)
         if not path.exists():
             QMessageBox.warning(self, "文件不存在", f"找不到文件：\n{entry}")
@@ -4910,16 +5236,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ 拖放
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self._busy:
-            return
         for url in event.mimeData().urls():
             if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() in IMAGE_SUFFIXES:
                 event.acceptProposedAction()
                 return
 
     def dropEvent(self, event: QDropEvent) -> None:
-        if self._reject_while_busy("拖入新图片"):
-            return
         opened = False
         for url in event.mimeData().urls():
             if not url.isLocalFile():
@@ -4942,6 +5264,19 @@ class MainWindow(QMainWindow):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().showEvent(event)
+        self._release_ctrl_tab_for_documents()
+
+    def _release_ctrl_tab_for_documents(self) -> None:
+        """把 Ctrl+Tab 从右侧控制面板页签抢回来，交给文档标签栏。"""
+        for shortcut in self.findChildren(QShortcut):
+            sequence = shortcut.key()
+            if sequence.matches(QKeySequence.StandardKey.NextChild) or sequence.matches(
+                QKeySequence.StandardKey.PreviousChild
+            ):
+                shortcut.setEnabled(False)
 
     # ------------------------------------------------------------------ 设置
 
@@ -5015,9 +5350,8 @@ class MainWindow(QMainWindow):
     ) -> bool:
         """要丢掉当前文档的成果时挽留一次；没什么可丢的就直接放行。
 
-        退出程序和关闭当前图片走的是同一段挽留，只有问句和 ``extra`` 里额外点名
-        的损失不同。``extra`` 里的话排在前面：那是调用方认为比"没导出"更值得说的
-        事（关图时就是"还没加入归一化历史"）。
+        关单个标签走这里；退出程序走 :meth:`_confirm_quit`，会点名每一个还有
+        未导出结果的标签。
         """
         lines = list(extra)
         if (
@@ -5039,10 +5373,41 @@ class MainWindow(QMainWindow):
         )
         return answer == QMessageBox.StandardButton.Yes
 
+    def _unsaved_lines_for(self, doc: Document) -> list[str]:
+        """退出时点名还有未导出结果的标签。关单个标签的“没进历史”不在这里。"""
+        name = doc.display_name()
+        result = doc.result
+        if (
+            doc.results_dirty
+            and result is not None
+            and getattr(result, "measurements", None)
+        ):
+            return [
+                f"「{name}」有 {len(result.measurements)} 个条带的定量结果尚未导出。"
+            ]
+        return []
+
+    def _confirm_quit(self) -> bool:
+        self._harvest_current()
+        lines: list[str] = []
+        for doc in self._docs:
+            lines.extend(self._unsaved_lines_for(doc))
+        if not lines:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "还有未保存的结果",
+            "\n".join([*lines, "确定要退出吗？"]),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def _shutdown_jobs(self) -> None:
         """取消并等待后台任务：不等就退，worker emit 时会撞上已销毁的接收方。"""
         for timer in (self._rotate_timer, self._roi_timer, self._quant_timer):
             timer.stop()
+        self._invalidate_jobs(doc_id=_JOB_ALL)
         self._job_tokens.clear()
         self._workers.clear()
         self._running.clear()
@@ -5057,7 +5422,7 @@ class MainWindow(QMainWindow):
             self._cursor_pushed = False
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if not self._confirm_discard_results():
+        if not self._confirm_quit():
             event.ignore()
             return
         self._shutdown_jobs()
